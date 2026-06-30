@@ -14,3 +14,11 @@ wheels/
 artifacts/
 matsne/output.json
 matsne/spider_logs.txt
+
+# Secrets
+.env
+
+# Qdrant ingestion (ingest/)
+ingest/.venv
+ingest/.state/
+ingest/qdrant_storage/

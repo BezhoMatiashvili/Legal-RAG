@@ -11,6 +11,7 @@ Section taxonomy seen in the corpus:
     ENCLOSURE (დანართი / annex) -> HEADER / CHAPTER / ARTICLE / POINT / SUBPOINT.
 """
 
+import logging
 import re
 from urllib.parse import urljoin
 
@@ -18,6 +19,8 @@ from bs4 import BeautifulSoup
 from markdownify import MarkdownConverter
 
 BASE_URL = "https://matsne.gov.ge"
+
+_log = logging.getLogger(__name__)
 
 # Section path segments that count as structural nesting (drive heading depth).
 # POINT / SUBPOINT are numbered items *inside* a section's body, not headings.
@@ -97,7 +100,7 @@ def _strip_cruft(main):
             a.decompose()
 
 
-def _clean_links(main):
+def _clean_links(main, base_url):
     for a in main.find_all("a"):
         href = a.get("href", "")
         if href.startswith("#") or not href:
@@ -105,14 +108,14 @@ def _clean_links(main):
             text = a.get_text()
             a.replace_with(text) if text.strip() else a.decompose()
         elif href.startswith("/"):
-            a["href"] = urljoin(BASE_URL, href)
+            a["href"] = urljoin(base_url, href)
 
 
-def _absolutize_images(main):
+def _absolutize_images(main, base_url):
     for img in main.find_all("img"):
         src = img.get("src", "")
         if src.startswith("/"):
-            img["src"] = urljoin(BASE_URL, src)
+            img["src"] = urljoin(base_url, src)
         img.attrs.setdefault("alt", "")
 
 
@@ -295,13 +298,18 @@ def _tidy(text):
     return text.strip()
 
 
-def html_to_markdown(html: str) -> str:
+def html_to_markdown(html: str, base_url: str = BASE_URL) -> str:
+    """Convert a fragment of legal-document HTML to Markdown.
+
+    ``base_url`` is used to absolutize root-relative links/images; it defaults to
+    matsne but other spiders should pass their own site root.
+    """
     soup = BeautifulSoup(html, "lxml")
     main = soup.select_one("#maindoc") or soup
 
     _strip_cruft(main)
-    _clean_links(main)
-    _absolutize_images(main)
+    _clean_links(main, base_url)
+    _absolutize_images(main, base_url)
     _transform_section_tables(main, soup)
     _flatten_layout_tables(main)
     _normalize_data_tables(main, soup)
@@ -314,3 +322,18 @@ def html_to_markdown(html: str) -> str:
         escape_underscores=False,
     )
     return _tidy(converter.convert_soup(main))
+
+
+def safe_html_to_markdown(html: str, base_url: str = BASE_URL, source_url: str | None = None) -> str:
+    """``html_to_markdown`` that never raises: on a parser failure it logs and returns "".
+
+    Detail-page bodies come from untrusted HTML; a single malformed document should not
+    drop the whole item, so callers use this and still emit the item with an empty body.
+    """
+    if not html:
+        return ""
+    try:
+        return html_to_markdown(html, base_url=base_url)
+    except Exception as exc:  # noqa: BLE001 - body extraction must be best-effort
+        _log.warning("html_to_markdown failed for %s: %s", source_url or "<unknown>", exc)
+        return ""
