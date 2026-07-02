@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "matsne_rag": {
+    "legal_rag": {
       "command": "uv",
       "args": [
         "run",

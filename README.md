@@ -15,8 +15,8 @@ uv run playwright install chromium   # only needed for the `tas` spider
 ## Scrape everything
 
 ```bash
-cd matsne
-uv run python -m matsne.run --start-date YYYY-MM-DD --end-date YYYY-MM-DD
+cd scraper
+uv run python -m legal_scrapers.run --start-date YYYY-MM-DD --end-date YYYY-MM-DD
 ```
 
 To scrape and ingest together from the repo root:
@@ -30,7 +30,7 @@ python3 run_all.py --start-date YYYY-MM-DD --end-date YYYY-MM-DD
 All spiders run from the Scrapy project directory and share the same interface:
 
 ```bash
-cd matsne
+cd scraper
 uv run scrapy crawl <spider> -a start_date=YYYY-MM-DD -a end_date=YYYY-MM-DD
 ```
 
@@ -51,10 +51,10 @@ To run every spider (or a subset) concurrently in one process with a single
 combined progress table:
 
 ```bash
-cd matsne
-uv run python -m matsne.run --start-date YYYY-MM-DD --end-date YYYY-MM-DD
-uv run python -m matsne.run --only ecd tbappeal --start-date 2026-06-01 --end-date 2026-06-30
-uv run python -m matsne.run --no-dedup        # force a full re-scrape this run
+cd scraper
+uv run python -m legal_scrapers.run --start-date YYYY-MM-DD --end-date YYYY-MM-DD
+uv run python -m legal_scrapers.run --only ecd tbappeal --start-date 2026-06-01 --end-date 2026-06-30
+uv run python -m legal_scrapers.run --no-dedup        # force a full re-scrape this run
 ```
 
 Each spider targets a different domain, so per-domain politeness (delay,
@@ -82,7 +82,7 @@ Prefer two terminals for development (independent restarts):
 # terminal A — continuous ingest
 cd ingest && uv run python -m ingest watch --source all
 # terminal B — scrape
-cd matsne && uv run python -m matsne.run --start-date 2026-06-01 --end-date 2026-06-30
+cd scraper && uv run python -m legal_scrapers.run --start-date 2026-06-01 --end-date 2026-06-30
 ```
 
 See `ingest/README.md` ("Continuous watch mode") for the watcher's flags and guarantees.
@@ -100,7 +100,7 @@ as `dedup/skipped`.
 - This is **skip-forever by identity**: a document already scraped is not
   re-fetched even if its content later changes on the source site.
 - To force a full re-scrape (re-fetch and re-emit everything), pass
-  `-s DEDUP_ENABLED=False` to `scrapy crawl` or `--no-dedup` to `python -m matsne.run`.
+  `-s DEDUP_ENABLED=False` to `scrapy crawl` or `--no-dedup` to `python -m legal_scrapers.run`.
 - To reset one spider's memory, delete its `artifacts/<spider>/seen.sqlite`.
 
 ## Spiders
@@ -118,7 +118,7 @@ as `dedup/skipped`.
 ### Examples
 
 ```bash
-cd matsne
+cd scraper
 uv run scrapy crawl ecd          -a start_date=2020-01-01 -a end_date=2020-01-31
 uv run scrapy crawl constcourt   -a start_date=2026-06-01 -a end_date=2026-06-30
 uv run scrapy crawl napr         -a start_date=2024-12-01 -a end_date=2024-12-31

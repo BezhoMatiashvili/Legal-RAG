@@ -3,10 +3,10 @@ import unittest
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SCRAPY_PROJECT_ROOT = PROJECT_ROOT / "matsne"
+SCRAPY_PROJECT_ROOT = PROJECT_ROOT / "scraper"
 sys.path.insert(0, str(SCRAPY_PROJECT_ROOT))
 
-from matsne.run import parse_args, select_spiders  # noqa: E402
+from legal_scrapers.run import parse_args, select_spiders  # noqa: E402
 
 ALL = ["matsne", "ecd", "constcourt", "napr", "supremecourt", "tas", "tbappeal"]
 

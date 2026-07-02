@@ -9,10 +9,10 @@ from scrapy.crawler import Crawler
 from scrapy.settings import Settings
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SCRAPY_PROJECT_ROOT = PROJECT_ROOT / "matsne"
+SCRAPY_PROJECT_ROOT = PROJECT_ROOT / "scraper"
 sys.path.insert(0, str(SCRAPY_PROJECT_ROOT))
 
-from matsne.spiders.matsne_spider import MatsneSpider  # noqa: E402
+from legal_scrapers.spiders.matsne_spider import MatsneSpider  # noqa: E402
 
 
 class MatsneSpiderDateTests(unittest.TestCase):

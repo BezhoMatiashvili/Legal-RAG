@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ingest/ingest/config.py -> parents[2] == repo root (sibling of matsne/ and artifacts/).
+# ingest/ingest/config.py -> parents[2] == repo root (sibling of scraper/ and artifacts/).
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 

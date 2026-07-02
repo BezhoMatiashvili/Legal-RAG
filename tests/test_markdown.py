@@ -3,9 +3,9 @@ import unittest
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(PROJECT_ROOT / "matsne"))
+sys.path.insert(0, str(PROJECT_ROOT / "scraper"))
 
-from matsne.utils.markdown import html_to_markdown, safe_html_to_markdown  # noqa: E402
+from legal_scrapers.utils.markdown import html_to_markdown, safe_html_to_markdown  # noqa: E402
 
 
 class HtmlToMarkdownTests(unittest.TestCase):
