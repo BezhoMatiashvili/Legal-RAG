@@ -46,6 +46,9 @@ class SupremecourtSpider(BaseLegalSpider):
         # User-approved exception (2026-06-29): /ka/getCases is the only case-list
         # endpoint and is disallowed by robots.txt. Override scoped to this spider.
         "ROBOTSTXT_OBEY": False,
+        # This site rate-limits aggressively, so keep this spider slow and serial.
+        "CONCURRENT_REQUESTS_PER_DOMAIN": 1,
+        "DOWNLOAD_DELAY": 8,
     }
 
     async def start(self):
