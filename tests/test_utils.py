@@ -4,10 +4,10 @@ from datetime import date
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SCRAPY_PROJECT_ROOT = PROJECT_ROOT / "matsne"
+SCRAPY_PROJECT_ROOT = PROJECT_ROOT / "scraper"
 sys.path.insert(0, str(SCRAPY_PROJECT_ROOT))
 
-from matsne.utils.dates import (  # noqa: E402
+from legal_scrapers.utils.dates import (  # noqa: E402
     date_part,
     dotnet_date_to_iso,
     iso_to_dotted,
@@ -15,8 +15,8 @@ from matsne.utils.dates import (  # noqa: E402
     iso_to_year_slashed,
     parse_dotted,
 )
-from matsne.utils.json_api import loads_maybe_double  # noqa: E402
-from matsne.utils.text import plain_text_to_markdown  # noqa: E402
+from legal_scrapers.utils.json_api import loads_maybe_double  # noqa: E402
+from legal_scrapers.utils.text import plain_text_to_markdown  # noqa: E402
 
 
 class DateConversionTests(unittest.TestCase):

@@ -5,21 +5,21 @@ from pathlib import Path
 from unittest import mock
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SCRAPY_PROJECT_ROOT = PROJECT_ROOT / "matsne"
+SCRAPY_PROJECT_ROOT = PROJECT_ROOT / "scraper"
 sys.path.insert(0, str(SCRAPY_PROJECT_ROOT))
 
 from rich.console import Console  # noqa: E402
 from scrapy.exceptions import NotConfigured  # noqa: E402
 from scrapy.utils.test import get_crawler  # noqa: E402
 
-from matsne.extensions import (  # noqa: E402
+from legal_scrapers.extensions import (  # noqa: E402
     LiveProgressExtension,
     ProgressSnapshot,
     extract_title,
     render_panel,
     render_table,
 )
-from matsne.items import EcdItem, MatsneItem, SupremecourtItem, TasItem  # noqa: E402
+from legal_scrapers.items import EcdItem, MatsneItem, SupremecourtItem, TasItem  # noqa: E402
 
 
 def _render_to_text(snap: ProgressSnapshot, frame: str = "⠋") -> str:

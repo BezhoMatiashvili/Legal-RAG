@@ -9,12 +9,12 @@ from scrapy.exceptions import DontCloseSpider
 from scrapy.http import HtmlResponse, TextResponse
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(PROJECT_ROOT / "matsne"))
+sys.path.insert(0, str(PROJECT_ROOT / "scraper"))
 
-from matsne.spiders.constcourt_spider import ConstcourtSpider, TEASER_MARKER  # noqa: E402
-from matsne.spiders.matsne_spider import MatsneSpider  # noqa: E402
-from matsne.spiders.napr_spider import NaprSpider  # noqa: E402
-from matsne.spiders.supremecourt_spider import SupremecourtSpider  # noqa: E402
+from legal_scrapers.spiders.constcourt_spider import ConstcourtSpider, TEASER_MARKER  # noqa: E402
+from legal_scrapers.spiders.matsne_spider import MatsneSpider  # noqa: E402
+from legal_scrapers.spiders.napr_spider import NaprSpider  # noqa: E402
+from legal_scrapers.spiders.supremecourt_spider import SupremecourtSpider  # noqa: E402
 
 
 def _html(url, body, meta=None):

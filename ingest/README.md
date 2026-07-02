@@ -105,7 +105,7 @@ reads `ingest/.env` for `QDRANT_URL` / `COLLECTION_NAME`. Qdrant must be running
 # boot-check / explore the tools without Claude (lists tools, lets you call them):
 npx @modelcontextprotocol/inspector uv run --directory ingest python -m ingest.mcp_server
 ```
-In Claude Code: `/mcp` should show `matsne_rag` connected, then just ask a question about
+In Claude Code: `/mcp` should show `legal_rag` connected, then just ask a question about
 the corpus and Claude will call `legal_search`.
 
 ## Tests

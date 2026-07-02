@@ -1,10 +1,10 @@
 """Run several spiders together in one process.
 
-Usage (from anywhere)::
+Usage (from the ``scraper/`` directory)::
 
-    uv run python -m matsne.run --start-date 2026-06-01 --end-date 2026-06-30
-    uv run python -m matsne.run --only ecd tbappeal --start-date 2026-06-20 --end-date 2026-06-22
-    uv run python -m matsne.run --no-dedup        # force a full re-scrape
+    uv run python -m legal_scrapers.run --start-date 2026-06-01 --end-date 2026-06-30
+    uv run python -m legal_scrapers.run --only ecd tbappeal --start-date 2026-06-20 --end-date 2026-06-22
+    uv run python -m legal_scrapers.run --no-dedup        # force a full re-scrape
 
 All spiders run concurrently in a single ``CrawlerProcess``. Each targets a
 different domain, so per-domain politeness (DOWNLOAD_DELAY, AutoThrottle,
@@ -35,21 +35,21 @@ SPIDER_ORDER = [
 def _bootstrap_project_dir() -> Path:
     """Make the Scrapy project importable + discoverable regardless of cwd.
 
-    ``run.py`` lives at ``<repo>/matsne/matsne/run.py``; ``scrapy.cfg`` and the
-    ``matsne`` package live one level up at ``<repo>/matsne``. ``scrapy crawl``
+    ``run.py`` lives at ``<repo>/scraper/legal_scrapers/run.py``; ``scrapy.cfg`` and the
+    ``legal_scrapers`` package live one level up at ``<repo>/scraper``. ``scrapy crawl``
     relies on being run from there, so we replicate that here.
     """
-    project_dir = Path(__file__).resolve().parent.parent  # <repo>/matsne
+    project_dir = Path(__file__).resolve().parent.parent  # <repo>/scraper
     os.chdir(project_dir)
     if str(project_dir) not in sys.path:
         sys.path.insert(0, str(project_dir))
-    os.environ.setdefault("SCRAPY_SETTINGS_MODULE", "matsne.settings")
+    os.environ.setdefault("SCRAPY_SETTINGS_MODULE", "legal_scrapers.settings")
     return project_dir
 
 
 def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        prog="python -m matsne.run",
+        prog="python -m legal_scrapers.run",
         description="Run all (or a subset of) the legal spiders together.",
     )
     parser.add_argument("--start-date", help="YYYY-MM-DD; forwarded to every spider")
@@ -99,7 +99,7 @@ def main(argv=None) -> None:
     from scrapy.crawler import CrawlerProcess
     from scrapy.utils.project import get_project_settings
 
-    from matsne.extensions import declare_spiders, finish_dashboard
+    from legal_scrapers.extensions import declare_spiders, finish_dashboard
 
     settings = get_project_settings()
     if args.no_dedup:

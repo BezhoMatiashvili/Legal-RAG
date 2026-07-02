@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run the scraper and the continuous ingest watcher together.
 
-The scraper (``matsne/``) and the ingester (``ingest/``) live in separate, mutually
+The scraper (``scraper/``) and the ingester (``ingest/``) live in separate, mutually
 incompatible Python environments (Scrapy on >=3.14, torch/BGE-M3 on <3.14), so they
 cannot share one process. This launcher spawns each in its own ``uv`` env as a
 subprocess, forwards Ctrl-C/SIGTERM to both, and prefixes their output.
@@ -24,7 +24,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent
 INGEST_DIR = REPO_ROOT / "ingest"
-MATSNE_DIR = REPO_ROOT / "matsne"
+SCRAPER_DIR = REPO_ROOT / "scraper"
 
 _print_lock = threading.Lock()
 
@@ -57,7 +57,7 @@ def main() -> None:
         watch_cmd += ["--collection", args.collection]
     watch_cmd += ["watch", "--source", "all", "--poll-interval", str(args.poll_interval)]
 
-    scrape_cmd = ["uv", "run", "python", "-m", "matsne.run"]
+    scrape_cmd = ["uv", "run", "python", "-m", "legal_scrapers.run"]
     if args.start_date:
         scrape_cmd += ["--start-date", args.start_date]
     if args.end_date:
@@ -74,8 +74,8 @@ def main() -> None:
 
     print(f"[run_all] starting watcher: {' '.join(watch_cmd)}  (cwd={INGEST_DIR})")
     watcher = subprocess.Popen(watch_cmd, cwd=str(INGEST_DIR), **common)
-    print(f"[run_all] starting scraper: {' '.join(scrape_cmd)}  (cwd={MATSNE_DIR})")
-    scraper = subprocess.Popen(scrape_cmd, cwd=str(MATSNE_DIR), **common)
+    print(f"[run_all] starting scraper: {' '.join(scrape_cmd)}  (cwd={SCRAPER_DIR})")
+    scraper = subprocess.Popen(scrape_cmd, cwd=str(SCRAPER_DIR), **common)
 
     procs = {"ingest": watcher, "scrape": scraper}
     threads = [threading.Thread(target=_pump, args=(p, tag), daemon=True)

@@ -8,14 +8,14 @@ from scrapy import Request
 from scrapy.http import TextResponse
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SCRAPY_PROJECT_ROOT = PROJECT_ROOT / "matsne"
+SCRAPY_PROJECT_ROOT = PROJECT_ROOT / "scraper"
 sys.path.insert(0, str(SCRAPY_PROJECT_ROOT))
 
-from matsne.spiders.constcourt_spider import ConstcourtSpider  # noqa: E402
-from matsne.spiders.ecd_spider import TEXT_URL, EcdSpider  # noqa: E402
-from matsne.spiders.napr_spider import NaprSpider  # noqa: E402
-from matsne.spiders.supremecourt_spider import SupremecourtSpider  # noqa: E402
-from matsne.spiders.tbappeal_spider import TbappealSpider  # noqa: E402
+from legal_scrapers.spiders.constcourt_spider import ConstcourtSpider  # noqa: E402
+from legal_scrapers.spiders.ecd_spider import TEXT_URL, EcdSpider  # noqa: E402
+from legal_scrapers.spiders.napr_spider import NaprSpider  # noqa: E402
+from legal_scrapers.spiders.supremecourt_spider import SupremecourtSpider  # noqa: E402
+from legal_scrapers.spiders.tbappeal_spider import TbappealSpider  # noqa: E402
 
 
 def json_response(url, payload, meta=None):

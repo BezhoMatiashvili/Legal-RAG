@@ -5,14 +5,14 @@ from pathlib import Path
 from unittest import mock
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SCRAPY_PROJECT_ROOT = PROJECT_ROOT / "matsne"
+SCRAPY_PROJECT_ROOT = PROJECT_ROOT / "scraper"
 sys.path.insert(0, str(SCRAPY_PROJECT_ROOT))
 
 from scrapy.exceptions import DropItem  # noqa: E402
 from scrapy.settings import Settings  # noqa: E402
 
-from matsne.pipelines import DedupPipeline  # noqa: E402
-from matsne.spiders.base import BaseLegalSpider  # noqa: E402
+from legal_scrapers.pipelines import DedupPipeline  # noqa: E402
+from legal_scrapers.spiders.base import BaseLegalSpider  # noqa: E402
 
 
 class _Spider(BaseLegalSpider):

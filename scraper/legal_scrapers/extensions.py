@@ -9,7 +9,7 @@ tell whether scraping is progressing, stalling, or erroring.
 feeds ``crawler.stats`` snapshots into a single, process-global dashboard that
 owns exactly one ``rich.Live``. For a single ``scrapy crawl`` the dashboard
 draws a detailed panel; when several spiders run together (``python -m
-matsne.run``) it draws one compact table with a row per spider. Routing every
+legal_scrapers.run``) it draws one compact table with a row per spider. Routing every
 spider through one ``Live`` is what makes the multi-spider view possible — two
 concurrent ``Live`` instances on the same stdout would corrupt the terminal.
 

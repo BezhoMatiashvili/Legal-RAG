@@ -28,7 +28,7 @@ from .config import Config, load_config
 from .search import build_filter, hybrid_search
 from .sources import SOURCES
 
-mcp = FastMCP("matsne_rag")
+mcp = FastMCP("legal_rag")
 
 SNIPPET_CHARS = 700  # markdown preview length per hit (enough to judge legal relevance)
 
