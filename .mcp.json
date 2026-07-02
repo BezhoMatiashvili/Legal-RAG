@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "matsne_rag": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory",
+        "/Users/bezhomatiashvili/Desktop/matsne_scraping/ingest",
+        "python",
+        "-m",
+        "ingest.mcp_server"
+      ]
+    }
+  }
+}

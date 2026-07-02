@@ -1,0 +1,30 @@
+[project]
+name = "legal-ingest"
+version = "0.1.0"
+description = "Ingest scraped Georgian legal documents into Qdrant (hybrid dense+sparse RAG)"
+readme = "README.md"
+# BGE-M3 needs torch, which has no Python 3.14 wheels yet, so this ingestion tool is a
+# standalone project pinned below 3.14 (the scraper stays on 3.14).
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "qdrant-client>=1.12",
+    "FlagEmbedding>=1.2.10",
+    "python-dotenv>=1.0",
+    "tqdm>=4.66",
+    "rich>=13",
+    "mcp[cli]>=1.2",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
+[tool.uv]
+# This is an application, not a library — don't try to build/install it as a package.
+package = false
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
