@@ -1,4 +1,4 @@
-# Scrapy settings for matsne project
+# Scrapy settings for the legal_scrapers project
 #
 # For simplicity, this file contains only settings considered important or
 # commonly used. You can find more settings consulting the documentation:
@@ -7,10 +7,10 @@
 #     https://docs.scrapy.org/en/latest/topics/downloader-middleware.html
 #     https://docs.scrapy.org/en/latest/topics/spider-middleware.html
 
-BOT_NAME = "matsne"
+BOT_NAME = "legal_scrapers"
 
-SPIDER_MODULES = ["matsne.spiders"]
-NEWSPIDER_MODULE = "matsne.spiders"
+SPIDER_MODULES = ["legal_scrapers.spiders"]
+NEWSPIDER_MODULE = "legal_scrapers.spiders"
 
 ADDONS = {}
 
@@ -50,19 +50,19 @@ DOWNLOAD_WARNSIZE = 33554432   # 32 MB warning
 # Enable or disable spider middlewares
 # See https://docs.scrapy.org/en/latest/topics/spider-middleware.html
 #SPIDER_MIDDLEWARES = {
-#    "matsne.middlewares.MatsneSpiderMiddleware": 543,
+#    "legal_scrapers.middlewares.MatsneSpiderMiddleware": 543,
 #}
 
 # Enable or disable downloader middlewares
 # See https://docs.scrapy.org/en/latest/topics/downloader-middleware.html
 DOWNLOADER_MIDDLEWARES = {
-   "matsne.middlewares.RotateUserAgentMiddleware": 543
+   "legal_scrapers.middlewares.RotateUserAgentMiddleware": 543
 }
 
 # Enable or disable extensions
 # See https://docs.scrapy.org/en/latest/topics/extensions.html
 EXTENSIONS = {
-    "matsne.extensions.LiveProgressExtension": 100,
+    "legal_scrapers.extensions.LiveProgressExtension": 100,
 }
 
 # Live terminal progress panel. Auto-disables when stdout is not a TTY (pipes,
@@ -72,7 +72,7 @@ PROGRESS_DISPLAY_ENABLED = True
 # Configure item pipelines
 # See https://docs.scrapy.org/en/latest/topics/item-pipeline.html
 ITEM_PIPELINES = {
-    "matsne.pipelines.DedupPipeline": 100,
+    "legal_scrapers.pipelines.DedupPipeline": 100,
 }
 
 # Cross-run deduplication. Each spider records scraped-document identities in
@@ -82,7 +82,7 @@ DEDUP_ENABLED = True
 
 # Use the asyncio reactor process-wide. Required so scrapy-playwright (the tas
 # spider) works under the single shared reactor when all spiders run together
-# via `python -m matsne.run`; also hardens `scrapy crawl tas`.
+# via `python -m legal_scrapers.run`; also hardens `scrapy crawl tas`.
 TWISTED_REACTOR = "twisted.internet.asyncioreactor.AsyncioSelectorReactor"
 
 # Enable and configure the AutoThrottle extension (disabled by default)

@@ -12,8 +12,8 @@ wheels/
 
 # Scraping artifacts
 artifacts/
-matsne/output.json
-matsne/spider_logs.txt
+scraper/output.json
+scraper/spider_logs.txt
 
 # Secrets
 .env
