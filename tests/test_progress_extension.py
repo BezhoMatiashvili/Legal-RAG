@@ -36,6 +36,7 @@ class RenderPanelTests(unittest.TestCase):
             items=128,
             requests=410,
             responses=402,
+            total_items=512,
             status_counts={200: 398, 404: 3, 500: 1},
             queue=12,
             errors=0,
@@ -50,6 +51,7 @@ class RenderPanelTests(unittest.TestCase):
         self.assertIn("ecd", out)
         self.assertIn("scraping", out)
         self.assertIn("128", out)          # items
+        self.assertIn("512 total", out)
         self.assertIn("57/min", out)       # 128 items over 134s ≈ 57/min
         self.assertIn("410 sent", out)
         self.assertIn("402 done", out)
@@ -77,9 +79,19 @@ class RenderPanelTests(unittest.TestCase):
 class RenderTableTests(unittest.TestCase):
     def _snaps(self):
         return [
-            ProgressSnapshot("matsne", 401.0, 842, 1200, 1190, {200: 1190},
-                             done=True, finish_reason="finished"),
-            ProgressSnapshot("ecd", 401.0, 128, 410, 402, {200: 401, 500: 1}, errors=1),
+            ProgressSnapshot(
+                "matsne", 401.0, 842, 1200, 1190,
+                total_items=1200,
+                status_counts={200: 1190},
+                done=True,
+                finish_reason="finished",
+            ),
+            ProgressSnapshot(
+                "ecd", 401.0, 128, 410, 402,
+                total_items=328,
+                status_counts={200: 401, 500: 1},
+                errors=1,
+            ),
             ProgressSnapshot("tbappeal", 0.0, 0, 0, 0, finish_reason="queued"),
         ]
 
@@ -102,6 +114,7 @@ class RenderTableTests(unittest.TestCase):
         out = self._render()
         self.assertIn("total", out)
         self.assertIn("970 items", out)   # 842 + 128 + 0
+        self.assertIn("1528 items", out)  # 1200 + 328
         self.assertIn("06:41", out)       # elapsed 401s
 
 

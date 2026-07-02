@@ -43,7 +43,9 @@ uv run scrapy crawl <spider> -a start_date=YYYY-MM-DD -a end_date=YYYY-MM-DD
 - `artifacts/` is git-ignored (local runtime data).
 
 A live progress panel is shown automatically while a crawl runs (it auto-disables
-when output is not a terminal). Disable it with `-s PROGRESS_DISPLAY_ENABLED=False`.
+when output is not a terminal). It shows items scraped in the current run plus
+the cross-run total from the spider's dedup store. Disable it with
+`-s PROGRESS_DISPLAY_ENABLED=False`.
 
 ## Running all spiders together
 

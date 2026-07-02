@@ -86,6 +86,7 @@ class ProgressSnapshot:
     items: int
     requests: int
     responses: int
+    total_items: int | None = None
     status_counts: dict = field(default_factory=dict)
     queue: int = 0
     errors: int = 0
@@ -148,12 +149,11 @@ def render_panel(snap: ProgressSnapshot, spinner_frame: str) -> Panel:
     grid.add_column()
 
     rate = _items_per_min(snap.items, snap.elapsed_s)
-    grid.add_row(
-        "items",
-        Text(f"{snap.items}", style="bold green").append(
-            f"   ({rate:.0f}/min)", style="dim"
-        ),
-    )
+    items_text = Text(f"{snap.items}", style="bold green")
+    items_text.append(f" this run   ({rate:.0f}/min)", style="dim")
+    if snap.total_items is not None:
+        items_text.append(f"   · {snap.total_items} total", style="bold blue")
+    grid.add_row("items", items_text)
     grid.add_row("requests", f"{snap.requests} sent · {snap.responses} done")
     grid.add_row("status", _format_status_counts(snap.status_counts))
     grid.add_row("queue", Text(f"{snap.queue} pending", style="dim"))
@@ -193,19 +193,25 @@ def render_table(snapshots, spinner_frame: str, elapsed_s: float):
     table = Table.grid(padding=(0, 2))
     table.add_column(no_wrap=True)                      # status glyph
     table.add_column(style="bold", no_wrap=True)        # spider name
-    table.add_column(justify="right", no_wrap=True)     # items
+    table.add_column(justify="right", no_wrap=True)     # run items
+    table.add_column(justify="right", no_wrap=True)     # total items
     table.add_column(justify="right", style="dim", no_wrap=True)  # requests
     table.add_column(justify="right", no_wrap=True)     # errors
     table.add_column()                                  # status / state
 
-    header = ("", "SPIDER", "ITEMS", "REQS", "ERR", "STATUS")
+    header = ("", "SPIDER", "RUN", "TOTAL", "REQS", "ERR", "STATUS")
     table.add_row(*(Text(h, style="bold dim") for h in header))
 
     total_items = 0
+    grand_total_items = 0
+    grand_total_known = False
     total_errors = 0
     for snap in snapshots:
         glyph, glyph_style, status_word = _status_glyph(snap, spinner_frame)
         total_items += snap.items
+        if snap.total_items is not None:
+            grand_total_items += snap.total_items
+            grand_total_known = True
         total_errors += snap.errors
         if snap.finish_reason == "queued":
             state = Text("queued", style="dim")
@@ -218,14 +224,21 @@ def render_table(snapshots, spinner_frame: str, elapsed_s: float):
             Text(glyph, style=glyph_style),
             Text(snap.spider),
             Text(str(snap.items), style="green" if snap.items else "dim"),
+            Text(
+                str(snap.total_items) if snap.total_items is not None else "—",
+                style="blue" if snap.total_items is not None else "dim",
+            ),
             str(snap.requests),
             Text(str(snap.errors), style=err_style),
             state,
         )
 
     footer = Text()
-    footer.append("total ", style="bold dim")
+    footer.append("run ", style="bold dim")
     footer.append(f"{total_items} items", style="bold green")
+    if grand_total_known:
+        footer.append(" · total ", style="bold dim")
+        footer.append(f"{grand_total_items} items", style="bold blue")
     footer.append(f" · {total_errors} errors", style="red" if total_errors else "dim")
     footer.append(f" · elapsed {_format_elapsed(elapsed_s)}", style="dim")
 
@@ -288,8 +301,14 @@ class _ProgressDashboard:
                 self.live = None
         for ext in self.exts:
             snap = ext.current_snapshot()
+            total = (
+                f" · {snap.total_items} total"
+                if snap.total_items is not None
+                else ""
+            )
             print(
-                f"✓ {snap.spider}: {snap.items} items · {snap.responses} responses"
+                f"✓ {snap.spider}: {snap.items} items this run{total}"
+                f" · {snap.responses} responses"
                 f" · {snap.errors} errors · {_format_elapsed(snap.elapsed_s)}"
                 f" · {snap.finish_reason or 'done'}"
             )
@@ -351,6 +370,7 @@ class _ProgressDashboard:
                         items=0,
                         requests=0,
                         responses=0,
+                        total_items=None,
                         finish_reason="queued",
                     )
                 )
@@ -450,6 +470,7 @@ class LiveProgressExtension:
             items=get("item_scraped_count", 0) or 0,
             requests=get("downloader/request_count", 0) or 0,
             responses=get("downloader/response_count", 0) or 0,
+            total_items=self._total_items(spider),
             status_counts=status_counts,
             queue=max(0, enqueued - dequeued),
             errors=get("log_count/ERROR", 0) or 0,
@@ -458,3 +479,12 @@ class LiveProgressExtension:
             done=done,
             finish_reason=finish_reason,
         )
+
+    @staticmethod
+    def _total_items(spider) -> int | None:
+        if not getattr(spider, "dedup_enabled", False):
+            return None
+        seen_keys = getattr(spider, "_seen_keys", None)
+        if seen_keys is None:
+            return None
+        return len(seen_keys)
