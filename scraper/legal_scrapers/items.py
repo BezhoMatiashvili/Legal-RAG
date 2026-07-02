@@ -67,6 +67,12 @@ def _body() -> scrapy.Field:
     return scrapy.Field(output_processor=TakeFirst())
 
 
+def _list() -> scrapy.Field:
+    """A structured (list/dict) field. The spider assigns it directly on the loaded
+    item rather than through an ItemLoader, so no per-element processing is applied."""
+    return scrapy.Field()
+
+
 class EcdItem(scrapy.Item):
     """ecd.court.ge — Electronic Court Decisions (JSON API)."""
 
@@ -149,11 +155,14 @@ class SupremecourtItem(scrapy.Item):
 class TasItem(scrapy.Item):
     """tas.ge / docs.tbilisi.gov.ge — Tbilisi Architecture Service documents (ExtJS/DWR).
 
-    Fields come from the ``getDocsForPublicInfo`` list records (+ the per-record
-    ``cachedInfo`` XML for nomenclature/status). Applicant/architect/cadastral-code are
-    not present in the public list payload, so they are omitted in this list crawl.
+    The list crawl (``getDocsForPublicInfo``) provides the base fields; each document is
+    then enriched from the public detail payload (``getUserDocumentLastMotion``), which
+    carries the applicant, cadastral/owner info, request text, attachments, the answers/
+    decision numbers, and the full decision text. Detail fields are ``None`` when the
+    detail fetch fails or the document has not yet been submitted.
     """
 
+    # --- list-level fields ---------------------------------------------------
     source_url = _f()
     document_id = _f()
     document_no = _f()
@@ -164,3 +173,50 @@ class TasItem(scrapy.Item):
     nomenclature = _f()
     nomenclature_case_id = _f()
     body_markdown = _body()
+
+    # --- detail: document / decision ----------------------------------------
+    document_type_id = _f()
+    deadline_date = _f()            # პასუხის გაცემის ვადა (deadLineDate)
+    acquaint_date = _f()            # გაცნობის თარიღი (motion.whenUserOpenedTheDoc)
+    decision_status_id = _f()       # document.documentStatusId
+    decision = _f()                 # გადაწყვეტილება, e.g. "თანხმობა" (STATUSES map)
+    decision_no = _f()              # გადაწყვეტილება № (latest response previousMotionId)
+    can_see_final_result = _f()
+    amount_to_pay = _f()
+    response_markdown = _body()     # document.responseText (HTML) -> Markdown
+
+    # --- detail: request / form ---------------------------------------------
+    request_text = _body()          # მოთხოვნის ტექსტი
+    form_fields = _list()           # [{label, value}] from docValues + fieldsetPojos
+    attachments = _list()           # [file names]
+    nomenclature_full = _f()        # nomenklaturMarkup -> text
+
+    # --- detail: applicant (docAuthor) --------------------------------------
+    applicant_name = _f()           # განმცხადებელი
+    applicant_first_name = _f()
+    applicant_last_name = _f()
+    applicant_personal_no = _f()
+    applicant_birth_date = _f()
+    applicant_address = _f()
+    applicant_email = _f()
+    applicant_phone = _f()
+    applicant_passport = _f()
+    applicant_person_id = _f()
+
+    # --- detail: executor (executorEmployee) --------------------------------
+    executor_name = _f()
+    executor_personal_no = _f()
+    executor_email = _f()
+    executor_phone = _f()
+    executor_id = _f()
+
+    # --- detail: cadastral / parcels (mapInfos) -----------------------------
+    parcels = _list()               # [{cad_code, address, area, purpose, owner, coowner, reg_no}]
+    cad_code = _f()                 # primary parcel, flattened
+    land_area = _f()
+    land_purpose = _f()
+    owner = _f()
+    coowner = _f()
+
+    # --- detail: answers (oldResponseMotions) -------------------------------
+    responses = _list()             # [{decision_no, acquaint_date, motion_date, status_id}]

@@ -20,6 +20,7 @@ from legal_scrapers.spiders.napr_spider import (  # noqa: E402
     decision_type_from_title,
 )
 from legal_scrapers.spiders.supremecourt_spider import SupremecourtSpider  # noqa: E402
+from legal_scrapers.spiders.tas_spider import TasSpider  # noqa: E402
 
 
 def _html(url, body, meta=None):
@@ -241,6 +242,170 @@ class NaprParseTests(unittest.TestCase):
         resp = TextResponse(url=req.url, body=body.encode("utf-8"), encoding="utf-8", request=req)
         pdf_req = next(o for o in spider.parse_list(resp) if isinstance(o, Request))
         self.assertEqual(pdf_req.meta["fields"]["dispute_category"], category)
+
+
+def _tas_list_record():
+    return {
+        "documentId": 25755,
+        "documentNo": "AR125755",
+        "address": "; ქალაქი თბილისი , გლდანი , მიკრო/რაიონი I , კორპუსი 16 ",
+        "registrationDate": "2012-02-24 12:21:34",
+        "createDateStr": "24/02/2012",
+        "cachedInfo": (
+            "<documentCachedInfo><documentStatusName>-</documentStatusName>"
+            "<categoryName>ანტრესოლის, კიბის, ვიტრინის</categoryName>"
+            "<actionName>რეკონსტრუქცია</actionName>"
+            "<caseId>4</caseId></documentCachedInfo>"
+        ),
+    }
+
+
+def _tas_detail():
+    return {
+        "ok": True,
+        "canSeeFinalResult": True,
+        "openDate": "2012-03-05T20:00:00.000Z",
+        "document": {
+            "documentNo": "AR125755",
+            "createDateStr": "24/02/2012",
+            "deadLineDate": "2012-03-01T20:00:00.000Z",
+            "documentStatusId": 1,
+            "documentTypeId": 73058,
+            "amountToPay": 0,
+            "address": "; ქალაქი თბილისი , გლდანი , მიკრო/რაიონი I , კორპუსი 16 ",
+            "responseText": (
+                "<pre>ფასადზე I კლასის ფანჯრების შეცვლის თაობაზე</pre>\n"
+                "<pre>ქ. თბილისის მერიის სსიპ თბილისის არქიტექტურის სამსახური "
+                "ადასტურებს ფანჯრების შეცვლის შესაძლებლობას.</pre>"
+            ),
+        },
+        "docAuthor": {
+            "firstName": "თამარ",
+            "lastName": "მგელაშვილი",
+            "personalNo": "16001020967",
+            "birhtDate": "1970-07-12T20:00:00.000Z",
+            "address": "დუშეთი ს. მიგრიაულთა ",
+            "email": "tamar@mail.ru",
+            "phoneNumber": "555383887",
+            "passSerialNumber": "ბ0752055",
+            "personId": 171136,
+        },
+        "executorEmployee": {
+            "firstName": "ეკა",
+            "lastName": "კვირკველია",
+            "personalNo": "01024022244",
+            "email": "eka@gmail.com",
+            "phoneNumber": "568321515",
+            "employeeId": 525,
+        },
+        "mapInfos": [
+            {
+                "naprCadCode": "01.11.12.007.010.01.178",
+                "naprAddress": "ქალაქი თბილისი , გლდანი , მიკრო/რაიონი I , კორპუსი 16 ",
+                "naprArea": 17,
+                "naprPurpose": "არასასოფლო სამეურნეო",
+                "naprOwner": "თამარ   მგელაშვილი (P/N: 16001020967)",
+                "naprCoowner": None,
+                "naprRegNo": None,
+            }
+        ],
+        "docValues": [
+            {
+                "documentFieldId": 2997,
+                "clobValue": "გთხოვთ მომცეთ უფლება ჩემს კუთვნილ ბინაში ფანჯრების შეცვლის.",
+                "stringValue": None,
+                "dateValueStr": "",
+            },
+            {
+                "documentFieldId": 2998,
+                "clobValue": None,
+                "stringValue": "C:\\fakepath\\foto.pdf",
+                "dateValueStr": "",
+            },
+        ],
+        "fieldsetPojos": [
+            {"fields": [{"documentFieldId": 2997, "fieldLabel": "..მოთხოვნის ტექსტი"}]},
+            {"fields": [{"documentFieldId": 2998, "fieldLabel": "..ფოტოსურათების pdf ფაილი "}]},
+        ],
+        "oldResponseMotions": [
+            {
+                "previousMotionId": 65192,
+                "whenUserOpenedTheDoc": "2012-03-05T20:00:00.000Z",
+                "motionDate": "2012-03-01T05:36:30.000Z",
+                "documentStatusId": 3,
+            }
+        ],
+        "attachedFiles": [{"fileName": "foto.pdf"}, {"fileName": "montaJi.pdf"}],
+        "nomenklaturMarkup": (
+            "ნომენკლატურა : <UL><LI><strong>I კლასი</strong></LI>"
+            "<LI><strong>ანტრესოლის, კიბის</strong></LI></UL>"
+        ),
+    }
+
+
+class TasDetailTests(unittest.TestCase):
+    def test_enriched_item_maps_all_detail_fields(self):
+        spider = TasSpider()
+        item = spider.build_item(_tas_list_record(), _tas_detail())
+
+        # Title-info block.
+        self.assertEqual(item["document_no"], "AR125755")
+        self.assertEqual(item["decision_status_id"], 1)
+        self.assertEqual(item["decision"], "თანხმობა")
+        self.assertEqual(item["decision_no"], 65192)
+        self.assertEqual(item["applicant_name"], "თამარ მგელაშვილი")
+        self.assertEqual(item["applicant_personal_no"], "16001020967")
+        self.assertEqual(item["document_type_id"], 73058)
+        self.assertTrue(item["can_see_final_result"])
+
+        # Dates are converted to the Tbilisi (UTC+4) calendar day the site shows.
+        self.assertEqual(item["deadline_date"], "2012-03-02")
+        self.assertEqual(item["acquaint_date"], "2012-03-06")
+
+        # Executor + cadastral.
+        self.assertEqual(item["executor_name"], "ეკა კვირკველია")
+        self.assertEqual(item["cad_code"], "01.11.12.007.010.01.178")
+        self.assertEqual(item["land_area"], 17)
+        self.assertEqual(item["land_purpose"], "არასასოფლო სამეურნეო")
+
+        # Request text + structured lists.
+        self.assertTrue(item["request_text"].startswith("გთხოვთ მომცეთ უფლება"))
+        self.assertIn("foto.pdf", item["attachments"])
+        self.assertEqual(len(item["parcels"]), 1)
+        self.assertEqual(item["responses"][0]["decision_no"], 65192)
+        labels = {field["label"] for field in item["form_fields"]}
+        self.assertIn("..მოთხოვნის ტექსტი", labels)
+
+        # Decision text: converted, no code fences from the <pre> wrappers.
+        self.assertIn("ადასტურებს", item["response_markdown"])
+        self.assertNotIn("```", item["response_markdown"])
+
+        # Body weaves the title info + decision together.
+        self.assertIn("**გადაწყვეტილება:** თანხმობა", item["body_markdown"])
+        self.assertIn("AR125755", item["body_markdown"])
+        self.assertIn("ადასტურებს", item["body_markdown"])
+
+    def test_missing_detail_falls_back_to_list_only_item(self):
+        spider = TasSpider()
+        item = spider.build_item(_tas_list_record(), None)
+
+        self.assertEqual(item["document_no"], "AR125755")
+        self.assertIn("ანტრესოლის", item["nomenclature"])
+        self.assertIn("**ნომენკლატურა:**", item["body_markdown"])
+        # No detail-only fields when enrichment is skipped.
+        self.assertNotIn("decision", item)
+        self.assertNotIn("applicant_name", item)
+        self.assertNotIn("parcels", item)
+
+    def test_unsubmitted_draft_is_not_enriched(self):
+        spider = TasSpider()
+        detail = _tas_detail()
+        detail["document"]["documentStatusId"] = 8  # draft, never submitted
+        item = spider.build_item(_tas_list_record(), detail)
+
+        self.assertEqual(item["document_no"], "AR125755")
+        self.assertNotIn("decision", item)
+        self.assertNotIn("applicant_name", item)
 
 
 if __name__ == "__main__":
