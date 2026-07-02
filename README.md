@@ -138,6 +138,11 @@ uv run scrapy crawl tas          -a start_date=2024-06-03 -a end_date=2024-06-03
   server-side).
 - **napr** — list metadata comes as JSON (double-encoded); the decision body is a PDF
   that the spider downloads and extracts to text. `sender` is already masked at source.
+  `dispute_category` is captured by crawling category-filtered searches before the
+  catch-all search. The same pattern would theoretically fit `დავის საგანი` and
+  `გადაწყვეტილების დასახელება/ტიპი`, but the live site currently posts all three
+  selects through one `ptag` field and concatenates combined selections, so those two
+  filters are not reliable as distinct scraped fields.
 - **tbappeal** — the only source with **no server-side date filter**: it crawls the
   small (~7-page) reverse-chronological category, filters each post by its listed date,
   and dedupes by slug. The full ruling is linked as `pdf_url`. Uses the apex domain

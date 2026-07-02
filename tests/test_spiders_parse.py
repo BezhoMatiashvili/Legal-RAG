@@ -2,6 +2,7 @@ import json
 import sys
 import unittest
 from pathlib import Path
+from urllib.parse import parse_qs
 from unittest.mock import MagicMock
 
 from scrapy import Request
@@ -13,7 +14,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "scraper"))
 
 from legal_scrapers.spiders.constcourt_spider import ConstcourtSpider, TEASER_MARKER  # noqa: E402
 from legal_scrapers.spiders.matsne_spider import MatsneSpider  # noqa: E402
-from legal_scrapers.spiders.napr_spider import NaprSpider  # noqa: E402
+from legal_scrapers.spiders.napr_spider import DISPUTE_CATEGORIES, NaprSpider  # noqa: E402
 from legal_scrapers.spiders.supremecourt_spider import SupremecourtSpider  # noqa: E402
 
 
@@ -113,6 +114,29 @@ class SupremecourtParseTests(unittest.TestCase):
 
 
 class NaprParseTests(unittest.TestCase):
+    def test_category_request_posts_ptag(self):
+        spider = NaprSpider(start_date="2024-01-01", end_date="2024-12-31")
+        category = DISPUTE_CATEGORIES[0]
+        req = spider.request_page(from_n=0, dispute_category=category)
+        payload = parse_qs(req.body.decode("utf-8"), keep_blank_values=True)
+        self.assertEqual(payload["ptag"], [category])
+        self.assertEqual(req.meta["dispute_category"], category)
+
+    def test_idle_schedules_unfiltered_pass_once(self):
+        spider = NaprSpider(start_date="2024-01-01", end_date="2024-12-31")
+        spider.catch_all_started = False
+        spider.crawler = MagicMock()
+        with self.assertRaises(DontCloseSpider):
+            spider.spider_idle()
+        req = spider.crawler.engine.crawl.call_args.args[0]
+        payload = parse_qs(req.body.decode("utf-8"), keep_blank_values=True)
+        self.assertEqual(payload["ptag"], [""])
+        self.assertIsNone(req.meta["dispute_category"])
+
+        spider.crawler.engine.crawl.reset_mock()
+        self.assertIsNone(spider.spider_idle())
+        spider.crawler.engine.crawl.assert_not_called()
+
     def test_double_encoded_json_yields_pdf_follow(self):
         spider = NaprSpider(start_date="2024-01-01", end_date="2024-12-31")
         inner = {
@@ -128,6 +152,27 @@ class NaprParseTests(unittest.TestCase):
         resp = TextResponse(url=req.url, body=body.encode("utf-8"), encoding="utf-8", request=req)
         reqs = [o for o in spider.parse_list(resp) if isinstance(o, Request)]
         self.assertTrue(any("file77.pdf" in r.url for r in reqs))
+
+    def test_category_phase_attaches_dispute_category(self):
+        spider = NaprSpider(start_date="2024-01-01", end_date="2024-12-31")
+        category = DISPUTE_CATEGORIES[0]
+        inner = {
+            "data": [{
+                "LETTERS_ID": "77", "RANDOMID": "r", "REGISTRATIONDATE": "2024-12-30 00:00:00",
+                "SENDER": "s", "ABOUT": "a", "KANC_DATE": "2024-12-30 00:00:00", "KANC_NO": "9",
+                "PDF": "/uploads/administrativeComplaints/file77.pdf",
+            }],
+            "total": "1",
+        }
+        body = json.dumps(json.dumps(inner))
+        req = Request(
+            url="https://www.napr.gov.ge/legal_search",
+            method="POST",
+            meta={"from_n": 0, "dispute_category": category},
+        )
+        resp = TextResponse(url=req.url, body=body.encode("utf-8"), encoding="utf-8", request=req)
+        pdf_req = next(o for o in spider.parse_list(resp) if isinstance(o, Request))
+        self.assertEqual(pdf_req.meta["fields"]["dispute_category"], category)
 
 
 if __name__ == "__main__":

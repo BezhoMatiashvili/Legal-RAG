@@ -111,6 +111,7 @@ class NaprItem(scrapy.Item):
     date = _f()                    # REGISTRATIONDATE
     sender = _f()                  # SENDER (already masked by the source)
     title = _f()                   # ABOUT
+    dispute_category = _f()        # "დავის ტიპი/კატეგორია" search filter (ptag)
     decision_date = _f()           # KANC_DATE
     decision_no = _f()             # KANC_NO
     pdf_url = _f()
