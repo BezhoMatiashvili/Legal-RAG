@@ -101,14 +101,14 @@ def test_napr_number_app_no_and_sender():
 def test_supremecourt_number_and_title_fallback():
     # subject present -> title combines subject + case_number
     doc = normalize("supremecourt", {
-        "case_id": "35513", "chamber": "0", "case_number": "ბს-174(კს-26)",
+        "case_id": "35513", "chamber": "ადმინისტრაციულ საქმეთა პალატა", "case_number": "ბს-174(კს-26)",
         "subject": "ადმინისტრაციული აქტი", "date": "2026-03-05", "body_markdown": "x",
     })
     assert doc.document_number == "ბს-174(კს-26)"
     assert "ბს-174(კს-26)" in doc.title
     # subject missing -> falls back to case_number alone (no empty title)
     doc2 = normalize("supremecourt", {
-        "case_id": "1", "chamber": "0", "case_number": "ბს-1", "date": "2026-03-05",
+        "case_id": "1", "chamber": "ადმინისტრაციულ საქმეთა პალატა", "case_number": "ბს-1", "date": "2026-03-05",
         "body_markdown": "x",
     })
     assert doc2.title == "ბს-1"
@@ -153,10 +153,10 @@ def test_ecd_mapping_joins_title_and_reads_dynamic_court():
 
 def test_supremecourt_composite_id():
     doc = normalize("supremecourt", {
-        "case_id": "73901", "chamber": "1", "subject": "დავა", "date": "2024-12-26",
+        "case_id": "73901", "chamber": "სამოქალაქო საქმეთა პალატა", "subject": "დავა", "date": "2024-12-26",
         "body_markdown": "x",
     })
-    assert doc.document_id == "73901:1"
+    assert doc.document_id == "73901:სამოქალაქო საქმეთა პალატა"
     assert doc.title == "დავა"
     assert doc.court == "supremecourt"
 

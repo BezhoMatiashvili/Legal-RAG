@@ -136,7 +136,7 @@ class SupremecourtItem(scrapy.Item):
 
     source_url = _f()
     case_id = _f()
-    chamber = _f()                 # palata 0/1/2
+    chamber = _f()                 # official chamber name
     case_number = _f()
     date = _f()
     subject = _f()

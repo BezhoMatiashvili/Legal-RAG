@@ -25,7 +25,12 @@ from .base import BaseLegalSpider
 
 BASE = "https://www.supremecourt.ge"
 GETCASES_URL = f"{BASE}/ka/getCases"
-CHAMBERS = (0, 1, 2)  # palata: administrative / civil / criminal chambers
+CHAMBER_NAMES = {
+    "0": "ადმინისტრაციულ საქმეთა პალატა",
+    "1": "სამოქალაქო საქმეთა პალატა",
+    "2": "სისხლის სამართლის საქმეთა პალატა",
+}
+CHAMBERS = tuple(int(palata) for palata in CHAMBER_NAMES)
 MAX_PAGES = 5000  # safety cap (the JS pager has no real "last page" marker)
 _FULLCASE_RE = re.compile(r"/fullcase/(\d+)/(\d+)")
 
@@ -83,9 +88,9 @@ class SupremecourtSpider(BaseLegalSpider):
             match = _FULLCASE_RE.search(href or "")
             if not match:
                 continue
-            case_id, chamber = match.group(1), match.group(2)
+            case_id, palata = match.group(1), match.group(2)
 
-            fields = {"case_id": case_id, "chamber": chamber}
+            fields = {"case_id": case_id, "chamber": CHAMBER_NAMES.get(palata, palata)}
             for child in case.xpath("./*"):
                 label = "".join(child.xpath("./span//text()").getall()).strip().rstrip(":").strip()
                 field = CASE_LABELS.get(label)
@@ -102,7 +107,7 @@ class SupremecourtSpider(BaseLegalSpider):
                 href,
                 callback=self.parse_detail,
                 errback=self.request_failed,
-                meta={"fields": fields},
+                meta={"fields": fields, "palata": palata},
             )
 
         if cases and page < MAX_PAGES:
@@ -112,7 +117,8 @@ class SupremecourtSpider(BaseLegalSpider):
 
     def parse_detail(self, response):
         fields = response.meta["fields"]
-        case_id, chamber = fields["case_id"], fields["chamber"]
+        case_id = fields["case_id"]
+        palata = response.meta["palata"]
 
         body_html = response.css("div.case-single#modalBody").get()
         body_markdown = safe_html_to_markdown(body_html, base_url=BASE, source_url=response.url)
@@ -121,6 +127,6 @@ class SupremecourtSpider(BaseLegalSpider):
         loader.add_value("source_url", response.url)
         for key, value in fields.items():
             loader.add_value(key, value)
-        loader.add_value("docx_url", f"{BASE}/ka/download/{case_id}/{chamber}")
+        loader.add_value("docx_url", f"{BASE}/ka/download/{case_id}/{palata}")
         loader.add_value("body_markdown", body_markdown)
         yield loader.load_item()

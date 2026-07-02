@@ -111,10 +111,28 @@ class SupremecourtParseTests(unittest.TestCase):
         self.assertEqual(len(follows), 1)
         fields = follows[0].meta["fields"]
         self.assertEqual(fields["case_id"], "73901")
-        self.assertEqual(fields["chamber"], "1")
+        self.assertEqual(fields["chamber"], "სამოქალაქო საქმეთა პალატა")
         self.assertEqual(fields["case_number"], "ას-1")
         self.assertEqual(fields["date"], "2024-12-26")
         self.assertEqual(fields["appeal_type"], "საკასაციო")
+
+    def test_parse_detail_keeps_numeric_palata_for_download_url(self):
+        spider = SupremecourtSpider(start_date="2024-01-01", end_date="2024-12-31")
+        fields = {
+            "case_id": "73901",
+            "chamber": "სამოქალაქო საქმეთა პალატა",
+            "case_number": "ას-1",
+        }
+        resp = _html(
+            "https://www.supremecourt.ge/ka/fullcase/73901/1",
+            '<div class="case-single" id="modalBody">სრული ტექსტი</div>',
+            {"fields": fields, "palata": "1"},
+        )
+
+        item = next(iter(spider.parse_detail(resp)))
+
+        self.assertEqual(item["chamber"], "სამოქალაქო საქმეთა პალატა")
+        self.assertEqual(item["docx_url"], "https://www.supremecourt.ge/ka/download/73901/1")
 
 
 class NaprParseTests(unittest.TestCase):

@@ -17,9 +17,9 @@
 {"query": "სპეციალური პროფესიული საგანმანათლებლო პროგრამა და მომზადება-გადამზადება", "gold": {"source": "matsne", "document_id": "6769851"}, "note": "semantic"}
 {"query": "თავდაცვის სამინისტროს სისტემის მოსამსახურის ჯანმრთელობის მდგომარეობის შემოწმება", "gold": {"source": "matsne", "document_id": "6690163"}, "note": "semantic"}
 # --- supremecourt (court_decision) ---
-{"query": "ადმინისტრაციულ-სამართლებრივი აქტების ბათილად ცნობა, კერძო საჩივარი უზენაეს სასამართლოში", "gold": {"source": "supremecourt", "document_id": "35513:0"}, "note": "semantic subject"}
+{"query": "ადმინისტრაციულ-სამართლებრივი აქტების ბათილად ცნობა, კერძო საჩივარი უზენაეს სასამართლოში", "gold": {"source": "supremecourt", "document_id": "35513:ადმინისტრაციულ საქმეთა პალატა"}, "note": "semantic subject"}
 {"query": "ბს-152(გ-26)", "gold": {"source": "supremecourt", "document_number": "ბს-152(გ-26)"}, "note": "bare case number -> sparse exact match"}
-{"query": "ინდივიდუალური ადმინისტრაციული აქტის ბათილად ცნობა, საკასაციო საჩივარი", "gold": {"source": "supremecourt", "document_id": "35509:0"}, "note": "semantic"}
+{"query": "ინდივიდუალური ადმინისტრაციული აქტის ბათილად ცნობა, საკასაციო საჩივარი", "gold": {"source": "supremecourt", "document_id": "35509:ადმინისტრაციულ საქმეთა პალატა"}, "note": "semantic"}
 # --- ecd (court_decision) ---
 {"query": "თბილისის საქალაქო სასამართლოს გადაწყვეტილება საქმე N8140-18", "gold": {"source": "ecd", "document_id": "5964662"}, "note": "semantic + ref"}
 {"query": "010142220700110071", "gold": {"source": "ecd", "document_number": "010142220700110071"}, "note": "bare case_no -> sparse"}
