@@ -12,6 +12,19 @@ uv sync
 uv run playwright install chromium   # only needed for the `tas` spider
 ```
 
+## Scrape everything
+
+```bash
+cd matsne
+uv run python -m matsne.run --start-date YYYY-MM-DD --end-date YYYY-MM-DD
+```
+
+To scrape and ingest together from the repo root:
+
+```bash
+python3 run_all.py --start-date YYYY-MM-DD --end-date YYYY-MM-DD
+```
+
 ## Running a spider
 
 All spiders run from the Scrapy project directory and share the same interface:
