@@ -15,7 +15,9 @@ Quirks handled here:
   საგანი" and "გადაწყვეტილების დასახელება/ტიპი" too. The live form is buggy as of
   2026-07-02: all three selects are collapsed into the same ``ptag`` parameter, and
   combined selections are concatenated without a separator, so those two fields are
-  not reliable enough to scrape as distinct item fields.
+  not reliable enough to scrape as distinct item fields. ``decision_type_name`` is
+  instead derived from the leading title phrase when the title contains
+  "გადაწყვეტილება".
 - ``SENDER`` already arrives masked by the source (personal IDs redacted).
 
 napr's robots.txt is an invalid IIS error page, which Scrapy treats as allow-all, so
@@ -34,6 +36,7 @@ from .base import BaseLegalSpider
 
 BASE = "https://www.napr.gov.ge"
 SEARCH_URL = f"{BASE}/legal_search"
+DECISION_WORD = "გადაწყვეტილება"
 
 DISPUTE_CATEGORIES = [
     "უძრავ ნივთებზე უფლებათა რეესტრი",
@@ -57,6 +60,16 @@ DISPUTE_CATEGORIES = [
     "საინფორმაციო/რეალაქტი",
     "სისტემური რეგისტრაცია (ირიგაციის არეალი)",
 ]
+
+
+def decision_type_from_title(title):
+    if not isinstance(title, str):
+        return None
+    normalized = " ".join(title.split())
+    decision_word_end = normalized.find(DECISION_WORD)
+    if decision_word_end == -1:
+        return None
+    return normalized[: decision_word_end + len(DECISION_WORD)]
 
 
 class NaprSpider(BaseLegalSpider):
@@ -109,13 +122,15 @@ class NaprSpider(BaseLegalSpider):
         total = int(data.get("total") or 0)
 
         for record in records:
+            title = record.get("ABOUT")
             fields = {
                 "source_url": f"{BASE}/ka/legal-practice",
                 "document_id": record.get("LETTERS_ID"),
                 "app_no": record.get("RANDOMID"),
                 "date": date_part(record.get("REGISTRATIONDATE")),
                 "sender": record.get("SENDER"),
-                "title": record.get("ABOUT"),
+                "title": title,
+                "decision_type_name": decision_type_from_title(title),
                 "decision_date": date_part(record.get("KANC_DATE")),
                 "decision_no": record.get("KANC_NO"),
             }

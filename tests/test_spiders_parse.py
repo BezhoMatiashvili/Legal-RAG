@@ -14,7 +14,11 @@ sys.path.insert(0, str(PROJECT_ROOT / "scraper"))
 
 from legal_scrapers.spiders.constcourt_spider import ConstcourtSpider, TEASER_MARKER  # noqa: E402
 from legal_scrapers.spiders.matsne_spider import MatsneSpider  # noqa: E402
-from legal_scrapers.spiders.napr_spider import DISPUTE_CATEGORIES, NaprSpider  # noqa: E402
+from legal_scrapers.spiders.napr_spider import (  # noqa: E402
+    DISPUTE_CATEGORIES,
+    NaprSpider,
+    decision_type_from_title,
+)
 from legal_scrapers.spiders.supremecourt_spider import SupremecourtSpider  # noqa: E402
 
 
@@ -114,6 +118,47 @@ class SupremecourtParseTests(unittest.TestCase):
 
 
 class NaprParseTests(unittest.TestCase):
+    def test_decision_type_from_title_extracts_parenthesized_detail_prefix(self):
+        title = (
+            "ა/ს დაკმაყოფილებაზე უარის თქმის შესახებ გადაწყვეტილება "
+            "(რეგისტრაციაზე უარის თქმის შესახებ №1 გადაწყვეტილება)."
+        )
+        self.assertEqual(
+            decision_type_from_title(title),
+            "ა/ს დაკმაყოფილებაზე უარის თქმის შესახებ გადაწყვეტილება",
+        )
+
+    def test_decision_type_from_title_extracts_dash_detail_prefix(self):
+        title = (
+            "დაკმაყოფილებაზე უარის თქმის შესახებ გადაწყვეტილება - "
+            "რეგისტრაციაზე უარის თქმის შესახებ №1 გადაწყვეტილება."
+        )
+        self.assertEqual(
+            decision_type_from_title(title),
+            "დაკმაყოფილებაზე უარის თქმის შესახებ გადაწყვეტილება",
+        )
+
+    def test_decision_type_from_title_collapses_whitespace(self):
+        title = " ა/ს დაკმაყოფილების შესახებ  გადაწყვეტილება   (x)"
+        self.assertEqual(
+            decision_type_from_title(title),
+            "ა/ს დაკმაყოფილების შესახებ გადაწყვეტილება",
+        )
+
+    def test_decision_type_from_title_preserves_administrative_complaint_variant(self):
+        title = (
+            "ადმინისტრაციული საჩივრის დაკმაყოფილებაზე უარის თქმის შესახებ "
+            "გადაწყვეტილება (x)"
+        )
+        self.assertEqual(
+            decision_type_from_title(title),
+            "ადმინისტრაციული საჩივრის დაკმაყოფილებაზე უარის თქმის შესახებ გადაწყვეტილება",
+        )
+
+    def test_decision_type_from_title_returns_none_without_decision_word(self):
+        self.assertIsNone(decision_type_from_title("სსიპ საჯარო რეესტრის წერილი"))
+        self.assertIsNone(decision_type_from_title(None))
+
     def test_category_request_posts_ptag(self):
         spider = NaprSpider(start_date="2024-01-01", end_date="2024-12-31")
         category = DISPUTE_CATEGORIES[0]
@@ -139,10 +184,11 @@ class NaprParseTests(unittest.TestCase):
 
     def test_double_encoded_json_yields_pdf_follow(self):
         spider = NaprSpider(start_date="2024-01-01", end_date="2024-12-31")
+        title = "ა/ს დაკმაყოფილების შესახებ გადაწყვეტილება (x)"
         inner = {
             "data": [{
                 "LETTERS_ID": "77", "RANDOMID": "r", "REGISTRATIONDATE": "2024-12-30 00:00:00",
-                "SENDER": "s", "ABOUT": "a", "KANC_DATE": "2024-12-30 00:00:00", "KANC_NO": "9",
+                "SENDER": "s", "ABOUT": title, "KANC_DATE": "2024-12-30 00:00:00", "KANC_NO": "9",
                 "PDF": "/uploads/administrativeComplaints/file77.pdf",
             }],
             "total": "1",
@@ -152,6 +198,10 @@ class NaprParseTests(unittest.TestCase):
         resp = TextResponse(url=req.url, body=body.encode("utf-8"), encoding="utf-8", request=req)
         reqs = [o for o in spider.parse_list(resp) if isinstance(o, Request)]
         self.assertTrue(any("file77.pdf" in r.url for r in reqs))
+        self.assertEqual(
+            reqs[0].meta["fields"]["decision_type_name"],
+            "ა/ს დაკმაყოფილების შესახებ გადაწყვეტილება",
+        )
 
     def test_category_phase_attaches_dispute_category(self):
         spider = NaprSpider(start_date="2024-01-01", end_date="2024-12-31")
