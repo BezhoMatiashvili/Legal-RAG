@@ -31,7 +31,7 @@ class BaseLegalSpider(scrapy.Spider):
     dedup_enabled = False
     _seen_keys: set = frozenset()
 
-    # base.py lives at <repo>/matsne/matsne/spiders/base.py, so parents[3] == <repo>.
+    # base.py lives at <repo>/scraper/legal_scrapers/spiders/base.py, so parents[3] == <repo>.
     # Each spider writes under ARTIFACTS_ROOT / <name> / ... (see configure_run_outputs).
     ARTIFACTS_ROOT = Path(__file__).resolve().parents[3] / "artifacts"
 
