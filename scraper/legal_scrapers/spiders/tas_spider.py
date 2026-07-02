@@ -324,6 +324,10 @@ class TasSpider(BaseLegalSpider):
         "PLAYWRIGHT_LAUNCH_OPTIONS": {"headless": True},
         "PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT": 60000,
         "CONCURRENT_REQUESTS": 1,
+        # The one navigational request only fetches the ExtJS shell page; all data comes
+        # from in-page DWR calls. Serving that shell from the HTTP cache bypasses the
+        # Playwright handler (no ``playwright_page`` in meta), so scope caching off here.
+        "HTTPCACHE_ENABLED": False,
     }
 
     async def start(self):
