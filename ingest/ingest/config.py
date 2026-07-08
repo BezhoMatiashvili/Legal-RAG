@@ -1,5 +1,7 @@
 """Env-driven configuration. Reads a .env file if present (python-dotenv)."""
 
+import hashlib
+import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,6 +37,19 @@ def _float_opt(name: str, default: float | None) -> float | None:
     return float(raw)
 
 
+def _device_opt(name: str) -> str | None:
+    """A device string (``cpu``/``cuda``/``cuda:0``/``mps``) or None.
+
+    Defensive against python-dotenv leaking an inline ``.env`` comment as the value
+    (e.g. ``EMBED_DEVICE=   # blank = auto``): a real device has no whitespace or ``#``,
+    so anything else is treated as unset.
+    """
+    raw = (os.getenv(name) or "").strip()
+    if not raw or raw.startswith("#") or any(c.isspace() for c in raw):
+        return None
+    return raw
+
+
 @dataclass(frozen=True)
 class Config:
     qdrant_url: str
@@ -56,29 +71,58 @@ class Config:
     chunk_min_tokens: int
     artifacts_root: Path
     state_dir: Path
+    query_log_enabled: bool
+    query_log_path: Path
 
 
 def load_config() -> Config:
     artifacts = os.getenv("ARTIFACTS_ROOT")
     artifacts_root = Path(artifacts) if artifacts else REPO_ROOT / "artifacts"
+    state_dir = REPO_ROOT / "ingest" / ".state"
+    ql_path = os.getenv("QUERY_LOG_PATH")
     return Config(
         qdrant_url=os.getenv("QDRANT_URL", "http://localhost:6333"),
         qdrant_api_key=os.getenv("QDRANT_API_KEY") or None,
         collection_name=os.getenv("COLLECTION_NAME", "georgian_legal"),
         embed_model=os.getenv("EMBED_MODEL", "BAAI/bge-m3"),
         dense_dim=_int("DENSE_DIM", 1024),
-        embed_device=os.getenv("EMBED_DEVICE") or None,
+        embed_device=_device_opt("EMBED_DEVICE"),
         embed_use_fp16=_bool("EMBED_USE_FP16", False),
         embed_batch_size=_int("EMBED_BATCH_SIZE", 8),
         rerank_enabled=_bool("RERANK_ENABLED", True),
         rerank_model=os.getenv("RERANK_MODEL", "BAAI/bge-reranker-v2-m3"),
         rerank_candidates=_int("RERANK_CANDIDATES", 80),
         rerank_min_score=_float_opt("RERANK_MIN_SCORE", 0.3),
-        rerank_device=os.getenv("RERANK_DEVICE") or os.getenv("EMBED_DEVICE") or None,
+        rerank_device=_device_opt("RERANK_DEVICE") or _device_opt("EMBED_DEVICE"),
         rerank_use_fp16=_bool("RERANK_USE_FP16", False),
         chunk_tokens=_int("CHUNK_TOKENS", 512),
         chunk_overlap=_int("CHUNK_OVERLAP", 80),
         chunk_min_tokens=_int("CHUNK_MIN_TOKENS", 64),
         artifacts_root=artifacts_root.resolve(),
-        state_dir=REPO_ROOT / "ingest" / ".state",
+        state_dir=state_dir,
+        query_log_enabled=_bool("QUERY_LOG_ENABLED", True),
+        query_log_path=Path(ql_path) if ql_path else state_dir / "queries.jsonl",
     )
+
+
+def retrieval_fingerprint(cfg: Config) -> str:
+    """Stable 16-hex digest of the knobs that determine what a search returns.
+
+    Stamped into MCP responses and the query log so any answer is traceable to the exact
+    index + retrieval config that produced it. Lives here (not in ``eval.explog``) so the
+    ``ingest`` package never imports ``eval`` — the layering only goes eval → ingest.
+    """
+    material = {
+        "collection_name": cfg.collection_name,
+        "embed_model": cfg.embed_model,
+        "dense_dim": cfg.dense_dim,
+        "rerank_enabled": cfg.rerank_enabled,
+        "rerank_model": cfg.rerank_model if cfg.rerank_enabled else None,
+        "rerank_candidates": cfg.rerank_candidates,
+        "rerank_min_score": cfg.rerank_min_score,
+        "chunk_tokens": cfg.chunk_tokens,
+        "chunk_overlap": cfg.chunk_overlap,
+        "chunk_min_tokens": cfg.chunk_min_tokens,
+    }
+    blob = json.dumps(material, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(blob.encode()).hexdigest()[:16]

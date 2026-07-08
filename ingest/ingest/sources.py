@@ -130,6 +130,11 @@ class CanonicalDoc:
     expiry_date: str | None      # ISO date the act loses force (matsne)
     body_markdown: str
     extra: dict
+    # Selected structured fields promoted from the raw item into the Qdrant payload so they
+    # are filterable/returnable (e.g. tas applicant IDs/phones). Personal data is retained
+    # by design — the index is local and confidential (see prompt.md:40). Empty for sources
+    # with no promoted fields.
+    promoted: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -151,6 +156,20 @@ class SourceSpec:
     in_force_fields: tuple[str, ...] = ()    # date the act enters into force
     expiry_fields: tuple[str, ...] = ()      # date the act loses force
     url_fields: tuple[str, ...] = field(default=("source_url", "document_url"))
+    promote_fields: tuple[str, ...] = ()     # raw item keys copied verbatim into payload
+
+    def declared_keys(self) -> set[str]:
+        """Every raw item key this spec reads — the schema-drift baseline of handled fields."""
+        keys: set[str] = {"body_markdown"}
+        for group in (self.id_fields, self.date_fields, self.title_fields, self.number_fields,
+                      self.registration_fields, self.parties_fields, self.in_force_fields,
+                      self.expiry_fields, self.url_fields, self.promote_fields):
+            keys.update(group)
+        for single in (self.doc_type_field, self.court_field, self.language_field,
+                       self.status_field):
+            if single:
+                keys.add(single)
+        return keys
 
     def _first(self, item, fields):
         for f in fields:
@@ -193,6 +212,8 @@ class SourceSpec:
         status_raw = item.get(self.status_field) if self.status_field else None
         status_raw = str(status_raw).strip() if status_raw not in (None, "") else None
 
+        promoted = {f: item[f] for f in self.promote_fields if item.get(f) not in (None, "", [])}
+
         return CanonicalDoc(
             source=self.source,
             document_id=document_id,
@@ -212,6 +233,7 @@ class SourceSpec:
             expiry_date=_parse_date(self._first(item, self.expiry_fields)),
             body_markdown=item.get("body_markdown") or "",
             extra=item,
+            promoted=promoted,
         )
 
 
@@ -288,8 +310,26 @@ SOURCES: dict[str, SourceSpec] = {
         title_fields=("document_no", "nomenclature"),
         number_fields=("document_no",),
         court="tas",
+        # Structured personal/party data promoted into the payload so staff can filter on
+        # it (retained by design — the index is local & confidential; see prompt.md:40).
+        # ``status``/``nomenclature`` are intentionally NOT promoted: the former collides
+        # with the canonical legal-status key, the latter is already in the title.
+        promote_fields=(
+            "applicant_personal_no", "applicant_birth_date", "applicant_address",
+            "applicant_phone", "applicant_passport",
+            "executor_personal_no", "executor_phone",
+            "address",
+        ),
     ),
 }
+
+# Promoted payload keys that get a Qdrant index, with the index kind: exact-match keyword
+# for identifiers/phones/dates, full-text for addresses. Keeps promoted PII filterable.
+PROMOTED_KEYWORD_FIELDS = (
+    "applicant_personal_no", "applicant_passport", "applicant_phone",
+    "executor_personal_no", "executor_phone", "applicant_birth_date",
+)
+PROMOTED_TEXT_FIELDS = ("applicant_address", "address")
 
 
 def normalize(source: str, item: dict) -> CanonicalDoc:
@@ -298,3 +338,18 @@ def normalize(source: str, item: dict) -> CanonicalDoc:
     except KeyError:
         raise ValueError(f"Unknown source {source!r}; known: {sorted(SOURCES)}") from None
     return spec.build(item)
+
+
+def schema_drift(source: str, item: dict, seen: set[str]) -> tuple[set[str], set[str]]:
+    """Detect scraped-JSON schema drift for ``source`` against a running key baseline.
+
+    Returns ``(new_keys, undeclared_keys)``: ``new_keys`` are raw item keys not yet in
+    ``seen`` (a field appeared in the crawler output); ``undeclared_keys`` is the subset the
+    :class:`SourceSpec` doesn't read at all (definitely unhandled — a likely field rename or
+    a new field worth wiring in). Both empty when nothing changed. The caller seeds ``seen``
+    from the first item (no alert) and unions ``new_keys`` back into it after each check, so
+    drift is reported once per newly-appearing key, not per document.
+    """
+    new_keys = set(item) - seen
+    undeclared = new_keys - SOURCES[source].declared_keys()
+    return new_keys, undeclared

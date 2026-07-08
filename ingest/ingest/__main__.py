@@ -97,6 +97,84 @@ def _cmd_watch(args) -> None:
     )
 
 
+def _cmd_snapshot(args) -> None:
+    from . import pipeline, snapshot
+
+    cfg = _resolved_cfg(args)
+    sources = pipeline.resolve_sources(args.source) if args.source != "all" else list(snapshot.SOURCES_PRESENT)
+    print(f"Building clean corpus snapshot from {len(sources)} source(s): {', '.join(sources)}")
+    snapshot.build_snapshot(
+        cfg, sources=sources, limit=args.limit,
+        near_dup=not args.no_near_dup, token_sample=args.token_sample,
+    )
+
+
+def _cmd_embed(args) -> None:
+    import json as _json
+    import random
+
+    from . import embed_job
+    from . import qdrant_store as store
+    from .embedding import BGEM3Embedder, make_token_counter
+
+    cfg = _resolved_cfg(args)
+    print(f"Loading embedding model {cfg.embed_model} (device={cfg.embed_device or 'auto/cpu'}, "
+          f"fp16={cfg.embed_use_fp16}, batch={cfg.embed_batch_size})...")
+    embedder = BGEM3Embedder(cfg)
+
+    digest, vec = embed_job.dense_checksum(embedder)
+    print(f"VECTOR-SPACE CHECKSUM: sha={digest}  dims[:8]={[round(x, 5) for x in vec[:8]]}")
+    print("  (embed the same sentence CPU vs GPU; assert cosine≈1 — guardrail G2)")
+    if args.checksum:
+        ref = embed_job.SNAPSHOT_DOCS.parent / "checksum_cpu.json"
+        embed_job.save_checksum_reference(embedder, ref)
+        print(f"  saved CPU reference vector → {ref}")
+        return
+
+    count_tokens = make_token_counter(cfg.embed_model)
+    client = store.make_client(cfg)
+    store.ensure_collection(client, cfg, recreate=args.recreate)
+
+    if args.pilot:
+        # gold/holdout docs (so the harness resolves) + a distractor sample per source
+        holdout = _json.loads(
+            (embed_job.SNAPSHOT_DOCS.parent.parent.parent / "eval" / "holdout_doc_ids.json").read_text()
+        )
+        gold_by_src: dict[str, set[str]] = {}
+        for x in holdout:
+            gold_by_src.setdefault(x["source"], set()).add(x["document_id"])
+        rng = random.Random(0)
+        docs = []
+        for source in embed_job.SOURCES:
+            docs.extend(embed_job.load_snapshot_docs(source, gold_by_src.get(source, set())))
+            gold_ids = gold_by_src.get(source, set())
+            pool = [d for d in embed_job.iter_snapshot_docs(source, limit=args.distractors * 3)
+                    if d.document_id not in gold_ids]
+            docs.extend(rng.sample(pool, min(args.distractors, len(pool))))
+        d, c, k = embed_job.embed_docs(cfg, client, embedder, count_tokens, docs,
+                                       batch_size=args.batch_size)
+        info = client.get_collection(cfg.collection_name)
+        print(f"Pilot embedded: {d} docs -> {c} chunks ({k} skipped). "
+              f"Collection '{cfg.collection_name}' now has {info.points_count} points.")
+        return
+
+    # full-corpus resumable embed (RunPod production profile)
+    sources = [args.source] if args.source != "all" else list(embed_job.SOURCES)
+    grand_d = grand_c = grand_k = 0
+    for source in sources:
+        d, c, k = embed_job.embed_source_resumable(
+            cfg, client, embedder, count_tokens, source,
+            batch_size=args.batch_size, limit=args.limit,
+        )
+        print(f"  {source}: {d} docs -> {c} chunks ({k} skipped)")
+        grand_d += d
+        grand_c += c
+        grand_k += k
+    info = client.get_collection(cfg.collection_name)
+    print(f"Done: {grand_d} docs -> {grand_c} chunks ({grand_k} skipped). "
+          f"Collection '{cfg.collection_name}' now has {info.points_count} points.")
+
+
 def _cmd_search(args) -> None:
     from . import qdrant_store as store
     from . import search as search_mod
@@ -160,6 +238,30 @@ def main() -> None:
     p_watch.add_argument("--limit", type=int, default=None,
                          help="cap docs per source per drain pass (debug)")
     p_watch.set_defaults(func=_cmd_watch)
+
+    p_snap = sub.add_parser(
+        "snapshot", help="build a clean, deduplicated, versioned corpus snapshot (Part 1)")
+    p_snap.add_argument("--source", default="all", help="spider name or 'all' (present sources)")
+    p_snap.add_argument("--limit", type=int, default=None, help="cap docs per source (dev)")
+    p_snap.add_argument("--no-near-dup", action="store_true",
+                        help="skip the MinHash/LSH near-duplicate pass (faster)")
+    p_snap.add_argument("--token-sample", type=int, default=2000,
+                        help="docs/source to sample for the BGE-M3 token-length profile")
+    p_snap.set_defaults(func=_cmd_snapshot)
+
+    p_embed = sub.add_parser(
+        "embed", help="embed the clean snapshot into Qdrant (CPU pilot / RunPod GPU prod)")
+    p_embed.add_argument("--source", default="all", help="source name or 'all'")
+    p_embed.add_argument("--pilot", action="store_true",
+                         help="embed holdout/gold docs + a distractor sample (interim baseline)")
+    p_embed.add_argument("--distractors", type=int, default=400,
+                         help="distractor docs/source in --pilot mode")
+    p_embed.add_argument("--checksum", action="store_true",
+                         help="print the vector-space checksum and exit (CPU-vs-GPU guardrail)")
+    p_embed.add_argument("--limit", type=int, default=None, help="cap docs/source (full mode)")
+    p_embed.add_argument("--batch-size", type=int, default=256, help="points per upsert batch")
+    p_embed.add_argument("--recreate", action="store_true", help="drop & recreate the collection")
+    p_embed.set_defaults(func=_cmd_embed)
 
     p_search = sub.add_parser("search", help="hybrid search the collection")
     p_search.add_argument("query")

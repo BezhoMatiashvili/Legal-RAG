@@ -5,7 +5,7 @@
       "args": [
         "run",
         "--directory",
-        "/Users/bezhomatiashvili/Desktop/matsne_scraping/ingest",
+        "/home/bezhomatiashvili/Desktop/Projects/Georgia-Legal-Search/ingest",
         "python",
         "-m",
         "ingest.mcp_server"

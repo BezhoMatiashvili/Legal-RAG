@@ -1,9 +1,20 @@
 """Structure-aware Markdown chunking, token-bounded with overlap.
 
-Splits on Markdown headings (our bodies already carry them), packs each section to a
-token budget with overlap, merges tiny tail chunks, and prepends the heading path to
-each chunk for lightweight context. The token counter is injectable so production uses
-the BGE-M3 tokenizer while tests run offline with a word counter.
+Splits on Markdown headings and legal article markers (``მუხლი N``), packs each section to
+a token budget with overlap, and merges tiny tail chunks. The stored ``chunk.text`` is the
+clean body slice; the heading/section context is prepended to the *embedded* text separately
+via :func:`build_embed_text`, keeping display text clean while embeddings stay context-rich.
+The token counter is injectable so production uses the BGE-M3 tokenizer while tests run
+offline with a word counter.
+
+Each chunk also records the half-open ``[char_start, char_end)`` range of the *original*
+body it was packed from (offsets into the ``text`` passed to :func:`chunk_document`, i.e.
+the cleaned ``body_markdown``). This lets the eval harness map a gold evidence span
+``(char_start, char_end)`` to whichever chunks overlap it under the current chunking
+config, so span→chunk relevance survives re-chunking. Offsets are tracked in the input's
+own coordinate space (never by re-locating a joined/stripped/normalized string), so they
+stay exact regardless of NFC form or stray ``\\r``. The synthetic heading-context prefix
+is not part of the span.
 """
 
 import re
@@ -13,6 +24,12 @@ from dataclasses import dataclass
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*\S)\s*$")
 _PARA_RE = re.compile(r"\n\s*\n")
 _SENT_RE = re.compile(r"(?<=[.!?…])\s+")
+# A legal article marker (`მუხლი N …`) at the start of a line. Georgian legislation
+# (esp. matsne) structures acts by article, so an article line starts a new chunk section
+# — the marker stays in the body (kept visible for citations, unlike consumed `#` headings).
+# Same-line whitespace only ([ \t], never \s) so a bare line-final "მუხლი" can't bind to a
+# digit on the next line (mirrors structure.py's regression-tested rule).
+_ARTICLE_LINE_RE = re.compile(r"^[ \t]*მუხლი[ \t]*\d")
 
 
 def default_token_counter(text: str) -> int:
@@ -26,22 +43,67 @@ class Chunk:
     chunk_index: int
     heading_path: list[str]
     token_count: int
+    # Half-open offsets into the original body this chunk was packed from. Sentinel -1
+    # means "unset" (e.g. a Chunk hand-constructed in a test); chunk_document always sets
+    # real values. See module docstring.
+    char_start: int = -1
+    char_end: int = -1
 
 
-def _split_sections(text: str) -> list[tuple[list[str], str]]:
-    """Break Markdown into (heading_path, body) sections by ATX headings."""
-    sections: list[tuple[list[str], str]] = []
+def _split_keep_pos(s: str, pattern: re.Pattern) -> list[tuple[str, int, int]]:
+    """Like ``pattern.split(s)`` but each segment carries its ``(start, end)`` in ``s``.
+
+    Mirrors ``re.split`` exactly for a group-less pattern: the pieces are the spans
+    between successive matches, with the matched delimiters dropped (but recovered here
+    as gaps between segment ends and the next segment start).
+    """
+    out: list[tuple[str, int, int]] = []
+    cursor = 0
+    for m in pattern.finditer(s):
+        out.append((s[cursor : m.start()], cursor, m.start()))
+        cursor = m.end()
+    out.append((s[cursor:], cursor, len(s)))
+    return out
+
+
+def _strip_span(seg: str, base: int) -> tuple[str, int, int]:
+    """Strip ``seg`` and return ``(core, abs_start, abs_end)`` shifting both ends."""
+    lead = len(seg) - len(seg.lstrip())
+    core = seg.strip()
+    return core, base + lead, base + lead + len(core)
+
+
+def _split_sections(text: str) -> list[tuple[list[str], str, int]]:
+    """Break Markdown into ``(heading_path, body, body_start)`` sections by ATX headings.
+
+    ``body`` is a contiguous substring of ``text`` (headings always flush the buffer, so a
+    section body is a maximal run of consecutive non-heading lines); ``body_start`` is where
+    it begins in ``text``. For ``\\n``-only input this yields byte-identical bodies to a
+    plain ``"\\n".join(lines).strip()``.
+    """
+    sections: list[tuple[list[str], str, int]] = []
     stack: list[tuple[int, str]] = []
     cur_path: list[str] = []
-    buf: list[str] = []
+    buf: list[tuple[int, int]] = []  # (line_start, content_end) per buffered line
 
     def flush():
-        body = "\n".join(buf).strip()
+        if not buf:
+            return
+        raw_start, raw_end = buf[0][0], buf[-1][1]
+        raw = text[raw_start:raw_end]
+        body = raw.strip()
         if body:
-            sections.append((list(cur_path), body))
+            lead = len(raw) - len(raw.lstrip())
+            sections.append((list(cur_path), body, raw_start + lead))
 
-    for line in text.splitlines():
-        m = _HEADING_RE.match(line.strip())
+    cursor = 0
+    contents = text.splitlines()
+    keepends = text.splitlines(keepends=True)
+    for content, ke in zip(contents, keepends):
+        start = cursor
+        cursor += len(ke)
+        content_end = start + len(content)
+        m = _HEADING_RE.match(content.strip())
         if m:
             flush()
             buf.clear()
@@ -49,55 +111,107 @@ def _split_sections(text: str) -> list[tuple[list[str], str]]:
             stack[:] = [(lv, t) for (lv, t) in stack if lv < level]
             stack.append((level, m.group(2).strip()))
             cur_path = [t for (_, t) in stack]
+        elif _ARTICLE_LINE_RE.match(content) and buf:
+            # Article boundary: start a fresh section but keep the marker line in the body
+            # (so "მუხლი 5 …" stays visible for citations). ``buf`` guard avoids a spurious
+            # empty flush when a section already begins with an article line.
+            flush()
+            buf[:] = [(start, content_end)]
         else:
-            buf.append(line)
+            buf.append((start, content_end))
     flush()
 
     if not sections and text.strip():
-        sections = [([], text.strip())]
+        lead = len(text) - len(text.lstrip())
+        sections = [([], text.strip(), lead)]
     return sections
 
 
-def _atoms(body: str, max_tokens: int, count: Callable[[str], int]) -> list[tuple[str, int]]:
-    """Break a section body into atoms (paragraphs, hard-splitting oversized ones)."""
-    atoms: list[tuple[str, int]] = []
-    for para in _PARA_RE.split(body):
-        para = para.strip()
+def heading_spans(text: str) -> list[tuple[int, int, str]]:
+    """Return ``(char_start, char_end, heading_text)`` for each ATX heading line.
+
+    Heading lines are consumed by :func:`_split_sections` (they become ``heading_path``
+    context, not body), so a span pointing at heading characters overlaps no chunk body.
+    The eval span→chunk mapper uses these ranges to map such a span to the chunks the
+    heading governs — whose embedded ``text`` carries the heading as its context prefix,
+    so the heading text is genuinely retrievable there. Uses the same scan and regex as
+    :func:`_split_sections`, so the two never disagree on what a heading is.
+    """
+    out: list[tuple[int, int, str]] = []
+    cursor = 0
+    for content, ke in zip(text.splitlines(), text.splitlines(keepends=True)):
+        start = cursor
+        cursor += len(ke)
+        content_end = start + len(content)
+        m = _HEADING_RE.match(content.strip())
+        if m:
+            out.append((start, content_end, m.group(2).strip()))
+    return out
+
+
+def _atoms(
+    body: str, max_tokens: int, count: Callable[[str], int]
+) -> list[tuple[str, int, int, int]]:
+    """Break a section body into atoms ``(text, tok, start, end)`` (offsets into ``body``).
+
+    Paragraphs first; oversized ones split into sentences; pathologically long sentences
+    packed into word windows. Offsets are recovered from match positions so they stay
+    exact through every ``.strip()``/``split`` (which otherwise drop that information).
+    """
+    atoms: list[tuple[str, int, int, int]] = []
+    for para_raw, p_start, _ in _split_keep_pos(body, _PARA_RE):
+        para, para_start, _ = _strip_span(para_raw, p_start)
         if not para:
             continue
         tok = count(para)
         if tok <= max_tokens:
-            atoms.append((para, tok))
+            atoms.append((para, tok, para_start, para_start + len(para)))
             continue
-        for sent in (s for s in _SENT_RE.split(para) if s.strip()):
-            stok = count(sent)
+        for sent_raw, s_start, _ in _split_keep_pos(para, _SENT_RE):
+            if not sent_raw.strip():
+                continue
+            sent, sent_start, sent_end = _strip_span(sent_raw, para_start + s_start)
+            stok = count(sent_raw)  # match legacy: count the unstripped sentence
             if stok <= max_tokens:
-                atoms.append((sent.strip(), stok))
+                atoms.append((sent, stok, sent_start, sent_end))
                 continue
             # Pathologically long sentence: pack words into windows.
-            window: list[str] = []
+            words = [
+                (m.group(), sent_start + m.start(), sent_start + m.end())
+                for m in re.finditer(r"\S+", sent)
+            ]
+            window: list[tuple[str, int, int]] = []
             wtok = 0
-            for word in sent.split():
-                w = count(word) or 1
-                if window and wtok + w > max_tokens:
-                    atoms.append((" ".join(window), wtok))
+            for w, ws, we in words:
+                wt = count(w) or 1
+                if window and wtok + wt > max_tokens:
+                    atoms.append(
+                        (" ".join(x[0] for x in window), wtok, window[0][1], window[-1][2])
+                    )
                     window, wtok = [], 0
-                window.append(word)
-                wtok += w
+                window.append((w, ws, we))
+                wtok += wt
             if window:
-                atoms.append((" ".join(window), wtok))
+                atoms.append(
+                    (" ".join(x[0] for x in window), wtok, window[0][1], window[-1][2])
+                )
     return atoms
 
 
-def _pack(atoms, max_tokens, overlap, min_tokens) -> list[tuple[str, int]]:
-    """Greedily pack atoms to the token budget, seeding each new chunk with overlap."""
-    packed: list[tuple[list[tuple[str, int]], int]] = []
-    cur: list[tuple[str, int]] = []
+def _pack(atoms, max_tokens, overlap, min_tokens) -> list[tuple[str, int, int, int]]:
+    """Greedily pack atoms to the token budget, seeding each new chunk with overlap.
+
+    Returns ``(text, tok, char_start, char_end)`` per chunk; the char span is the
+    ``min``/``max`` over the packed atoms' offsets — provably correct even through the
+    tail-fold's non-monotonic atom order.
+    """
+    packed: list[tuple[list[tuple[str, int, int, int]], int]] = []
+    cur: list[tuple[str, int, int, int]] = []
     cur_tok = 0
     for atom in atoms:
         if cur and cur_tok + atom[1] > max_tokens:
             packed.append((cur, cur_tok))
-            seed: list[tuple[str, int]] = []
+            seed: list[tuple[str, int, int, int]] = []
             seed_tok = 0
             for a in reversed(cur):
                 if seed_tok + a[1] > overlap:
@@ -116,7 +230,15 @@ def _pack(atoms, max_tokens, overlap, min_tokens) -> list[tuple[str, int]]:
         prev_atoms, prev_tok = packed[-1]
         packed[-1] = (prev_atoms + tail_atoms, prev_tok + tail_tok)
 
-    return [("\n\n".join(a[0] for a in subset), tok) for subset, tok in packed]
+    return [
+        (
+            "\n\n".join(a[0] for a in subset),
+            tok,
+            min(a[2] for a in subset),
+            max(a[3] for a in subset),
+        )
+        for subset, tok in packed
+    ]
 
 
 def chunk_document(
@@ -127,24 +249,52 @@ def chunk_document(
     min_tokens: int = 64,
     count_tokens: Callable[[str], int] = default_token_counter,
 ) -> list[Chunk]:
-    """Chunk a Markdown document into overlapping, heading-aware chunks."""
+    """Chunk a Markdown document into overlapping, structure-aware chunks.
+
+    ``chunk.text`` is the **clean** body slice (what gets stored/displayed); the
+    heading/section context lives in ``chunk.heading_path`` and is folded into the
+    *embedded* text separately by :func:`build_embed_text`. Sections break on ATX headings
+    and on legal article markers (``მუხლი N``).
+    """
     chunks: list[Chunk] = []
     idx = 0
-    for path, body in _split_sections(text or ""):
-        ctx = " > ".join(path)
-        # Leave room for the prepended heading context, but never collapse the budget
-        # to near-zero when the heading is long (keep at least a quarter of max_tokens).
-        ctx_tokens = count_tokens(ctx) if ctx else 0
-        budget = max(max_tokens // 4, max_tokens - ctx_tokens)
-        for piece, _ in _pack(_atoms(body, budget, count_tokens), budget, overlap, min_tokens):
-            chunk_text = f"{ctx}\n\n{piece}" if ctx else piece
+    for path, body, body_start in _split_sections(text or ""):
+        for piece, tok, cstart, cend in _pack(
+            _atoms(body, max_tokens, count_tokens), max_tokens, overlap, min_tokens
+        ):
             chunks.append(
                 Chunk(
-                    text=chunk_text,
+                    text=piece,
                     chunk_index=idx,
                     heading_path=path,
-                    token_count=count_tokens(chunk_text),
+                    token_count=count_tokens(piece),
+                    char_start=body_start + cstart,
+                    char_end=body_start + cend,
                 )
             )
             idx += 1
     return chunks
+
+
+def build_embed_text(
+    text: str,
+    *,
+    title: str | None = None,
+    document_type: str | None = None,
+    heading_path: list[str] | None = None,
+) -> str:
+    """Context-enriched text to **embed** (the stored/displayed ``text`` stays clean).
+
+    Prepends ``title > document_type > section/article path`` so a short clause is embedded
+    with the context that disambiguates it — a Georgian legal query often matches the act
+    title or article heading, not the bare clause body. Prepended to the embedded text only.
+    """
+    parts: list[str] = []
+    if title:
+        parts.append(title)
+    if document_type:
+        parts.append(document_type)
+    if heading_path:
+        parts.extend(heading_path)
+    ctx = " > ".join(p for p in parts if p)
+    return f"{ctx}\n\n{text}" if ctx else text

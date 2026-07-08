@@ -1,4 +1,5 @@
 from ingest.chunking import Chunk
+from ingest.dedup import content_hash
 from ingest.qdrant_store import KEYWORD_FIELDS, TEXT_FIELDS, _rfc3339, build_payload
 from ingest.sources import CanonicalDoc
 
@@ -80,3 +81,21 @@ def test_new_index_fields_are_declared():
     assert "registration_code" in KEYWORD_FIELDS
     assert "status" in KEYWORD_FIELDS
     assert set(TEXT_FIELDS) == {"text", "title", "parties"}
+
+
+def test_build_payload_carries_content_hash():
+    # The doc-body identity is stamped on every chunk (same value across a doc's chunks)
+    # and equals the corpus dedup hash of the cleaned body — this is what watch compares
+    # to skip re-embedding unchanged docs.
+    doc = _doc(body_markdown="the cleaned body text")
+    p0 = build_payload(doc, Chunk(text="a", chunk_index=0, heading_path=[], token_count=1))
+    p1 = build_payload(doc, Chunk(text="b", chunk_index=1, heading_path=[], token_count=1))
+    assert p0["content_hash"] == content_hash("the cleaned body text")
+    assert p0["content_hash"] == p1["content_hash"]
+    assert "content_hash" in KEYWORD_FIELDS
+
+
+def test_build_payload_content_hash_changes_with_body():
+    a = build_payload(_doc(body_markdown="v1"), Chunk(text="x", chunk_index=0, heading_path=[], token_count=1))
+    b = build_payload(_doc(body_markdown="v2"), Chunk(text="x", chunk_index=0, heading_path=[], token_count=1))
+    assert a["content_hash"] != b["content_hash"]

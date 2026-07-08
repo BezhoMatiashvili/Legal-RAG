@@ -1,4 +1,4 @@
-from ingest.chunking import chunk_document
+from ingest.chunking import build_embed_text, chunk_document
 
 
 def test_empty_document_yields_no_chunks():
@@ -14,7 +14,7 @@ def test_short_document_is_one_chunk():
     assert "short legal line" in chunks[0].text
 
 
-def test_heading_paths_and_context_prefix():
+def test_heading_paths_and_clean_text():
     md = (
         "# Title\n\npreamble paragraph.\n\n"
         "## Article 1\n\nbody of article one here.\n\n"
@@ -25,8 +25,13 @@ def test_heading_paths_and_context_prefix():
     assert ["Title"] in paths
     assert ["Title", "Article 1"] in paths
     assert ["Title", "Article 2"] in paths
-    # Heading path is prepended to chunk text for context.
-    assert any(c.text.startswith("Title > Article 1") for c in chunks)
+    # Stored/display text is CLEAN — the heading path is NOT baked into it.
+    a1 = next(c for c in chunks if c.heading_path == ["Title", "Article 1"])
+    assert a1.text == "body of article one here."
+    # Context is folded into the embedded text only, via build_embed_text.
+    embed = build_embed_text(a1.text, title="Doc", document_type="law", heading_path=a1.heading_path)
+    assert embed == "Doc > law > Title > Article 1\n\nbody of article one here."
+    assert build_embed_text("bare", title=None, document_type=None, heading_path=None) == "bare"
 
 
 def test_packing_respects_budget_and_overlaps():
@@ -46,6 +51,24 @@ def test_packing_respects_budget_and_overlaps():
 
     # chunk indices are contiguous from 0.
     assert [c.chunk_index for c in chunks] == list(range(len(chunks)))
+
+
+def test_article_markers_start_new_sections_and_stay_in_body():
+    md = (
+        "შესავალი დებულება აქ.\n\n"
+        "მუხლი 1. პირველი მუხლის შინაარსი.\n\n"
+        "მუხლი 2. მეორე მუხლის შინაარსი აქ არის."
+    )
+    chunks = chunk_document(md, max_tokens=100, overlap=0, min_tokens=1)
+    texts = [c.text for c in chunks]
+    # each article is its own chunk, and the "მუხლი N" marker is kept in the body
+    assert any(t.startswith("მუხლი 1.") for t in texts)
+    assert any(t.startswith("მუხლი 2.") for t in texts)
+    # the preamble is separated from article 1
+    assert any(t.startswith("შესავალი") and "მუხლი 1" not in t for t in texts)
+    # offsets still slice back exactly
+    for c in chunks:
+        assert md[c.char_start : c.char_end].strip()
 
 
 def test_injected_token_counter_is_used():

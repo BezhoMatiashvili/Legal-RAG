@@ -20,11 +20,72 @@ from pathlib import Path
 from tqdm import tqdm
 
 from . import qdrant_store as store
-from .chunking import chunk_document
+from .chunking import build_embed_text, chunk_document
 from .config import Config
-from .sources import SOURCES, normalize
+from .dedup import content_hash
+from .sources import SOURCES, normalize, schema_drift
 
 logger = logging.getLogger("ingest.pipeline")
+
+
+def _indexed_content_hash(client, cfg: Config, source: str, document_id: str) -> str | None:
+    """``content_hash`` of the doc's chunk-0 already in Qdrant, or None if not indexed.
+
+    A single O(1) point lookup by deterministic id — lets watch skip re-embedding a doc the
+    scraper re-emitted unchanged, without re-reading the whole body from the index."""
+    try:
+        recs = client.retrieve(
+            collection_name=cfg.collection_name,
+            ids=[store.point_id(source, document_id, 0)],
+            with_payload=["content_hash"],
+        )
+    except Exception:  # noqa: BLE001 - a lookup failure must never block ingestion
+        return None
+    return (recs[0].payload or {}).get("content_hash") if recs else None
+
+
+def _record_schema_drift(source: str, item: dict, state: dict) -> None:
+    """Seed / update the per-source key baseline in ``state`` and warn on newly-seen keys."""
+    seen = set(state.get("schema_keys") or [])
+    if not seen:  # first item establishes the baseline (no alert)
+        state["schema_keys"] = sorted(set(item))
+        return
+    new_keys, undeclared = schema_drift(source, item, seen)
+    if new_keys:
+        logger.warning("%s: schema drift — new key(s) %s (undeclared: %s)",
+                       source, sorted(new_keys), sorted(undeclared) or "none")
+        drift = state.setdefault("schema_drift", {})
+        for kk in new_keys:
+            drift[kk] = drift.get(kk, 0) + 1
+        state["schema_keys"] = sorted(seen | new_keys)
+
+
+def write_ingest_report(cfg: Config, states: dict, *, kind: str = "watch") -> Path:
+    """Write a per-source ingestion report (docs/added/updated/unchanged/skipped/chunks +
+    schema-drift) to ``.state/reports/ingest-<date>.json``; returns the path."""
+    reports_dir = cfg.state_dir / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    now = datetime.now(UTC).replace(microsecond=0)
+    fields = ("docs", "chunks", "added", "updated", "unchanged", "skipped")
+    per_source: dict = {}
+    totals = dict.fromkeys(fields, 0)
+    drift_total: dict = {}
+    for source, st in states.items():
+        row = {f: int(st.get(f, 0)) for f in fields}
+        row["schema_drift"] = dict(st.get("schema_drift", {}))
+        row["updated_at"] = st.get("updated_at")
+        per_source[source] = row
+        for f in fields:
+            totals[f] += row[f]
+        for kk, n in row["schema_drift"].items():
+            drift_total[kk] = drift_total.get(kk, 0) + n
+    report = {
+        "generated_at": now.isoformat(), "kind": kind, "collection": cfg.collection_name,
+        "totals": totals, "schema_drift": drift_total, "per_source": per_source,
+    }
+    path = reports_dir / f"ingest-{now:%Y%m%d}.json"
+    path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
 
 
 def items_path(cfg: Config, source: str, run: str = "latest") -> Path:
@@ -149,7 +210,13 @@ def ingest_source(
                 continue
             if use_panel:
                 progress.set_phase(source, "embedding")
-            embedded = embedder.encode_passages([c.text for c in chunks])
+            embedded = embedder.encode_passages([
+                build_embed_text(
+                    c.text, title=doc.title, document_type=doc.document_type,
+                    heading_path=c.heading_path,
+                )
+                for c in chunks
+            ])
         except Exception as exc:  # one bad doc must not abort the whole source
             skipped += 1
             logger.warning("%s: skipping doc %s (chunk/embed failed): %s", source, doc.document_id, exc)
@@ -297,7 +364,13 @@ def _build_doc_points(cfg: Config, embedder, count_tokens, doc) -> tuple[list, i
     )
     if not chunks:
         return [], 0
-    embedded = embedder.encode_passages([c.text for c in chunks])
+    embedded = embedder.encode_passages([
+        build_embed_text(
+            c.text, title=doc.title, document_type=doc.document_type,
+            heading_path=c.heading_path,
+        )
+        for c in chunks
+    ])
     points = []
     for chunk, emb in zip(chunks, embedded):
         vector = {"dense": emb.dense}
@@ -318,6 +391,7 @@ def watch_drain_source(
     *,
     batch_size: int = 256,
     skip_stale_delete: bool = False,
+    skip_unchanged: bool = True,
     limit: int | None = None,
     stop_event: threading.Event | None = None,
 ) -> tuple[int, int, int]:
@@ -369,12 +443,23 @@ def watch_drain_source(
                 break
             try:
                 item = json.loads(raw)
+                _record_schema_drift(source, item, state)
                 doc = normalize(source, item)
             except (json.JSONDecodeError, ValueError, KeyError) as exc:
                 skipped += 1
                 state["skipped"] = state.get("skipped", 0) + 1
                 logger.warning("%s: skipping malformed record: %s", source, exc)
                 continue
+
+            # Change detection: skip re-embedding a doc the scraper re-emitted unchanged.
+            embedded_prev = None
+            if skip_unchanged:
+                embedded_prev = _indexed_content_hash(client, cfg, source, doc.document_id)
+                if embedded_prev is not None and embedded_prev == content_hash(doc.body_markdown or ""):
+                    state["unchanged"] = state.get("unchanged", 0) + 1
+                    last_off = end_off  # already current in the index; advance past it
+                    continue
+
             try:
                 points, n_chunks = _build_doc_points(cfg, embedder, count_tokens, doc)
             except Exception as exc:  # one bad doc must not abort the source
@@ -390,6 +475,10 @@ def watch_drain_source(
                 store.delete_doc_chunks_from(
                     client, cfg.collection_name, doc.source, doc.document_id, n_chunks
                 )
+            if embedded_prev is not None:
+                state["updated"] = state.get("updated", 0) + 1   # re-embedded a changed doc
+            elif skip_unchanged:
+                state["added"] = state.get("added", 0) + 1       # newly-seen doc
             last_off = end_off
             docs += 1
             chunks_total += n_chunks
@@ -504,3 +593,8 @@ def watch_loop(
     finally:
         for sig, handler in installed.items():
             signal.signal(sig, handler)
+        try:
+            path = write_ingest_report(cfg, states, kind="watch")
+            logger.info("ingest report: %s", path)
+        except Exception as exc:  # noqa: BLE001 - a report failure must not mask shutdown
+            logger.warning("failed to write ingest report: %s", exc)

@@ -13,6 +13,8 @@ dependencies = [
     "tqdm>=4.66",
     "rich>=13",
     "mcp[cli]>=1.2",
+    "datasketch>=1.6",  # MinHash/LSH near-duplicate clustering for corpus dedup (Part 1)
+    "torch",            # CPU build only — see [tool.uv.sources] below
 ]
 
 [dependency-groups]
@@ -24,6 +26,17 @@ dev = [
 [tool.uv]
 # This is an application, not a library — don't try to build/install it as a package.
 package = false
+
+# Serving runs on CPU (GPU work happens on RunPod, in its own env). Pull the CPU-only
+# torch build from PyTorch's CPU index — the default PyPI wheel drags in ~6 GB of CUDA
+# runtime (nvidia-*, torch-cuda) that is useless on this box and makes `uv sync` crawl.
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

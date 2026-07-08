@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import time
 from enum import Enum
 
 from mcp.server.fastmcp import FastMCP
@@ -24,9 +26,12 @@ from pydantic import BaseModel, ConfigDict, Field
 from qdrant_client import models
 
 from . import qdrant_store as store
-from .config import Config, load_config
-from .search import build_filter, hybrid_search
+from .config import Config, load_config, retrieval_fingerprint
+from .querylog import append_query_log, build_query_record
+from .search import build_filter, detect_language, hybrid_search
 from .sources import SOURCES
+
+logger = logging.getLogger("ingest.mcp_server")
 
 mcp = FastMCP("legal_rag")
 
@@ -122,6 +127,10 @@ def _hit_dict(hit) -> dict:
         "source_url": p.get("source_url"),
         "chunk_index": p.get("chunk_index"),
         "heading": p.get("heading"),
+        # Exact evidence span [char_start, char_end) into the document body, for precise citation.
+        "char_start": p.get("char_start"),
+        "char_end": p.get("char_end"),
+        "token_count": p.get("token_count"),
         "text": p.get("text"),
     }
 
@@ -262,6 +271,7 @@ async def legal_search(params: SearchInput) -> str:
         client = _get_client()
         embedder = await _get_embedder()
         reranker = await _get_reranker()
+        t0 = time.perf_counter()
         hits = await asyncio.to_thread(
             hybrid_search,
             cfg,
@@ -284,19 +294,48 @@ async def legal_search(params: SearchInput) -> str:
             date_from=params.date_from,
             date_to=params.date_to,
         )
+        elapsed_ms = (time.perf_counter() - t0) * 1000
     except Exception as e:  # noqa: BLE001 - surface an actionable message to the agent
         return _handle_error(e)
+
+    _log_query(cfg, params, hits, elapsed_ms)
 
     if not hits:
         return "No results found. Try a broader query or remove filters."
 
+    fp = retrieval_fingerprint(cfg)
     if params.response_format is ResponseFormat.JSON:
-        payload = {"count": len(hits), "hits": [_hit_dict(h) for h in hits]}
+        payload = {
+            "count": len(hits), "collection": cfg.collection_name, "fingerprint": fp,
+            "hits": [_hit_dict(h) for h in hits],
+        }
         return json.dumps(payload, ensure_ascii=False, indent=2)
 
     blocks = [f"# {len(hits)} results for: {params.query}", ""]
     blocks.extend(_format_hit_md(rank, hit) for rank, hit in enumerate(hits, 1))
+    blocks.append(f"\n> index: {cfg.collection_name} · fp {fp}")
     return "\n".join(blocks)
+
+
+def _log_query(cfg: Config, params, hits, elapsed_ms: float) -> None:
+    """Best-effort local query log (never breaks the tool; local file only — see querylog)."""
+    if not cfg.query_log_enabled:
+        return
+    try:
+        filters = {
+            k: getattr(params, k) for k in (
+                "source", "language", "document_type", "court", "status", "document_number",
+                "registration_code", "parties", "contains", "date_from", "date_to",
+            )
+        }
+        rec = build_query_record(
+            query=params.query, filters=filters, top_k=params.top_k,
+            hits=[_hit_dict(h) for h in hits], latency_ms=elapsed_ms,
+            fingerprint=retrieval_fingerprint(cfg), route=detect_language(params.query),
+        )
+        append_query_log(rec, cfg.query_log_path)
+    except Exception as e:  # noqa: BLE001 - logging must never break search
+        logger.warning("query log write failed: %s", e)
 
 
 class GetDocumentInput(BaseModel):
@@ -333,6 +372,34 @@ def _scroll_all(client, collection: str, flt: models.Filter, page: int = 256) ->
         if offset is None:
             break
     return out
+
+
+def _stitch_overlap(points) -> str:
+    """Join chunk texts, removing the ~80-token overlap between consecutive chunks.
+
+    ``char_start``/``char_end`` (offsets into the clean body) only *signal* an overlap —
+    ``chunk.text`` is a re-joined/stripped rendering, so it can't be sliced by offsets.
+    When two chunks' ranges overlap we drop the duplicated leading text of the next chunk
+    by a bounded longest suffix==prefix match; otherwise chunks are paragraph-joined.
+    """
+    result = ""
+    prev_end = None
+    for pt in points:
+        p = pt.payload or {}
+        t = p.get("text") or ""
+        cs, ce = p.get("char_start"), p.get("char_end")
+        if not result:
+            result = t
+        elif prev_end is not None and cs is not None and cs < prev_end:
+            window = result[-4000:]  # overlap is ~80 tokens; bound the scan
+            maxov = min(len(window), len(t))
+            cut = next((k for k in range(maxov, 0, -1) if window.endswith(t[:k])), 0)
+            result += t[cut:]
+        else:
+            result += "\n\n" + t
+        if ce is not None:
+            prev_end = ce if prev_end is None else max(prev_end, ce)
+    return result
 
 
 @mcp.tool(
@@ -386,7 +453,7 @@ async def legal_get_document(params: GetDocumentInput) -> str:
 
     points.sort(key=lambda pt: (pt.payload or {}).get("chunk_index", 0))
     first = points[0].payload or {}
-    body = "\n\n".join((pt.payload or {}).get("text") or "" for pt in points)
+    body = _stitch_overlap(points)
 
     if params.response_format is ResponseFormat.JSON:
         payload = {
@@ -398,7 +465,9 @@ async def legal_get_document(params: GetDocumentInput) -> str:
             "court": first.get("court"),
             "language": first.get("language"),
             "source_url": first.get("source_url"),
+            "content_hash": first.get("content_hash"),
             "chunk_count": len(points),
+            "collection": _get_cfg().collection_name,
             "text": body,
         }
         return json.dumps(payload, ensure_ascii=False, indent=2)
@@ -408,13 +477,11 @@ async def legal_get_document(params: GetDocumentInput) -> str:
         "",
         f"- source: {first.get('source')} · type: {first.get('document_type') or '—'} "
         f"· date: {first.get('date_raw') or '—'}",
-        f"- document_id: `{first.get('document_id')}` · {len(points)} chunks",
+        f"- document_id: `{first.get('document_id')}` · {len(points)} chunks (overlap de-duplicated)",
     ]
     if first.get("source_url"):
         header.append(f"- url: {first.get('source_url')}")
-    header.append(
-        "\n> Note: chunks carry ~80-token overlap, so some text may repeat across boundaries.\n"
-    )
+    header.append("")
     return "\n".join(header) + "\n" + body
 
 
@@ -724,6 +791,217 @@ async def legal_collection_info() -> str:
         "- supremecourt: case_number · tas: document_no · tbappeal: none",
     ]
     return "\n".join(lines)
+
+
+def _latest_report(cfg: Config) -> dict | None:
+    """The most recent ingestion report under ``.state/reports/``, or None."""
+    reports_dir = cfg.state_dir / "reports"
+    try:
+        files = sorted(reports_dir.glob("ingest-*.json"))
+        return json.loads(files[-1].read_text(encoding="utf-8")) if files else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+class StatusInput(BaseModel):
+    """Input for the ingestion-status report."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    response_format: ResponseFormat = Field(
+        ResponseFormat.MARKDOWN, description="'markdown' or 'json'."
+    )
+
+
+@mcp.tool(
+    name="ingest_status",
+    annotations={
+        "title": "Ingestion / Index Status",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def ingest_status(params: StatusInput | None = None) -> str:
+    """Report index size, per-source counts, watcher freshness, and the latest ingest report.
+
+    Use this to see how fresh the corpus is and whether the daily watcher is keeping up —
+    total indexed points, per-source point counts, each source's last-watched timestamp and
+    running docs/added/updated/unchanged/skipped counters, and the most recent ingestion
+    report (including any JSON schema-drift alerts). No embedding / model load.
+    """
+    fmt = params.response_format if params else ResponseFormat.MARKDOWN
+    try:
+        cfg = _get_cfg()
+        client = _get_client()
+        info = await asyncio.to_thread(client.get_collection, cfg.collection_name)
+        counts = await asyncio.to_thread(_source_counts, client, cfg.collection_name)
+    except Exception as e:  # noqa: BLE001
+        return _handle_error(e)
+
+    from . import pipeline
+
+    watch: dict = {}
+    for src in SOURCES:
+        st = pipeline._load_watch_state(cfg, src)
+        if st.get("updated_at"):
+            watch[src] = {
+                k: st.get(k) for k in (
+                    "docs", "chunks", "added", "updated", "unchanged", "skipped", "updated_at",
+                )
+            }
+    report = _latest_report(cfg)
+    points = getattr(info, "points_count", None)
+    fp = retrieval_fingerprint(cfg)
+
+    if fmt is ResponseFormat.JSON:
+        return json.dumps({
+            "collection": cfg.collection_name, "points": points, "fingerprint": fp,
+            "per_source": counts, "watchers": watch, "latest_report": report,
+        }, ensure_ascii=False, indent=2)
+
+    lines = [
+        f"# Ingest status: {cfg.collection_name}",
+        "",
+        f"- points: {points} · fingerprint: {fp}",
+    ]
+    if counts:
+        lines.append("- per-source points: " + ", ".join(
+            f"{s}={n}" for s, n in sorted(counts.items(), key=lambda kv: kv[1], reverse=True)))
+    if watch:
+        lines += ["", "## Watchers (last drain)"]
+        for src, w in sorted(watch.items()):
+            lines.append(
+                f"- {src}: {w.get('docs', 0)} docs / {w.get('chunks', 0)} chunks · "
+                f"added {w.get('added', 0)} · updated {w.get('updated', 0)} · "
+                f"unchanged {w.get('unchanged', 0)} · skipped {w.get('skipped', 0)} · "
+                f"@ {w.get('updated_at')}")
+    else:
+        lines += ["", "_No watcher state found (the daily watcher has not run on this box)._"]
+    if report:
+        drift = report.get("schema_drift") or {}
+        lines += ["", f"## Latest report ({report.get('generated_at')})",
+                  f"- totals: {report.get('totals')}",
+                  f"- schema drift: {drift or 'none'}"]
+    return "\n".join(lines)
+
+
+class GetVersionsInput(BaseModel):
+    """Input for listing the version lineage of a document."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    source: str = Field(..., description="Source key (as returned in a search hit).", min_length=1)
+    document_id: str = Field(..., description="The document_id from a search hit.", min_length=1)
+    response_format: ResponseFormat = Field(
+        ResponseFormat.MARKDOWN, description="'markdown' or 'json'."
+    )
+
+
+@mcp.tool(
+    name="legal_get_document_versions",
+    annotations={
+        "title": "Get Document Version Lineage",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def legal_get_document_versions(params: GetVersionsInput) -> str:
+    """List the amendment/version lineage of a legal act (matsne acts sharing a registry code).
+
+    Matsne legislation is published as multiple dated documents that share one
+    ``registration_code`` — successive amendments of the same act. This returns every such
+    version, newest first, marking the one whose ``status`` is ``in_force`` as current, so a
+    lawyer can see the act's history and which text is currently effective. For sources with
+    no registry-code lineage (courts etc.) it returns just the single document. No model load.
+    """
+    try:
+        cfg = _get_cfg()
+        client = _get_client()
+        flt = models.Filter(must=[
+            models.FieldCondition(key="source", match=models.MatchValue(value=params.source)),
+            models.FieldCondition(key="document_id", match=models.MatchValue(value=params.document_id)),
+        ])
+        points = await asyncio.to_thread(_scroll_all, client, cfg.collection_name, flt)
+    except Exception as e:  # noqa: BLE001
+        return _handle_error(e)
+
+    if not points:
+        return (f"No document found for source={params.source!r} "
+                f"document_id={params.document_id!r}.")
+
+    reg = next(((pt.payload or {}).get("registration_code") for pt in points
+                if (pt.payload or {}).get("registration_code")), None)
+
+    if reg:
+        try:
+            vflt = build_filter(source=params.source, registration_code=reg)
+            vpoints = await asyncio.to_thread(_scroll_all, client, cfg.collection_name, vflt)
+        except Exception as e:  # noqa: BLE001
+            return _handle_error(e)
+        versions = _dedup_documents(vpoints)
+        # attach status (dedup drops it); newest first is already the dedup order
+        status_by_id = {}
+        for pt in vpoints:
+            p = pt.payload or {}
+            status_by_id.setdefault(p.get("document_id"), p.get("status"))
+        for v in versions:
+            v["status"] = status_by_id.get(v["document_id"])
+            v["is_current"] = v["status"] == "in_force"
+    else:
+        versions = _dedup_documents(points)
+        for v in versions:
+            v["status"] = None
+            v["is_current"] = None
+
+    if params.response_format is ResponseFormat.JSON:
+        return json.dumps({
+            "registration_code": reg, "count": len(versions), "versions": versions,
+        }, ensure_ascii=False, indent=2)
+
+    if not reg:
+        return (f"# 1 version\n\nNo registry-code lineage for source={params.source!r} "
+                f"(this source doesn't group amendments). Single document:\n\n"
+                + _format_doc_line(1, versions[0]))
+    lines = [f"# {len(versions)} version(s) · registration_code `{reg}`", ""]
+    for rank, v in enumerate(versions, 1):
+        tag = " **[in force]**" if v.get("is_current") else (f" ({v['status']})" if v.get("status") else "")
+        lines.append(_format_doc_line(rank, v) + tag)
+    return "\n\n".join(lines)
+
+
+@mcp.tool(
+    name="legal_health",
+    annotations={
+        "title": "Health Check",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def legal_health() -> str:
+    """Liveness/readiness probe: confirms Qdrant is reachable and the collection is populated.
+
+    Returns JSON ``{ok, collection, points, qdrant_url, fingerprint}``; ``ok`` is false with
+    an actionable hint if Qdrant is unreachable or the collection is missing. No model load."""
+    try:
+        cfg = _get_cfg()
+        client = _get_client()
+        info = await asyncio.to_thread(client.get_collection, cfg.collection_name)
+        return json.dumps({
+            "ok": True, "collection": cfg.collection_name,
+            "points": getattr(info, "points_count", None),
+            "qdrant_url": cfg.qdrant_url, "fingerprint": retrieval_fingerprint(cfg),
+        }, ensure_ascii=False)
+    except Exception as e:  # noqa: BLE001
+        return json.dumps({
+            "ok": False, "error": f"{type(e).__name__}: {e}",
+            "hint": "Start Qdrant (cd ingest && docker compose up -d) and check COLLECTION_NAME.",
+        }, ensure_ascii=False)
 
 
 def main() -> None:

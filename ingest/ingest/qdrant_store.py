@@ -8,8 +8,13 @@ from qdrant_client import QdrantClient, models
 
 from .chunking import Chunk
 from .config import Config
+from .dedup import content_hash
 from .embedding import Sparse
-from .sources import CanonicalDoc
+from .sources import (
+    PROMOTED_KEYWORD_FIELDS,
+    PROMOTED_TEXT_FIELDS,
+    CanonicalDoc,
+)
 
 # Fixed namespace so point IDs are stable across runs/machines.
 NAMESPACE = uuid.UUID("8b1d3c9e-7a2f-4c0b-9e6a-2f1d4c5b6a70")
@@ -23,6 +28,10 @@ KEYWORD_FIELDS = (
     "document_number",
     "registration_code",
     "status",
+    # Doc-body identity (SHA-256 of the cleaned body). Replicated on every chunk of a doc.
+    # Indexed so watch's change-detection and cross-source exact-dup version grouping can
+    # filter by it without a full scroll.
+    "content_hash",
 )
 # Datetime range indexes (in addition to the primary "date" index created below).
 DATETIME_FIELDS = ("date", "in_force_date", "expiry_date")
@@ -89,11 +98,11 @@ def ensure_collection(client: QdrantClient, cfg: Config, *, recreate: bool = Fal
             )
         ),
     )
-    for field in KEYWORD_FIELDS:
+    for field in (*KEYWORD_FIELDS, *PROMOTED_KEYWORD_FIELDS):
         client.create_payload_index(
             name, field_name=field, field_schema=models.PayloadSchemaType.KEYWORD
         )
-    for field in TEXT_FIELDS:
+    for field in (*TEXT_FIELDS, *PROMOTED_TEXT_FIELDS):
         client.create_payload_index(
             name,
             field_name=field,
@@ -133,7 +142,7 @@ def _rfc3339(date: str | None) -> str | None:
 
 
 def build_payload(doc: CanonicalDoc, chunk: Chunk) -> dict:
-    return {
+    payload = {
         "source": doc.source,
         "document_id": doc.document_id,
         "chunk_index": chunk.chunk_index,
@@ -152,8 +161,18 @@ def build_payload(doc: CanonicalDoc, chunk: Chunk) -> dict:
         "expiry_date": _rfc3339(doc.expiry_date),
         "heading": " > ".join(chunk.heading_path) or None,
         "token_count": chunk.token_count,
+        "char_start": chunk.char_start,
+        "char_end": chunk.char_end,
         "text": chunk.text,
+        # Doc-level identity replicated on each chunk: lets watch skip re-embedding an
+        # unchanged doc (compare chunk-0's hash) without re-reading the whole body from Qdrant.
+        "content_hash": content_hash(doc.body_markdown or ""),
     }
+    # Promoted structured fields (e.g. tas applicant IDs/phones). setdefault so a promoted
+    # key can never overwrite a canonical payload field.
+    for key, value in doc.promoted.items():
+        payload.setdefault(key, value)
+    return payload
 
 
 def sparse_vector(sparse: Sparse) -> models.SparseVector:
