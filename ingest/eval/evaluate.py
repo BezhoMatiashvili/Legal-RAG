@@ -211,6 +211,8 @@ def main() -> None:
     ap.add_argument("--sparse-weight", type=float, default=None, help="weighted dense/sparse fusion")
     ap.add_argument("--max-per-doc", type=int, default=None, help="diversity: cap chunks per doc")
     ap.add_argument("--mmr-lambda", type=float, default=None, help="diversity: MMR trade-off 0..1")
+    ap.add_argument("--translate-queries", metavar="PATH", default=None,
+                    help="I2: authored EN→KA query-translation JSON (embeds the KA text)")
     ap.add_argument("--ab", action="store_true",
                     help="paired A/B: --mode with knobs OFF (A) vs the given knobs ON (B)")
     ap.add_argument("--log", action="store_true", help="append runs to the experiment log")
@@ -242,13 +244,22 @@ def main() -> None:
     rel = build_query_relevance(gold, bodies, chunk_cfg, count_tokens)
 
     rescore = {"on": True, "off": False}.get(args.rescore)
+    translations, translations_hash = (None, None)
+    if args.translate_queries:
+        from .translations import load_query_translations
+
+        translations, translations_hash = load_query_translations(Path(args.translate_queries), gold)
     knobs = {
         "rerank_candidates": args.rerank_candidates, "fusion": args.fusion,
         "prefetch_limit": args.prefetch_limit, "hnsw_ef": args.hnsw_ef, "rescore": rescore,
         "sparse_weight": args.sparse_weight, "max_per_doc": args.max_per_doc,
-        "mmr_lambda": args.mmr_lambda,
+        "mmr_lambda": args.mmr_lambda, "translations": translations,
     }
-    active_knobs = {k: v for k, v in knobs.items() if v not in (None, "rrf")}
+    # The raw translation dict never enters config_hash/logs — its file content hash does.
+    active_knobs = {k: v for k, v in knobs.items()
+                    if v not in (None, "rrf") and k != "translations"}
+    if translations_hash:
+        active_knobs["translate_queries"] = translations_hash
 
     deps = qdrant_deps(cfg) if args.backend == "qdrant" else None
     backend, index_info = make_backend(

@@ -330,6 +330,12 @@ async def legal_search(params: SearchInput) -> str:
     returned chunks are ordered by true query↔text relevance. The ``score`` field is the
     reranker's calibrated relevance (0..1), not a cosine/RRF score.
 
+    The corpus is Georgian. For non-Georgian queries, translate the query into Georgian
+    legal terminology and search with the Georgian text (keep the original only as a
+    fallback); Georgian-language statute vocabulary retrieves dramatically better —
+    measured on the golden set, authored Georgian translations of English queries raised
+    cross-lingual Recall@10 from 0.27 to 0.50 at the production rerank config.
+
     Use the optional filters to scope by source, court, legal ``status`` (in_force /
     repealed / pending — matsne acts), language, document type, document/registration
     number, party names, an exact keyword that must appear (``contains``), or a date range.

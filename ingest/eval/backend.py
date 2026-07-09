@@ -153,7 +153,7 @@ class QdrantBackend:
                  *, fusion: str = "rrf", prefetch_limit: int | None = None,
                  hnsw_ef: int | None = None, rescore: bool | None = None,
                  sparse_weight: float | None = None, max_per_doc: int | None = None,
-                 mmr_lambda: float | None = None):
+                 mmr_lambda: float | None = None, translations: dict[str, str] | None = None):
         self.cfg = cfg
         self.client = client
         self.embedder = embedder
@@ -167,6 +167,10 @@ class QdrantBackend:
         self.sparse_weight = sparse_weight   # manual weighted dense/sparse fusion (RRF is unweighted)
         self.max_per_doc = max_per_doc       # diversity: cap chunks per document_id
         self.mmr_lambda = mmr_lambda         # diversity: MMR trade-off (needs candidate vectors)
+        # I2 cross-lingual knob: {original_query: authored KA legal-register translation}.
+        # Substituted before encoding, so routing/sparse/rerank all see the Georgian text;
+        # queries without an entry (all KA ones) are untouched by construction.
+        self.translations = translations
         self._bm25 = None  # BM25Index | FullCorpusBM25, built lazily in _ensure_bm25
         self._filter = None
 
@@ -279,6 +283,9 @@ class QdrantBackend:
 
     def search(self, query: str, mode: str, k: int) -> tuple[list[Hit], dict[str, float]]:
         from qdrant_client import models
+
+        if self.translations:
+            query = self.translations.get(query, query)
 
         lat = {"embed": 0.0, "search": 0.0, "rerank": 0.0}
 
