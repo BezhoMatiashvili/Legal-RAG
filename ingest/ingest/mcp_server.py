@@ -343,6 +343,30 @@ async def legal_search(params: SearchInput) -> str:
     use ``legal_browse``. To read a full document after a chunk looks relevant, pass its
     ``source`` + ``document_id`` to ``legal_get_document``.
 
+    Retry playbook — when the top hits don't actually match the ask, iterate instead of
+    settling: (a) re-query in Georgian legal terminology (statute vocabulary, synonyms);
+    (b) drop filters that may be excluding the target; (c) if the ask names a specific
+    law/order/decree number, resolve it with ``legal_lookup`` (document_number or
+    registration_code) first and then read it via ``legal_get_document``; (d) for a
+    law's amendment history browse its registration_code with
+    ``legal_get_document_versions``; (e) raise ``top_k`` (up to 50). Think between calls;
+    stop when a returned document_number/title genuinely matches the ask — never present
+    the nearest semantic match as if it were the asked-for document. Note the corpus may
+    lack consolidated base-law texts (amendment acts dominate); if a base statute doesn't
+    surface, say so rather than citing an amendment as the law itself.
+
+    Abstention contract — scores are calibrated 0..1 but saturate high: a top score
+    below ~0.92 is a strong not-found signal (measured on the golden set: every
+    gold-hitting query's top score was ≥0.926, while 10% of misses fell below it), and a
+    HIGH score does NOT prove the right document — always check that the returned
+    title / document_number actually matches the ask. If the top score is below ~0.92 or
+    no hit's title/number matches the asked-for law, report that the document was not
+    found rather than citing the nearest match — the corpus may lack it.
+
+    Before emitting any citation in an answer, verify it resolves via ``legal_lookup``
+    (document_number or registration_code); never cite an identifier that does not
+    resolve to a real document.
+
     Args:
         params (SearchInput): query, top_k (1-50), optional filters (source, court,
             status, language, document_type, document_number, registration_code, parties,
@@ -551,6 +575,10 @@ async def legal_get_document(params: GetDocumentInput) -> str:
     text. It fetches every chunk for the given source + document_id (no embedding /
     model load) and joins them in order. Note: BGE-M3 chunks carry ~80 tokens of
     overlap, so a little text may repeat across chunk boundaries.
+
+    Before emitting any citation drawn from this document in an answer, verify the
+    cited identifier resolves via ``legal_lookup`` (document_number or
+    registration_code); never cite an identifier that does not resolve.
 
     Args:
         params (GetDocumentInput): source, document_id, and response_format.
