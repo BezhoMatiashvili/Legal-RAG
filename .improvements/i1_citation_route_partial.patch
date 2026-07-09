@@ -1,0 +1,169 @@
+diff --git a/ingest/eval/backend.py b/ingest/eval/backend.py
+index cd954ac..64e84b2 100644
+--- a/ingest/eval/backend.py
++++ b/ingest/eval/backend.py
+@@ -153,7 +153,7 @@ class QdrantBackend:
+                  *, fusion: str = "rrf", prefetch_limit: int | None = None,
+                  hnsw_ef: int | None = None, rescore: bool | None = None,
+                  sparse_weight: float | None = None, max_per_doc: int | None = None,
+-                 mmr_lambda: float | None = None):
++                 mmr_lambda: float | None = None, citation_route: str | None = None):
+         self.cfg = cfg
+         self.client = client
+         self.embedder = embedder
+@@ -167,6 +167,7 @@ class QdrantBackend:
+         self.sparse_weight = sparse_weight   # manual weighted dense/sparse fusion (RRF is unweighted)
+         self.max_per_doc = max_per_doc       # diversity: cap chunks per document_id
+         self.mmr_lambda = mmr_lambda         # diversity: MMR trade-off (needs candidate vectors)
++        self.citation_route = citation_route  # I1: pin exact citation hits ("ids" | "full")
+         self._bm25 = None  # BM25Index | FullCorpusBM25, built lazily in _ensure_bm25
+         self._filter = None
+ 
+@@ -293,6 +294,16 @@ class QdrantBackend:
+         emb = self.embedder.encode_query(query)
+         lat["embed"] = time.perf_counter() - t0
+         coll = self.cfg.collection_name
++
++        pinned = []
++        if self.citation_route:
++            from ingest.citations import citation_lookup, extract_citation
++
++            t0 = time.perf_counter()
++            ref = extract_citation(query, mode=self.citation_route)
++            if ref is not None:
++                pinned = citation_lookup(self.client, coll, emb.dense, ref)
++            lat["search"] += time.perf_counter() - t0
+         sp = self._search_params(models)
+         want_vec = self.mmr_lambda is not None
+         deep = mode == "rerank" or self._diversity_on  # fetch a pool, not just top_k
+@@ -335,7 +346,7 @@ class QdrantBackend:
+                     limit=fetch_n, with_payload=True, with_vectors=want_vec,
+                 )
+                 points = res.points
+-        lat["search"] = time.perf_counter() - t0
++        lat["search"] += time.perf_counter() - t0  # += : citation-route lookup time above
+ 
+         if mode == "rerank" and self.reranker is not None and points:
+             from ingest.search import rerank_points
+@@ -353,4 +364,9 @@ class QdrantBackend:
+         else:
+             points = points[:k]
+ 
++        if pinned:
++            from ingest.citations import pin_points
++
++            points = pin_points(pinned, points, k)
++
+         return self._points_to_hits(points), lat
+diff --git a/ingest/eval/evaluate.py b/ingest/eval/evaluate.py
+index 1b8d8f0..ec094f4 100644
+--- a/ingest/eval/evaluate.py
++++ b/ingest/eval/evaluate.py
+@@ -211,6 +211,8 @@ def main() -> None:
+     ap.add_argument("--sparse-weight", type=float, default=None, help="weighted dense/sparse fusion")
+     ap.add_argument("--max-per-doc", type=int, default=None, help="diversity: cap chunks per doc")
+     ap.add_argument("--mmr-lambda", type=float, default=None, help="diversity: MMR trade-off 0..1")
++    ap.add_argument("--citation-route", choices=("ids", "full"), default=None,
++                    help="I1: pin exact citation/alias matches above semantic hits")
+     ap.add_argument("--ab", action="store_true",
+                     help="paired A/B: --mode with knobs OFF (A) vs the given knobs ON (B)")
+     ap.add_argument("--log", action="store_true", help="append runs to the experiment log")
+@@ -246,7 +248,7 @@ def main() -> None:
+         "rerank_candidates": args.rerank_candidates, "fusion": args.fusion,
+         "prefetch_limit": args.prefetch_limit, "hnsw_ef": args.hnsw_ef, "rescore": rescore,
+         "sparse_weight": args.sparse_weight, "max_per_doc": args.max_per_doc,
+-        "mmr_lambda": args.mmr_lambda,
++        "mmr_lambda": args.mmr_lambda, "citation_route": args.citation_route,
+     }
+     active_knobs = {k: v for k, v in knobs.items() if v not in (None, "rrf")}
+ 
+diff --git a/ingest/ingest/config.py b/ingest/ingest/config.py
+index bc4e926..7b05bdb 100644
+--- a/ingest/ingest/config.py
++++ b/ingest/ingest/config.py
+@@ -37,6 +37,12 @@ def _float_opt(name: str, default: float | None) -> float | None:
+     return float(raw)
+ 
+ 
++def _route_opt(name: str) -> str | None:
++    """Citation-route mode: ``ids`` / ``full``; unset, empty, or ``off`` → None (disabled)."""
++    raw = (os.getenv(name) or "").strip().lower()
++    return raw if raw in ("ids", "full") else None
++
++
+ def _device_opt(name: str) -> str | None:
+     """A device string (``cpu``/``cuda``/``cuda:0``/``mps``) or None.
+ 
+@@ -76,6 +82,8 @@ class Config:
+     chunk_tokens: int
+     chunk_overlap: int
+     chunk_min_tokens: int
++    # Citation exact-match routing (improvement I1): None = off, "ids" | "full".
++    citation_route: str | None
+     artifacts_root: Path
+     state_dir: Path
+     query_log_enabled: bool
+@@ -110,6 +118,7 @@ def load_config() -> Config:
+         chunk_tokens=_int("CHUNK_TOKENS", 512),
+         chunk_overlap=_int("CHUNK_OVERLAP", 80),
+         chunk_min_tokens=_int("CHUNK_MIN_TOKENS", 64),
++        citation_route=_route_opt("CITATION_ROUTE"),
+         artifacts_root=artifacts_root.resolve(),
+         state_dir=state_dir,
+         query_log_enabled=_bool("QUERY_LOG_ENABLED", True),
+@@ -136,5 +145,8 @@ def retrieval_fingerprint(cfg: Config) -> str:
+         "chunk_overlap": cfg.chunk_overlap,
+         "chunk_min_tokens": cfg.chunk_min_tokens,
+     }
++    # Added conditionally so the fingerprint is unchanged while the knob is off (G5).
++    if cfg.citation_route:
++        material["citation_route"] = cfg.citation_route
+     blob = json.dumps(material, sort_keys=True, separators=(",", ":"))
+     return hashlib.sha256(blob.encode()).hexdigest()[:16]
+diff --git a/ingest/ingest/search.py b/ingest/ingest/search.py
+index 27d31a1..37a511e 100644
+--- a/ingest/ingest/search.py
++++ b/ingest/ingest/search.py
+@@ -8,6 +8,7 @@ import re
+ 
+ from qdrant_client import models
+ 
++from .citations import citation_lookup, extract_citation, pin_points
+ from .config import Config
+ 
+ _MKHEDRULI_RE = re.compile(r"[ა-ჿ]")
+@@ -131,6 +132,16 @@ def hybrid_search(
+     emb = embedder.encode_query(query)
+     flt = build_filter(**filters)
+ 
++    # Citation exact-match routing (CITATION_ROUTE, improvement I1): an explicit citation
++    # resolves through the keyword-indexed payload fields and its chunks are pinned above
++    # the semantic results. Skipped when the caller already filters (their intent wins).
++    # Knob off / no citation / no exact hit ⇒ the unchanged code path below.
++    pinned = []
++    if getattr(cfg, "citation_route", None) and flt is None:
++        ref = extract_citation(query, mode=cfg.citation_route)
++        if ref is not None:
++            pinned = citation_lookup(client, cfg.collection_name, emb.dense, ref)
++
+     # How many candidates to fuse before reranking. With a reranker we want a deep pool
+     # so the cross-encoder has real recall to work with; without one, the old top_k*5/50.
+     diversity_on = max_per_doc is not None or mmr_lambda is not None
+@@ -179,11 +190,12 @@ def hybrid_search(
+             top_k=len(points) if diversity_on else top_k, min_score=rerank_min_score,
+         )
+     if diversity_on:
+-        return diversify(points, top_k=top_k, max_per_doc=max_per_doc,
+-                         mmr_lambda=mmr_lambda, query_vec=emb.dense)
+-    if reranker is None:
+-        return points[:top_k]
+-    return points
++        points = diversify(points, top_k=top_k, max_per_doc=max_per_doc,
++                           mmr_lambda=mmr_lambda, query_vec=emb.dense)
++    elif reranker is None:
++        points = points[:top_k]
++    # Pinning happens after rerank/diversity so nothing can demote an exact citation hit.
++    return pin_points(pinned, points, top_k) if pinned else points
+ 
+ 
+ def _point_dense(pt):
