@@ -30,9 +30,12 @@ each metric with 95 % bootstrap CIs, with a **mandatory full-corpus BM25 floor**
 6. **Recommended interim production config: `hybrid + rerank@50`, no diversity** —
    `retrieval_fingerprint = 81c807b279399098` (see §6). Depth is a documented latency/quality knob.
 
-**Binding caveat:** CPU rerank latency is the real constraint (~25 s/query @50, ~41 s @80). The
-reranker is the bottleneck; an int8/ONNX or GPU-accelerated reranker (the GPU path built this
-session) is the clear next step to make deep rerank practical for interactive serving.
+**Binding caveat:** CPU rerank latency is the real constraint — now **measured** (reranker-only,
+OMP_NUM_THREADS=8, `scripts/rerank_latency_probe.py`): p50 **16.2 s @10 · 45.4 s @30 · 66.9 s @50 ·
+114.4 s @80** per query. Worse than the earlier derived estimates (~25 s @50) — this box is a
+hybrid P/E-core laptop CPU that power-scales under sustained load. CPU rerank is definitively not
+interactive; an int8/ONNX or GPU-accelerated reranker (the GPU path built this session) is
+mandatory before deep rerank ships interactively.
 
 ---
 
@@ -96,8 +99,10 @@ V=4,213,139, nnz=207,680,637, avgdl=144.2.
   modes (no change to results or `config_hash`) → sparse back to 76 s. Even so, CPU `rerank@80`
   (both models resident) ran 70 min and OOM-crashed — the reason reranking was moved to GPU.
 - **The reranker was subsequently optimized** (physical-core thread pinning + length-bucketed batches,
-  `ingest/rerank.py`) — scores unchanged, CPU throughput improved; the derived latencies here predate
-  that and are an upper bound.
+  `ingest/rerank.py`) — scores unchanged. Per-depth CPU latency has since been **measured directly**
+  (`scripts/rerank_latency_probe.py`, 2026-07-09): p50 16.2/45.4/66.9/114.4 s per query at depth
+  10/30/50/80. These supersede the old derived numbers (which turned out to be underestimates —
+  the box's hybrid P/E-core CPU clocks down under sustained all-core load).
 
 ---
 
@@ -115,7 +120,7 @@ _Full 2.45M-chunk index, 103-query golden set, chunk-level. mean [95 % bootstrap
 | sparse | 0.282 [0.194, 0.369] | 0.182 [0.121, 0.248] | 0.160 [0.102, 0.223] | 307 / 405 |
 | hybrid | 0.330 [0.243, 0.427] | 0.182 [0.126, 0.244] | 0.146 [0.094, 0.203] | 474 / 642 |
 | routed | 0.330 [0.243, 0.427] | 0.187 [0.129, 0.249] | 0.151 [0.098, 0.208] | 440 / 564 |
-| **+rerank@80** | **0.388 [0.301, 0.485]** | **0.289 [0.212, 0.367]** | **0.270 [0.195, 0.348]** | 40800 / 46920 (CPU, derived) |
+| **+rerank@80** | **0.388 [0.301, 0.485]** | **0.289 [0.212, 0.367]** | **0.270 [0.195, 0.348]** | 114354 / 116142 (CPU, measured) |
 
 ### Cross-lingual slice (22 EN→KA pairs)
 
@@ -126,14 +131,14 @@ _Full 2.45M-chunk index, 103-query golden set, chunk-level. mean [95 % bootstrap
 | hybrid | 0.136 | 0.047 | 0.027 |
 | **rerank@80** | **0.273** | **0.184** | **0.156** |
 
-### Rerank-depth ablation (quality: GPU fp32; latency: CPU, derived — upper bound)
+### Rerank-depth ablation (quality: GPU fp32; latency: CPU, measured 2026-07-09)
 
-| depth | R@10 | nDCG@10 | cross-lingual R@10 | lat p50 (ms) |
+| depth | R@10 | nDCG@10 | cross-lingual R@10 | lat p50 (ms, measured) |
 |---|---|---|---|---|
-| rerank@10 | 0.330 [0.243, 0.427] | 0.249 [0.174, 0.326] | 0.136 | 5538 |
-| rerank@30 | 0.340 [0.252, 0.437] | 0.262 [0.186, 0.341] | 0.182 | 15612 |
-| rerank@50 | 0.359 [0.272, 0.456] | 0.270 [0.193, 0.349] | 0.227 | 25688 |
-| rerank@80 | 0.388 [0.301, 0.485] | 0.289 [0.212, 0.367] | 0.273 | 40800 |
+| rerank@10 | 0.330 [0.243, 0.427] | 0.249 [0.174, 0.326] | 0.136 | 16197 |
+| rerank@30 | 0.340 [0.252, 0.437] | 0.262 [0.186, 0.341] | 0.182 | 45429 |
+| rerank@50 | 0.359 [0.272, 0.456] | 0.270 [0.193, 0.349] | 0.227 | 66856 |
+| rerank@80 | 0.388 [0.301, 0.485] | 0.289 [0.212, 0.367] | 0.273 | 114354 |
 
 Quality rises monotonically with depth on point estimates, but the per-depth CIs overlap (depth
 differences are not individually significant at n=103). Cross-lingual R@10 trends up with depth
@@ -145,7 +150,7 @@ pick it against a latency budget, not a significance claim.
 
 | config | R@10 | nDCG@10 [95% CI] | lat p50 (ms) | verdict |
 |---|---|---|---|---|
-| rerank@80 (base) | 0.388 | 0.289 [0.212, 0.367] | 40800 (CPU, derived) | — |
+| rerank@80 (base) | 0.388 | 0.289 [0.212, 0.367] | 114354 (CPU, measured) | — |
 | max-per-doc=2 | 0.388 | 0.289 [0.212, 0.368] | +cap (negligible) | **tie** (CIs identical) |
 | mmr λ=0.5 | 0.136 | 0.074 [0.037, 0.117] | +MMR (dense-vec pass) | **significantly harmful** (CI disjoint from base) |
 
@@ -175,19 +180,29 @@ Rationale:
   that drops the sparse branch for EN.
 - **Diversity off** (cap neutral, MMR harmful).
 
-**Serving caveat (load-bearing):** CPU rerank latency (~25 s/q @50) is impractical for interactive
-use. The reranker is the bottleneck — recommend an **int8/ONNX CPU reranker or the GPU rerank path**
-(built this session) before this ships interactively. Retrieval-only (hybrid, ~0.5 s/q) is the
-graceful-degradation fallback if the reranker is unavailable.
+**Serving caveat (load-bearing):** CPU rerank latency (**measured 66.9 s/q @50, 114.4 s/q @80**)
+is impractical for interactive use. The reranker is the bottleneck — recommend an **int8/ONNX CPU
+reranker or the GPU rerank path** (built this session) before this ships interactively.
+Retrieval-only (hybrid, ~0.5 s/q) is the graceful-degradation fallback if the reranker is
+unavailable.
 
-## 8. Deferred — Qdrant recall-setting tuning grid
+## 8. Qdrant recall-setting tuning grid (completed 2026-07-09, green index)
 
-The fusion / prefetch-depth / HNSW-ef×int8-rescore / cross-lingual-sparse-weight sweep was **not
-completed**: a concurrent `backfill_consolidation.py` job began re-indexing `georgian_legal`
-(status → yellow) mid-run, timing out the hybrid queries (Qdrant 500 "fill query context timed out").
-These knobs are secondary optimization and don't affect the findings or recommendation above.
-**Re-run on a green/stable index:** `bash scripts/phase_c_full.sh tuning` (rows append to
-`eval/experiments.jsonl`; regenerate tables with `scripts/build_phase_c_report.py`).
+All 16 cells ran clean on the green post-backfill index (2,454,410 points; the earlier attempt
+had died on "fill query context" timeouts from the concurrent `backfill_consolidation.py`
+writer). Full tables in §5–§8 of `phase_c_report_tables.md`. **Every knob is secondary — the
+recommendation is unchanged:**
+
+- **Fusion RRF vs DBSF:** paired A/B = **TIE on every metric** (e.g. nDCG@10 Δ=-0.004,
+  p=0.78); DBSF's point estimates are slightly worse (R@10 0.291 vs 0.330). Keep **RRF**.
+- **Prefetch depth 50→400:** R@10 flat at 0.330, nDCG@10 0.182→0.184 (noise). Keep default.
+- **HNSW ef 64/128/256 × int8 rescore (dense):** ef=256 nudges nDCG@10 0.112→0.118 (CIs overlap
+  heavily); rescore on/off is a wash. Dense alone is far below hybrid, so no prod impact.
+- **Sparse-weight (hybrid):** overall nDCG@10 peaks at w=0.8 (0.191 vs 0.179 base, CIs overlap)
+  **but the cross-lingual slice collapses monotonically with sparse weight** (EN R@10:
+  0.182 @ w=0.0 → 0.045 @ w=0.8 → 0.000 @ w=1.0) — direct confirmation that lexical/sparse
+  matching carries zero cross-lingual signal. The small overall gain is not worth killing the
+  EN slice; keep the default RRF hybrid.
 
 ## 9. Sample daily-ingestion report
 
@@ -199,12 +214,17 @@ docs/added/updated/unchanged/skipped/chunks + schema_drift + updated_at.
 
 ## 10. Caveats & follow-ups
 
-- **Rerank latency is derived** (from the rerank@80 wall-clock, pre-optimization reranker) — an upper
-  bound. A clean per-depth CPU measurement with the length-bucketed reranker is a quick follow-up.
-- **Rerank-vs-hybrid significance:** the win is by point estimate + wide CIs (n=103), not a formal
-  paired test (depths were run standalone on GPU). The point-estimate gains are large and consistent
-  across all metrics + the cross-lingual slice, but a paired rerank-vs-hybrid comparison would harden
-  the claim. The one formal paired test run (routing) is reported in §6.
-- **Tuning grid deferred** (§8).
+- ~~**Rerank latency is derived**~~ **RESOLVED (2026-07-09):** measured per-depth with the
+  length-bucketed reranker (`scripts/rerank_latency_probe.py`, OMP_NUM_THREADS=8, →
+  `eval/rerank_xval.json`): p50 16.2/45.4/66.9/114.4 s per query @ depth 10/30/50/80. The old
+  derived numbers were ~2.8× optimistic — this hybrid P/E-core CPU throttles under sustained
+  all-core load (observed at 45% clock scaling). Conclusion unchanged but stronger: CPU rerank
+  is not interactive at any useful depth.
+- ~~**Rerank-vs-hybrid significance**~~ **RESOLVED (2026-07-09):** a paired permutation test
+  (`--compare hybrid rerank`, rerank scored on a GPU pod, retrieval local) **certifies the rerank
+  win**: nDCG@10 Δ=+0.113 [+0.065,+0.165] p=0.0001 → ADOPT; MRR@10 Δ=+0.131 [+0.078,+0.190]
+  p=0.0001 → ADOPT; R@5 Δ=+0.117 [+0.039,+0.194] p=0.0072 → ADOPT; R@10 Δ=+0.068 [+0.000,+0.136]
+  p=0.095 → TIE. Rows in `eval/experiments_gpu.jsonl`; paired block in
+  `~/gpu_embed_work/significance_compare.log`.
 - **MMR crater** (0.289→0.074) is directionally expected but large; worth confirming it's a genuine
   effect vs. an `diversify()` MMR-implementation artifact before drawing library-level conclusions.

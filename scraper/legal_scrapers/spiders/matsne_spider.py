@@ -58,6 +58,23 @@ class MatsneSpider(BaseLegalSpider):
                     yield request
             return
 
+        if getattr(self, "catch_all_only", None):
+            # Completeness shortcut: the empty-topic + empty-status catch-all listing returns
+            # the WHOLE corpus, so the topic×status phase-1 pass is pure redundancy (it only
+            # re-lists docs the catch-all already covers). Run just the catch-all, per yearly
+            # window — same coverage, ~half the listing requests. No phase-2 transition.
+            self.first_batch_urls = self.deferred_batch_urls = []
+            self.deferred_batch_started = True
+            for win_start, win_end in sub_windows(
+                self.scraping_start_date, self.scraping_end_date, "yearly"
+            ):
+                request = self.build_request(
+                    build_search_url(win_start, win_end, "", ""), callback=self.parse
+                )
+                if request:
+                    yield request
+            return
+
         self.first_batch_urls, self.deferred_batch_urls = generate_start_url_batches(
             self.scraping_start_date,
             self.scraping_end_date,

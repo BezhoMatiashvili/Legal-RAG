@@ -161,5 +161,33 @@ class AdaptiveSplitTests(unittest.TestCase):
         self.assertIsNone(self._split(spider, self._search_url("01-01-2015", "31-01-2015"), 200))
 
 
+class CatchAllOnlyModeTests(unittest.TestCase):
+    def test_catch_all_only_yields_one_pure_catchall_per_year(self):
+        spider = MatsneSpider(start_date="2018-01-01", end_date="2020-12-31")
+        spider.catch_all_only = "1"
+
+        async def collect():
+            return [r async for r in spider.start()]
+
+        reqs = asyncio.run(collect())
+        self.assertEqual(len(reqs), 3)  # 2018, 2019, 2020
+        for r in reqs:
+            q = parse_qs(urlparse(r.url).query, keep_blank_values=True)
+            self.assertEqual(q.get("label", [""])[0], "")            # empty topic
+            self.assertEqual(q.get("additional_status", [""])[0], "")  # empty status
+            self.assertEqual(r.callback, spider.parse)
+        self.assertTrue(spider.deferred_batch_started)  # no phase-2 transition
+
+    def test_without_flag_runs_normal_phase1(self):
+        spider = MatsneSpider(start_date="2020-01-01", end_date="2020-12-31")
+
+        async def collect():
+            return [r async for r in spider.start()]
+
+        reqs = asyncio.run(collect())
+        # normal phase 1 = non-empty topic×status cells → far more than 1/year
+        self.assertGreater(len(reqs), 3)
+
+
 if __name__ == "__main__":
     unittest.main()

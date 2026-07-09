@@ -58,6 +58,8 @@ def _resolve_paths(cfg, args) -> list[Path]:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--items", nargs="*", help="explicit items.jsonl path(s)")
+    ap.add_argument("--source", default="matsne",
+                    help="source name for sources.normalize (default: matsne)")
     ap.add_argument("--runs-since", help="include run dirs whose id >= this (e.g. 20260709T080007Z)")
     ap.add_argument("--collection", help="target collection (on the pod: georgian_legal_delta)")
     ap.add_argument("--batch-size", type=int, default=256)
@@ -77,7 +79,7 @@ def main() -> None:
     malformed = 0
     for item in _iter_items(paths):
         try:
-            doc = normalize("matsne", item)
+            doc = normalize(args.source, item)
         except Exception:  # noqa: BLE001 - a malformed record must not abort the delta
             malformed += 1
             continue

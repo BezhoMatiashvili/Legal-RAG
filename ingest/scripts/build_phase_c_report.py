@@ -212,10 +212,16 @@ def main() -> int:
     md += ["_per-language = en:_", ""]
     md += slice_table(core, lbl_mode, "lang", "en")
 
-    md += ["### 3. Rerank-depth ablation (quality: GPU pod, fp32; latency: CPU, derived)", ""]
-    md += ["_Latency is derived: rerank@80 measured 40.8 s/query end-to-end on the pre-"
-           "length-bucketing CPU reranker (4203 s / 103 q); rerank scales ~linearly with depth, "
-           "so shallower depths are ~proportional. Treat as an upper bound._", ""]
+    if probe:
+        md += ["### 3. Rerank-depth ablation (quality: GPU pod, fp32; latency: CPU, measured)", ""]
+        md += ["_Latency is measured on this box by `scripts/rerank_latency_probe.py` "
+               "(OMP_NUM_THREADS=8, length-bucketed reranker, reranker-only — add ~0.3-0.5 s "
+               "retrieval+encode for end-to-end)._", ""]
+    else:
+        md += ["### 3. Rerank-depth ablation (quality: GPU pod, fp32; latency: CPU, derived)", ""]
+        md += ["_Latency is derived: rerank@80 measured 40.8 s/query end-to-end on the pre-"
+               "length-bucketing CPU reranker (4203 s / 103 q); rerank scales ~linearly with depth, "
+               "so shallower depths are ~proportional. Treat as an upper bound._", ""]
     md += metric_table(depth, lbl_rc, probe=probe)
 
     md += ["### 4. Diversity (max-per-doc / MMR) vs no-diversity rerank@80", ""]

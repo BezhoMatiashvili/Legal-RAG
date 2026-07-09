@@ -8,6 +8,12 @@ lazily on the first search, so the server handshakes instantly and the tools
 that don't need embeddings (``legal_get_document``, ``legal_collection_info``)
 never trigger a model load.
 
+With ``SEARCH_BACKEND=remote`` every retrieval tool instead RPCs the RunPod
+serverless worker (see ``ingest/serverless/``), which runs these very same tool
+coroutines against its own Qdrant — responses are byte-identical and this
+process loads no models and needs no local Qdrant at all. ``ingest_status``
+stays local either way (watcher state lives on this box).
+
 Run it inside the ingest uv environment:
 
     uv run --directory ingest python -m ingest.mcp_server
@@ -111,6 +117,53 @@ async def _get_reranker():
 def _is_remote_reranker(reranker) -> bool:
     """True for the HTTP/GPU-pod reranker (``RemoteBGEReranker`` sets ``.device = "remote"``)."""
     return getattr(reranker, "device", None) == "remote"
+
+
+# --- Remote backend (RunPod serverless worker) ---------------------------------
+
+_remote_client = None
+
+
+def _use_remote() -> bool:
+    return _get_cfg().search_backend == "remote"
+
+
+def _get_remote_client():
+    global _remote_client
+    if _remote_client is None:
+        from .remote_search import RunPodQueueClient
+
+        cfg = _get_cfg()
+        _remote_client = RunPodQueueClient(
+            cfg.runpod_endpoint_id or "", cfg.runpod_api_key or "",
+            timeout=cfg.runpod_api_timeout)
+    return _remote_client
+
+
+async def _remote_op(op: str, params: dict | None = None) -> str:
+    """One RPC to the serverless worker. The worker runs the same tool coroutine, so its
+    output string IS this tool's output string. Errors come back as actionable text; there
+    is deliberately NO silent fallback to the local path — loading models locally is
+    exactly the swap-thrash the remote backend removes, so the user opts back in by
+    flipping the env instead."""
+    try:
+        out = await asyncio.to_thread(_get_remote_client().call, op, params or {})
+        return out.get("result") or ""
+    except Exception as e:  # noqa: BLE001 - surface an actionable message to the agent
+        return (
+            f"Error (remote backend): {e}\n\n"
+            "If the serverless endpoint is gone for good, set SEARCH_BACKEND=local in "
+            "ingest/.env and reconnect /mcp to serve from the local Qdrant instead."
+        )
+
+
+def _publish_manifest(cfg: Config) -> dict | None:
+    """The locally-mirrored publish manifest — what data the worker should be serving."""
+    try:
+        return json.loads(
+            (cfg.state_dir / "publish" / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
 
 
 def _handle_error(e: Exception) -> str:
@@ -298,6 +351,11 @@ async def legal_search(params: SearchInput) -> str:
         "chunk_index", "heading", "text"}, ...]}.
         Returns a "No results found" message when nothing matches.
     """
+    if _use_remote():
+        t0 = time.perf_counter()
+        result = await _remote_op("search", params.model_dump(mode="json"))
+        _log_query_remote(params, (time.perf_counter() - t0) * 1000)
+        return result
     try:
         cfg = _get_cfg()
         client = _get_client()
@@ -359,6 +417,30 @@ async def legal_search(params: SearchInput) -> str:
     blocks.extend(_format_hit_md(rank, hit) for rank, hit in enumerate(hits, 1))
     blocks.append(f"\n> index: {cfg.collection_name} · fp {fp}")
     return "\n".join(blocks)
+
+
+def _log_query_remote(params, elapsed_ms: float) -> None:
+    """Local-only latency log for remote-mode searches. Hit ids stay on the worker (the
+    result is an opaque formatted string here), so the record carries ``mode='remote'``
+    and an empty hit list — analytics must not read its ``n_hits=0`` as "no results"."""
+    cfg = _get_cfg()
+    if not cfg.query_log_enabled:
+        return
+    try:
+        filters = {
+            k: getattr(params, k) for k in (
+                "source", "language", "document_type", "court", "status", "document_number",
+                "registration_code", "parties", "contains", "date_from", "date_to",
+            )
+        }
+        rec = build_query_record(
+            query=params.query, filters=filters, top_k=params.top_k, hits=[],
+            latency_ms=elapsed_ms, fingerprint=retrieval_fingerprint(cfg),
+            mode="remote", route=detect_language(params.query),
+        )
+        append_query_log(rec, cfg.query_log_path)
+    except Exception as e:  # noqa: BLE001 - logging must never break search
+        logger.warning("query log write failed: %s", e)
 
 
 def _log_query(cfg: Config, params, hits, elapsed_ms: float) -> None:
@@ -474,6 +556,8 @@ async def legal_get_document(params: GetDocumentInput) -> str:
         "document_type", "court", "language", "source_url", "chunk_count",
         "text"}. Returns a "No document found" message when the id is unknown.
     """
+    if _use_remote():
+        return await _remote_op("get_document", params.model_dump(mode="json"))
     try:
         cfg = _get_cfg()
         client = _get_client()
@@ -644,6 +728,8 @@ async def legal_lookup(params: LookupInput) -> str:
             "Provide at least one identifier: document_number, registration_code, or "
             "document_id."
         )
+    if _use_remote():
+        return await _remote_op("lookup", params.model_dump(mode="json"))
     try:
         cfg = _get_cfg()
         client = _get_client()
@@ -718,6 +804,8 @@ async def legal_browse(params: BrowseInput) -> str:
         number, parties, url), or — when response_format='json' — {"count", "offset",
         "limit", "documents": [...]}. ``count`` is the page size, not the global total.
     """
+    if _use_remote():
+        return await _remote_op("browse", params.model_dump(mode="json"))
     try:
         cfg = _get_cfg()
         client = _get_client()
@@ -788,6 +876,8 @@ async def legal_collection_info() -> str:
         dense vector dimension, embedding model, the known source keys, and (when
         the server supports faceting) per-source point counts.
     """
+    if _use_remote():
+        return await _remote_op("collection_info")
     try:
         cfg = _get_cfg()
         client = _get_client()
@@ -962,6 +1052,8 @@ async def legal_get_document_versions(params: GetVersionsInput) -> str:
     lawyer can see the act's history and which text is currently effective. For sources with
     no registry-code lineage (courts etc.) it returns just the single document. No model load.
     """
+    if _use_remote():
+        return await _remote_op("versions", params.model_dump(mode="json"))
     try:
         cfg = _get_cfg()
         client = _get_client()
@@ -1031,7 +1123,26 @@ async def legal_health() -> str:
     """Liveness/readiness probe: confirms Qdrant is reachable and the collection is populated.
 
     Returns JSON ``{ok, collection, points, qdrant_url, fingerprint}``; ``ok`` is false with
-    an actionable hint if Qdrant is unreachable or the collection is missing. No model load."""
+    an actionable hint if Qdrant is unreachable or the collection is missing. No model load.
+
+    In remote mode this probes the serverless endpoint's health API instead (instant, never
+    wakes — and never bills — a worker) and reports the locally-mirrored publish manifest."""
+    if _use_remote():
+        cfg = _get_cfg()
+        try:
+            h = await asyncio.to_thread(_get_remote_client().health)
+        except Exception as e:  # noqa: BLE001
+            return json.dumps({
+                "ok": False, "backend": "remote",
+                "error": f"{type(e).__name__}: {e}",
+                "hint": "Check RUNPOD_ENDPOINT_ID / RUNPOD_API_KEY in ingest/.env, or flip "
+                        "SEARCH_BACKEND=local to serve from the local Qdrant.",
+            }, ensure_ascii=False)
+        return json.dumps({
+            "ok": True, "backend": "remote", "endpoint_id": cfg.runpod_endpoint_id,
+            "workers": h.get("workers"), "jobs": h.get("jobs"),
+            "published": _publish_manifest(cfg),
+        }, ensure_ascii=False)
     try:
         cfg = _get_cfg()
         client = _get_client()

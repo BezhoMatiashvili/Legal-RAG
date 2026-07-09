@@ -1,6 +1,9 @@
 services:
   qdrant:
-    image: qdrant/qdrant:latest
+    # Pinned to the exact version the serverless worker bundles (ingest/serverless/):
+    # Qdrant snapshots are only guaranteed compatible within the same minor version,
+    # so a drive-by `docker compose pull` to a newer minor would break publishes.
+    image: qdrant/qdrant:v1.18.2
     container_name: legal-qdrant
     # Bound to loopback, so the index/dashboard is never world-exposed by default — no
     # API key needed for local dev. For any SHARED/REMOTE host you must BOTH:

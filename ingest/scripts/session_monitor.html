@@ -51,6 +51,20 @@
   .meta{color:var(--dim);font-size:12px;margin-top:3px;display:flex;gap:10px;flex-wrap:wrap}
   .chip{background:var(--panel2);border:1px solid var(--border);border-radius:6px;padding:1px 7px;
     font-family:var(--mono);font-size:11px;color:var(--dim)}
+  .chip.warn{color:var(--amber)} .chip.bad{color:var(--red)} .chip.ok{color:var(--green)}
+
+  /* pipeline step tracker */
+  .steps{display:flex;align-items:center;gap:7px;flex-wrap:wrap;margin-top:11px}
+  .step{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;font-weight:600;
+    padding:3px 10px;border-radius:20px;border:1px solid var(--border);color:var(--faint);
+    background:var(--panel2)}
+  .step.done{color:var(--green);border-color:rgba(63,185,80,.4)}
+  .step.active{color:var(--amber);border-color:rgba(210,153,34,.55);
+    box-shadow:0 0 0 0 rgba(210,153,34,.4);animation:steppulse 1.6s infinite}
+  .step.failed{color:var(--red);border-color:rgba(248,81,73,.5)}
+  .step-arrow{color:var(--faint);font-size:11px}
+  @keyframes steppulse{0%{box-shadow:0 0 0 0 rgba(210,153,34,.35)}
+    70%{box-shadow:0 0 0 6px rgba(210,153,34,0)}100%{box-shadow:0 0 0 0 rgba(210,153,34,0)}}
   .said{margin:11px 0 4px;font-size:12.5px;color:#c9d4e0;background:var(--panel2);
     border:1px solid var(--border);border-radius:8px;padding:8px 10px;max-height:66px;overflow:hidden}
   .prog{margin-top:12px}
@@ -112,6 +126,17 @@
 
   <div class="tiles" id="tiles"></div>
 
+  <h2 class="section">Pipeline · scrape → GPU embed</h2>
+  <div class="two" style="margin-bottom:6px">
+    <div class="card" id="scrapecard"><div class="empty">no matsne run yet</div></div>
+    <div class="card" id="gpucard"><div class="empty">no delta-embed run yet</div></div>
+  </div>
+
+  <h2 class="section">Embedding coverage → Qdrant</h2>
+  <div class="card" id="covcard" style="margin-bottom:6px">
+    <div class="empty">no coverage report yet — run <code>scripts/verify_all_embedded.py</code></div>
+  </div>
+
   <h2 class="section">Recent legal_search latencies</h2>
   <div class="tile"><table id="queries"></table></div>
 
@@ -168,16 +193,33 @@ function render(s){
   $('upd').textContent = 'updated '+s.now+' · every 3s';
   $('dot').classList.remove('off');
 
-  const sy=s.system, rag=s.rag, pod=rag.pod;
-  const podTxt = pod.up ? `<span class="ok">● up</span>` : `<span class="bad">● down</span>`;
-  const podSub = pod.up ? (pod.device||'') : 'CPU / RRF fallback';
+  const sy=s.system, rag=s.rag, pod=rag.pod, sls=rag.serverless||{};
+  // Serverless endpoint card (replaces the old SSH-tunnel GPU pod when configured).
+  let gpuLab='GPU rerank pod', gpuTxt, gpuSub;
+  if (sls.configured){
+    gpuLab='Serverless GPU';
+    const w=sls.workers||{}, running=(w.running||0), idle=(w.idle||0);
+    gpuTxt = !sls.up ? `<span class="bad">● unreachable</span>`
+      : running ? `<span class="ok">● busy</span>`
+      : idle ? `<span class="ok">● warm</span>`
+      : `<span class="warn">● scaled to zero</span>`;
+    gpuSub = (sls.backend==='remote'?'remote mode':'local mode')
+      + (sls.published?` · ${(sls.published.points/1e6).toFixed(2)}M pts published`:'');
+  } else {
+    gpuTxt = pod.up ? `<span class="ok">● up</span>` : `<span class="bad">● down</span>`;
+    gpuSub = pod.up ? (pod.device||'') : 'CPU / RRF fallback';
+  }
   $('tiles').innerHTML =
     tile('RAM', sy.ram_used_gb+'<small>/'+sy.ram_total_gb+' GB</small>', sy.ram_pct+'%', sy.ram_pct) +
     tile('Swap', sy.swap_used_gb+'<small>/'+sy.swap_total_gb+' GB</small>', sy.swap_pct+'%', sy.swap_pct) +
     tile('Load (1m)', sy.load, 'cores busy', null) +
-    tile('GPU rerank pod', podTxt, podSub, null) +
+    tile(gpuLab, gpuTxt, gpuSub, null) +
     tile('MCP servers', rag.mcp_count, (rag.mcp_rss_gb||0)+' GB · '+(rag.mcp_cpu||0)+'% cpu', null) +
-    tile('Qdrant', (rag.qdrant_gb!=null?rag.qdrant_gb:'–'), 'GB resident', null);
+    qdrantTile(s.qdrant||{}, rag);
+
+  renderScrape(s.scrape||{active:false});
+  renderGpu(s.gpu||{active:false});
+  renderCoverage(s.coverage||{}, s.qdrant||{}, s.gpu||{});
 
   lastProcs = s.processes || [];
   renderProcs();
@@ -224,6 +266,158 @@ function card(s){
     ${said}${prog}
     <div class="feed">${feed}</div>
   </div>`;
+}
+
+function qdrantTile(qd, rag){
+  if(!('up' in qd))   // old server process without the qdrant field — not a real outage
+    return tile('Qdrant', (rag.qdrant_gb!=null?rag.qdrant_gb:'–'), 'GB resident', null);
+  if(!qd.up) return tile('Qdrant', '<span class="bad">● down</span>',
+    (rag.qdrant_gb!=null?rag.qdrant_gb+' GB resident':''), null);
+  const stC = qd.status==='green'?'ok':qd.status==='yellow'?'warn':'bad';
+  const pts = qd.points!=null ? (qd.points/1e6).toFixed(2)+'M' : '–';
+  return tile('Qdrant · georgian_legal', pts+'<small> pts</small>',
+    `<span class="${stC}">● ${qd.status||'?'}</span> · ${(rag.qdrant_gb!=null?rag.qdrant_gb+' GB':'')}`
+    + (qd.delta_points!=null?` · delta ${(qd.delta_points/1e3).toFixed(0)}k`:''), null);
+}
+
+// Chain tracker: embed (GPU) → pull snapshot → restore → merge → verify.
+// Phase states come from the orchestrator log (gpu.*) + live process checks (cov.*).
+function covSteps(cov, g){
+  const anyLive = (g.active&&g.orchestrator_alive&&!g.done) || cov.merge_running || cov.verify_running;
+  if(!anyLive) return '';
+  const phase=g.phase||'';
+  const EMBED=['starting','packaged','booting pod','uploading payload','embedding on GPU'];
+  const PULL=['snapshotting','downloading snapshot'];
+  const RESTORE=['verifying + restoring','restoring locally'];
+  const failed=phase.startsWith('FAILED');
+  let idx; // index of the active step
+  if(cov.verify_running) idx=4;
+  else if(cov.merge_running) idx=3;
+  else if(g.done) idx=3;                    // orchestrator finished, merge about to start
+  else if(RESTORE.includes(phase)) idx=2;
+  else if(PULL.includes(phase)) idx=1;
+  else idx=0;
+  const names=['embed on GPU','pull snapshot','restore','merge → main','verify'];
+  const icons=['⚡','⬇','📦','🔀','✔'];
+  const steps=names.map((n,i)=>{
+    const st=i<idx?'done':i===idx?(failed&&i===0?'failed':'active'):'';
+    const ic=i<idx?'✓':icons[i];
+    return `<span class="step ${st}">${ic} ${n}</span>`;
+  }).join('<span class="step-arrow">→</span>');
+  const detail=cov.verify_running?cov.verify_detail:cov.merge_running?cov.merge_detail:null;
+  return `<div class="steps">${steps}</div>`
+    +(detail?`<div class="said" style="margin-top:8px">⏳ ${esc(detail)}</div>`:'');
+}
+
+function renderCoverage(cov, qd, gpu){
+  const el=$('covcard');
+  const r=cov.report, b2=cov.batch2||{};
+  // badge: live verify > report verdict > nothing
+  let badgeCls='idle', badgeTxt='no report yet';
+  if(cov.verify_running){ badgeCls='working'; badgeTxt='verifying…'; }
+  else if(r && r.total_missing===0){ badgeCls='working'; badgeTxt='all embedded ✓'; }
+  else if(r){ badgeCls='waiting'; badgeTxt=r.total_missing.toLocaleString()+' missing'; }
+  el.className='card '+(cov.verify_running?'working':!r?'idle':r.total_missing===0?'':'waiting');
+
+  const chips=[
+    qd.points!=null?`<span class="chip">${qd.points.toLocaleString()} points</span>`:'',
+    qd.status?`<span class="chip ${qd.status==='green'?'':'warn'}">index ${esc(qd.status)}</span>`:'',
+    qd.delta_points!=null?`<span class="chip">delta collection ${qd.delta_points.toLocaleString()} pts</span>`:'',
+    r?`<span class="chip">verified ${esc(r.generated_at)} @ ${(r.points_count/1e6).toFixed(2)}M pts</span>`:'',
+  ].filter(Boolean).join('');
+
+  const steps = covSteps(cov, gpu);
+  let batch='';
+  if(b2.active){
+    const st=b2.stage||'?';
+    const bc = st==='complete'?'ok':st.startsWith('FAILED')?'bad':'warn';
+    batch=`<div class="said">⚙ batch-2 embed pipeline: <b class="${bc}">${esc(st)}</b>`
+      +(b2.tail_docs!=null?` — ${b2.tail_docs.toLocaleString()} docs queued`:'')
+      +(steps&&r?` · <span class="muted">coverage numbers below are from the last verify — they refresh when the chain's final verify lands</span>`:'')
+      +`</div>`;
+  }
+
+  let rows='';
+  if(r && r.per_source){
+    rows='<div style="margin-top:12px">'+Object.entries(r.per_source).map(([src,v])=>{
+      const pct = v.scraped_docs ? Math.floor(100*v.embedded_docs/v.scraped_docs) : 100;
+      const miss = v.missing ? `<span class="bad">${v.missing.toLocaleString()} missing</span>`
+                             : '<span class="ok">✓</span>';
+      const nt = (v.no_text ? ` · <span class="muted">${v.no_text} no-text</span>` : '')
+        + (v.quarantined ? ` · <span class="muted">${v.quarantined} quarantined</span>` : '');
+      return `<div class="prog" style="margin-top:7px">
+        <div class="plab"><span><b>${esc(src)}</b> — ${v.embedded_docs.toLocaleString()} / ${v.scraped_docs.toLocaleString()} docs</span>
+        <span>${miss}${nt} · ${pct}%</span></div>
+        <div class="bar"><span style="width:${pct}%;background:${v.missing?'var(--amber)':'var(--green)'}"></span></div>
+      </div>`;
+    }).join('')+'</div>';
+  }
+  const total = r?`<div class="meta" style="margin-top:9px"><span>total scraped docs: <b>${r.total_scraped_docs.toLocaleString()}</b></span>
+    <span>embedded: <b>${(r.total_scraped_docs-r.total_missing-(r.total_no_text||0)-(r.total_quarantined||0)).toLocaleString()}</b></span>
+    <span class="${r.total_missing?'bad':'ok'}">missing: <b>${r.total_missing.toLocaleString()}</b></span>
+    ${r.total_no_text?`<span class="muted">empty-body (unembeddable): <b>${r.total_no_text}</b></span>`:''}
+    ${r.total_quarantined?`<span class="muted">quarantined by hygiene: <b>${r.total_quarantined}</b></span>`:''}</div>`:'';
+
+  el.innerHTML=`<div class="chead"><span class="title">Embedding coverage — all sources → georgian_legal</span>
+      <span class="badge ${badgeCls}">${badgeTxt}</span></div>
+    <div class="meta">${chips}</div>${steps}${batch}${total}${rows}`;
+}
+
+function renderScrape(sc){
+  const el=$('scrapecard');
+  if(!sc.active){ el.innerHTML='<div class="empty">no matsne run yet</div>'; return; }
+  const state = sc.alive?'crawling':(sc.finished?'finished':'stopped');
+  el.className='card '+(sc.alive?'working':sc.finished?'':'waiting');
+  const chips=[
+    `<span class="chip">${esc((sc.run||'').slice(0,16))}</span>`,
+    sc.pages!=null?`<span class="chip">${sc.pages.toLocaleString()} pages</span>`:'',
+    sc.pages_min!=null?`<span class="chip">${sc.pages_min} pages/min</span>`:'',
+    sc.items_min!=null?`<span class="chip">${sc.items_min} items/min</span>`:'',
+    `<span class="chip ${sc.errors?'bad':''}">${sc.errors||0} errors</span>`,
+  ].filter(Boolean).join('');
+  const cov = sc.coverage_pct!=null?`<div class="prog">
+      <div class="plab"><span>corpus coverage — seen ${sc.seen_total.toLocaleString()} / ~${sc.advertised.toLocaleString()} advertised</span>
+      <span>${sc.coverage_pct}%</span></div>
+      <div class="bar"><span style="width:${Math.min(100,sc.coverage_pct)}%;background:var(--blue)"></span></div></div>`:'';
+  el.innerHTML=`<div class="chead"><span class="title">Scrape — ${(sc.items||0).toLocaleString()} docs this run</span>
+      <span class="badge ${sc.alive?'working':'idle'}">${state}</span></div>
+    <div class="meta">${chips}</div>${cov}`;
+}
+
+function renderGpu(g){
+  const el=$('gpucard');
+  if(!g.active){ el.innerHTML='<div class="empty">no delta-embed run yet</div>'; return; }
+  const done=!!g.done, failed=(g.phase||'').startsWith('FAILED')||g.phase==='exited';
+  el.className='card '+(done?'':failed?'waiting':'working');
+  const badgeCls=done?'working':failed?'waiting':'working';
+  const badgeTxt=done?'complete':esc(g.phase||'?');
+  // progress bar: upload % while uploading, real pod-side point count while embedding
+  let pct=null, plab='';
+  if(g.upload_pct!=null){ pct=g.upload_pct; plab=`upload ${g.upload_mb||'?'} / ${g.payload_mb} MB`; }
+  else if(g.embed_pct!=null){ pct=g.embed_pct;
+    plab=`embedded ${(g.points_so_far||0).toLocaleString()} / ~${(g.est_total_points||0).toLocaleString()} chunks`; }
+  else if(done){ pct=100; plab='done'; }
+  const bar=pct!=null?`<div class="prog"><div class="plab"><span>${plab}</span><span>${pct}%</span></div>
+    <div class="bar"><span style="width:${pct}%;background:${failed?'var(--amber)':'var(--green)'}"></span></div></div>`:'';
+  const chips=[
+    g.pod?`<span class="chip">pod ${esc(g.pod)}</span>`:'',
+    g.gpu?`<span class="chip">${esc(g.gpu)}</span>`:'',
+    g.price_hr!=null?`<span class="chip">$${g.price_hr}/hr</span>`:'',
+    g.pod_uptime_min!=null?`<span class="chip">⏱ ${g.pod_uptime_min} min</span>`:'',
+    g.cost_so_far!=null?`<span class="chip">≈$${g.cost_so_far}</span>`:'',
+    g.items?`<span class="chip">${g.items.toLocaleString()} docs</span>`:'',
+    g.points?`<span class="chip">${g.points.toLocaleString()} points</span>`:'',
+    g.balance!=null?`<span class="chip">balance $${(+g.balance).toFixed(2)}</span>`:'',
+    g.open_pods!=null?`<span class="chip ${g.open_pods&&(done||g.pod_terminated)?'bad':''}">${g.open_pods} open pod${g.open_pods===1?'':'s'}</span>`:'',
+  ].filter(Boolean).join('');
+  const detail=g.detail?`<div class="said">⚙ ${esc(g.detail)}</div>`:'';
+  const g2=g.g2?`<div class="said">✔ ${esc(g.g2)}</div>`:'';
+  const cost=g.cost_line?`<div class="said">💰 ${esc(g.cost_line)}</div>`:'';
+  const orch=g.orchestrator_alive?'':'<span class="chip">orchestrator not running</span>';
+  el.innerHTML=`<div class="chead"><span class="title">Delta embed → georgian_legal_delta</span>
+      <span class="badge ${badgeCls}">${badgeTxt}</span></div>
+    <div class="meta">${chips}${orch}<span class="chip">${esc(g.log||'')}</span></div>
+    ${bar}${detail}${g2}${cost}`;
 }
 
 let lastProcs=[], procSort='rss_mb', procFilter='';

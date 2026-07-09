@@ -55,6 +55,12 @@ class Config:
     qdrant_url: str
     qdrant_api_key: str | None
     collection_name: str
+    # 'local' = embed/search/rerank in-process (the default); 'remote' = the MCP tools RPC
+    # to the RunPod serverless worker and load no models / need no local Qdrant.
+    search_backend: str
+    runpod_endpoint_id: str | None
+    runpod_api_key: str | None
+    runpod_api_timeout: int
     embed_model: str
     dense_dim: int
     embed_device: str | None
@@ -85,6 +91,10 @@ def load_config() -> Config:
         qdrant_url=os.getenv("QDRANT_URL", "http://localhost:6333"),
         qdrant_api_key=os.getenv("QDRANT_API_KEY") or None,
         collection_name=os.getenv("COLLECTION_NAME", "georgian_legal"),
+        search_backend=(os.getenv("SEARCH_BACKEND") or "local").strip().lower() or "local",
+        runpod_endpoint_id=(os.getenv("RUNPOD_ENDPOINT_ID") or "").strip() or None,
+        runpod_api_key=os.getenv("RUNPOD_API_KEY") or None,
+        runpod_api_timeout=_int("RUNPOD_API_TIMEOUT", 240),
         embed_model=os.getenv("EMBED_MODEL", "BAAI/bge-m3"),
         dense_dim=_int("DENSE_DIM", 1024),
         embed_device=_device_opt("EMBED_DEVICE"),

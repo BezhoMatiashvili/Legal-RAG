@@ -36,6 +36,77 @@ sparse-weight) was NOT run — a concurrent **user job `scripts/backfill_consoli
 re-indexing `georgian_legal` (status→yellow), timing out hybrid queries. Core results predate it
 (safe). Re-run on a green index: **`bash scripts/phase_c_full.sh tuning`**.
 
+---
+
+## 🧾 2026-07-09/10 late session — full-corpus embed coverage, verified
+
+The July crawls grew the scraped universe to **208,218 docs** (matsne 156,676 · napr
+25,214 · ecd 21,827 · tas 1,344 · constcourt 3,076 · tbappeal 81). Coverage ground truth
+is the new **`ingest/scripts/verify_all_embedded.py`**: derives ids exactly like ingest
+(`SourceSpec.id_fields` — ecd = `decision_document_id`, NOT its raw `document_id` field),
+one payload-only scroll (~2.5 min), classifies missing into true-missing vs `no_text`
+(empty body, zero chunks) vs `quarantined` (`snapshots/v1/quarantine.jsonl`, 257 docs
+excluded by hygiene by design), writes `ingest/.state/embed_coverage.json` (+`.partial`
+for `--sources` runs — never clobbers the global report). The session monitor (:8770,
+restart after .py edits) has a new **"Embedding coverage → Qdrant" panel** rendering it:
+live points/status, per-source bars, batch-pipeline stage.
+
+Gap-closing done this session: 2 never-scraped matsne ids (23230, 24178) seed-fetched
+(`-s DEDUP_ENABLED=False` — seen.sqlite blocks re-fetch otherwise) + CPU-embedded (550
+chunks); 5 near-empty constcourt docs embedded; `embed_delta.py` gained `--source`.
+Batch-2 (5,738 matsne docs): first pod embed SUCCEEDED but the snapshot pull died with
+the pod (~$0.89 lost — see memory [[delta-embed-pull-hazard]]; pull timeout now 1800 s,
+was 4 h); the recovery re-run (orchestrate → merge → verify) **COMPLETED 2026-07-09
+20:33Z, $0.26**: 37,815 points merged → **`georgian_legal` = 2,637,645 points**, and the
+final verify exited 0 — **0 missing anywhere: 207,940/208,218 scraped docs embedded, 97
+empty-body + 181 quarantined excluded by design** (constcourt 3,074/3,076 · ecd
+21,827/21,827 · matsne 156,404/156,676 · napr 25,210/25,214 · tas 1,344/1,344 · tbappeal
+81/81). Pod terminated, pods=[], balance $10.53.
+
+## ▶ NEXT SESSION — start here (Part 3 is essentially COMPLETE)
+
+**Read the report first:** `ingest/eval/phase_c_report.md` (+ regenerable tables
+`ingest/eval/phase_c_report_tables.md`). It has the full baseline, the recommended production
+config (`hybrid+rerank@50`, `retrieval_fingerprint=81c807b279399098`), and honest caveats. The
+old "IMMEDIATE NEXT — Phase C" / "Phase D" sections below are **historical** — that plan was executed.
+
+**Nothing is required next.** Open options, in rough priority:
+1. **(optional) Finish the deferred tuning grid** once your `backfill_consolidation.py` finishes and
+   `curl -s localhost:6333/collections/georgian_legal | grep status` shows **green**:
+   `bash scripts/phase_c_full.sh tuning` → then regenerate tables with
+   `scripts/build_phase_c_report.py --gpu-log eval/experiments_gpu.jsonl --sweep-log <tier1 log>`.
+   Secondary knobs; won't change the recommendation.
+2. **(optional) Harden the significance claims** — the rerank-vs-hybrid win is by point estimate
+   (CIs overlap, n=103); a paired permutation test (`--compare hybrid rerank`, but rerank on CPU is
+   slow/OOM — do it via the GPU rerank path or an accelerated reranker) would certify it. And a
+   clean per-depth CPU rerank-latency measurement (`scripts/rerank_latency_probe.py`, run with
+   `OMP_NUM_THREADS=8`) would replace the derived latencies.
+3. **(optional) Make rerank practical for serving** — CPU rerank@50 is ~25 s/query; needs int8/ONNX
+   or the on-demand GPU rerank path. See memory **[[serving-latency-and-gpu-rerank]]**.
+4. **Commit** — everything is uncommitted (per the standing rule). Nothing has been committed.
+
+**⚠ Critical gotchas for a fresh session (from memory):**
+- **Git:** the tree is on branch **`dev` @ `7992ce9`** (our custom offset-aware stack). `origin/dev`
+  is the **LangChain fork — do NOT `git pull`/merge it** (clobbers `build_payload`/`is_consolidated`/
+  offset chunker). `git reset --hard 7992ce9` recovers. See **[[git-branch-fork-hazard]]**.
+- **RAM:** 30 GB box can't co-run Qdrant + a resident reranker + desktop without swap-thrash. The
+  harness now loads the reranker **only** for `rerank` modes (`RERANK_ENABLED=false` else) — baked
+  into `scripts/phase_c_full.sh`. See **[[eval-ram-reranker-swap]]**.
+- **GPU rerank is fragile** — it once orphaned a billing pod; **always** `python scripts/runpod_rerank.py down`
+  after use and check `myself{pods}` is empty. See **[[serving-latency-and-gpu-rerank]]**.
+- **Concurrent writers:** if `backfill_consolidation.py` (or any ingest) is running, the index is
+  yellow and eval queries time out — wait for green.
+
+**New this session (all under `ingest/`, tested — 222 pass, ruff clean):**
+`eval/bm25_full.py` (full-corpus BM25, cached `eval/.bm25_full/`) · `ingest/rerank.py`
+`RemoteBGEReranker` + CPU thread-pin/length-bucket · `scripts/runpod_rerank.py` +
+`runpod_rerank_server.py` (GPU rerank over SSH tunnel) · `scripts/phase_c_full.sh`
+(`{tier1|gpu_rerank|diversity|tuning}`) · `scripts/build_phase_c_report.py` ·
+`scripts/rerank_latency_probe.py` · `scripts/sample_ingest_report.py` · additive `knobs` field on
+eval rows. GPU rows → `eval/experiments_gpu.jsonl` (quality only; not CPU latency).
+
+---
+
 **🎉 THE CORPUS IS EMBEDDED, VERIFIED, AND PERMANENT.** The full corpus is embedded into local
 Qdrant collection **`georgian_legal` = 2,453,915 points, status GREEN** (HNSW indexed), persisted
 on disk via the docker bind-mount (`ingest/qdrant_storage/`). It never needs re-embedding unless
@@ -132,7 +203,7 @@ All CPU-validated, unit-tested; no re-embed needed. Key additions:
 
 ---
 
-## ▶ IMMEDIATE NEXT — Phase C: measure through the harness  (local, no GPU, no cost)
+## ~~▶ IMMEDIATE NEXT — Phase C~~ (HISTORICAL — this plan was executed; see "NEXT SESSION" above)
 
 The index is **green** and ready. A runner script is already written:
 **`ingest/scripts/phase_c.sh`** (runs dense → sparse → hybrid → rerank, then `--compare hybrid
@@ -162,7 +233,7 @@ distractors (scoped, like the FakeBackend), (b) use Qdrant native full-text (`Ma
 text index) as the lexical baseline, or (c) report neural-vs-neural and note BM25 was out of scope
 at full-corpus scale. Pick one and `log()` the choice. (Fix code, not tests, if you extend it.)
 
-## Phase D — STOP-gate report + housekeeping
+## ~~Phase D — STOP-gate report~~ (HISTORICAL — DONE; report at `ingest/eval/phase_c_report.md`)
 
 Write the report: harness comparison tables (modes + routing + rerank depths + diversity + Qdrant
 recall settings, each with CIs/latency); the GPU embed completion (2,453,915 chunks, G2 cosine
