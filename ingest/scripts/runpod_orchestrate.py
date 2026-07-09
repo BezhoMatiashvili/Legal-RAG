@@ -102,9 +102,9 @@ def gql(query: str, variables: dict | None = None) -> dict:
 
 
 def run(cmd: list[str], *, input: bytes | None = None, timeout: int | None = None,
-        check: bool = True) -> subprocess.CompletedProcess:
+        check: bool = True, ok_codes: tuple = (0,)) -> subprocess.CompletedProcess:
     r = subprocess.run(cmd, input=input, capture_output=True, timeout=timeout)
-    if check and r.returncode != 0:
+    if check and r.returncode not in ok_codes:
         raise RuntimeError(f"cmd failed ({r.returncode}): {' '.join(cmd[:3])}...\n"
                            f"{r.stderr.decode(errors='replace')[-2000:]}")
     return r
@@ -155,25 +155,47 @@ def ensure_pod_tools(ip: str, port: int) -> None:
     log(f"pod tools ready (rsync available: {_HAVE_RSYNC[0]})")
 
 
+def _remote_size(ip: str, port: int, path: str) -> int:
+    out = ssh_capture(ip, port, f"stat -c%s {shlex.quote(path)} 2>/dev/null", timeout=30).strip()
+    return int(out) if out.isdigit() else -1
+
+
+# Rsync WITHOUT -a: no owner/group/perm preservation → avoids the chown that RunPod's volume
+# rejects (exit 23). --inplace resumes into the dest directly. Size match is the real success
+# check, so benign attr codes (23/24) are tolerated.
+_RSYNC_FLAGS = ["--partial", "--append-verify", "--inplace"]
+_RSYNC_OK = (0, 23, 24)
+
+
 def push_file(local: Path, remote_path: str, ip: str, port: int, timeout: int = 3600) -> None:
+    local = Path(local)
+    want = local.stat().st_size
     if _HAVE_RSYNC[0]:
         ssh_e = " ".join(shlex.quote(a) for a in _ssh_base(ip, port))
-        run(["rsync", "-a", "--partial", "--append-verify", "-e", ssh_e,
-             str(local), f"root@{ip}:{remote_path}"], timeout=timeout)
-        return
+        run(["rsync", *_RSYNC_FLAGS, "-e", ssh_e, str(local), f"root@{ip}:{remote_path}"],
+            timeout=timeout, ok_codes=_RSYNC_OK)
+        if _remote_size(ip, port, remote_path) == want:
+            return
+        log("rsync push size mismatch — falling back to cat stream")
     with open(local, "rb") as fh:  # stream stdin → remote `cat` (no whole-file buffering)
         r = subprocess.run(_ssh_base(ip, port) + [f"root@{ip}", f"cat > {shlex.quote(remote_path)}"],
                            stdin=fh, stderr=subprocess.PIPE, timeout=timeout)
     if r.returncode:
         raise RuntimeError(f"push_file failed: {r.stderr.decode(errors='replace')[-500:]}")
+    if _remote_size(ip, port, remote_path) != want:
+        raise RuntimeError(f"push_file size mismatch: remote != {want}")
 
 
 def pull_file(remote_path: str, local: Path, ip: str, port: int, timeout: int = 7200) -> None:
+    local = Path(local)
     if _HAVE_RSYNC[0]:
         ssh_e = " ".join(shlex.quote(a) for a in _ssh_base(ip, port))
-        run(["rsync", "-a", "--partial", "--append-verify", "-e", ssh_e,
-             f"root@{ip}:{remote_path}", str(local)], timeout=timeout)
-        return
+        run(["rsync", *_RSYNC_FLAGS, "-e", ssh_e, f"root@{ip}:{remote_path}", str(local)],
+            timeout=timeout, ok_codes=_RSYNC_OK)
+        rs = _remote_size(ip, port, remote_path)
+        if rs >= 0 and local.exists() and local.stat().st_size == rs:
+            return
+        log("rsync pull size mismatch — falling back to cat stream")
     with open(local, "wb") as fh:  # stream remote `cat` → local file
         r = subprocess.run(_ssh_base(ip, port) + [f"root@{ip}", f"cat {shlex.quote(remote_path)}"],
                            stdout=fh, stderr=subprocess.PIPE, timeout=timeout)

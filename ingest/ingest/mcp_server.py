@@ -16,10 +16,14 @@ Run it inside the ingest uv environment:
 from __future__ import annotations
 
 import asyncio
+import atexit
 import json
 import logging
+import os
+import signal
 import time
 from enum import Enum
+from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, ConfigDict, Field
@@ -47,6 +51,12 @@ _embedder = None
 _embedder_lock = asyncio.Lock()
 _reranker = None
 _reranker_lock = asyncio.Lock()
+
+# The embed+rerank path holds the BGE-M3 + cross-encoder working set (~4.6 GB) and is
+# CPU-bound. On this RAM-tight box two concurrent searches co-thrash into swap and each
+# balloons ~3x (observed: an overlapping pair both ~597 s vs ~190 s isolated). Serialize
+# the heavy work to one at a time — correct for a single-user MCP tool.
+_search_semaphore = asyncio.Semaphore(1)
 
 
 def _get_cfg() -> Config:
@@ -76,17 +86,31 @@ async def _get_embedder():
 
 
 async def _get_reranker():
-    """Load the cross-encoder reranker once, off the event loop. None if disabled."""
+    """Get the reranker once. ``RERANK_REMOTE_URL`` set → a GPU-pod HTTP reranker (instant,
+    no local model / no ~2.3 GB CPU footprint); else the local CPU cross-encoder loaded off
+    the event loop. ``None`` if reranking is disabled."""
     global _reranker
-    if not _get_cfg().rerank_enabled:
+    cfg = _get_cfg()
+    if not cfg.rerank_enabled:
         return None
     if _reranker is None:
         async with _reranker_lock:
             if _reranker is None:
-                from .rerank import BGEReranker
+                if cfg.rerank_remote_url:
+                    from .rerank import RemoteBGEReranker
 
-                _reranker = await asyncio.to_thread(BGEReranker, _get_cfg())
+                    _reranker = RemoteBGEReranker(cfg.rerank_remote_url, timeout=60)
+                    logger.info("reranker: remote GPU pod at %s", cfg.rerank_remote_url)
+                else:
+                    from .rerank import BGEReranker
+
+                    _reranker = await asyncio.to_thread(BGEReranker, cfg)
     return _reranker
+
+
+def _is_remote_reranker(reranker) -> bool:
+    """True for the HTTP/GPU-pod reranker (``RemoteBGEReranker`` sets ``.device = "remote"``)."""
+    return getattr(reranker, "device", None) == "remote"
 
 
 def _handle_error(e: Exception) -> str:
@@ -119,6 +143,8 @@ def _hit_dict(hit) -> dict:
         "registration_code": p.get("registration_code"),
         "document_type": p.get("document_type"),
         "status": p.get("status"),
+        "is_consolidated": p.get("is_consolidated"),
+        "consolidated_count": p.get("consolidated_count"),
         "title": p.get("title"),
         "parties": p.get("parties"),
         "date": p.get("date_raw"),
@@ -193,6 +219,12 @@ class SearchInput(BaseModel):
         None,
         description="Legal status (matsne acts only): 'in_force', 'repealed', or "
         "'pending'. Use 'in_force' to restrict to law currently in effect.",
+    )
+    is_consolidated: bool | None = Field(
+        None,
+        description="Filter matsne acts by consolidation: true = the act has consolidated "
+        "versions (it was amended/re-published over time), false = a one-shot act never "
+        "amended.",
     )
     document_number: str | None = Field(
         None,
@@ -271,20 +303,14 @@ async def legal_search(params: SearchInput) -> str:
         client = _get_client()
         embedder = await _get_embedder()
         reranker = await _get_reranker()
-        t0 = time.perf_counter()
-        hits = await asyncio.to_thread(
-            hybrid_search,
-            cfg,
-            client,
-            embedder,
-            params.query,
+        search_kwargs = dict(
             top_k=params.top_k,
-            reranker=reranker,
             rerank_candidates=cfg.rerank_candidates,
             rerank_min_score=cfg.rerank_min_score,
             source=params.source,
             court=params.court,
             status=params.status,
+            is_consolidated=params.is_consolidated,
             language=params.language,
             document_type=params.document_type,
             document_number=params.document_number,
@@ -294,7 +320,25 @@ async def legal_search(params: SearchInput) -> str:
             date_from=params.date_from,
             date_to=params.date_to,
         )
-        elapsed_ms = (time.perf_counter() - t0) * 1000
+        # Serialize the heavy embed+rerank work so overlapping queries don't co-thrash swap.
+        async with _search_semaphore:
+            t0 = time.perf_counter()
+            try:
+                hits = await asyncio.to_thread(
+                    hybrid_search, cfg, client, embedder, params.query,
+                    reranker=reranker, **search_kwargs,
+                )
+            except Exception as e:  # noqa: BLE001
+                # A remote GPU reranker can go away (pod terminated / tunnel dropped). Rather
+                # than hang or error the tool, degrade to the RRF-fused order and keep serving.
+                if reranker is None or not _is_remote_reranker(reranker):
+                    raise
+                logger.warning("remote reranker unreachable (%s); falling back to RRF order", e)
+                hits = await asyncio.to_thread(
+                    hybrid_search, cfg, client, embedder, params.query,
+                    reranker=None, **search_kwargs,
+                )
+            elapsed_ms = (time.perf_counter() - t0) * 1000
     except Exception as e:  # noqa: BLE001 - surface an actionable message to the agent
         return _handle_error(e)
 
@@ -1004,8 +1048,43 @@ async def legal_health() -> str:
         }, ensure_ascii=False)
 
 
+def _is_our_server(pid: int) -> bool:
+    """True only if ``pid`` is a live ``ingest.mcp_server`` — never mistake a PID that a
+    different program has since reused for our old server."""
+    try:
+        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return False
+    return b"ingest.mcp_server" in cmdline
+
+
+def _enforce_singleton() -> None:
+    """Reap a previous MCP-server instance so a ``/mcp`` reconnect doesn't leak a ~4.6 GB
+    process. Every reconnect spawns a fresh server; without this the old one lingers with
+    BGE-M3 + the reranker resident and, stacked, drives a 30 GB box into swap (observed:
+    ≥4 concurrent servers). Best-effort and never fatal — a stale/reused PID or an
+    unwritable state dir must not stop the new server from serving. Uses SIGTERM (graceful:
+    it may abort the old server's in-flight query, but never corrupts the index)."""
+    pidfile = _get_cfg().state_dir / "mcp_server.pid"
+    try:
+        if pidfile.exists():
+            old = int((pidfile.read_text().strip() or "0"))
+            if old and old != os.getpid() and _is_our_server(old):
+                os.kill(old, signal.SIGTERM)
+                logger.info("singleton: SIGTERM prior MCP server pid=%s", old)
+    except (ValueError, OSError) as e:  # unreadable/garbage pidfile, dead PID, no perm
+        logger.warning("singleton: could not reap prior server: %s", e)
+    try:
+        pidfile.parent.mkdir(parents=True, exist_ok=True)
+        pidfile.write_text(str(os.getpid()))
+        atexit.register(lambda: pidfile.unlink(missing_ok=True))
+    except OSError as e:
+        logger.warning("singleton: could not write pidfile %s: %s", pidfile, e)
+
+
 def main() -> None:
     """Run the MCP server over stdio (the default transport)."""
+    _enforce_singleton()
     mcp.run()
 
 

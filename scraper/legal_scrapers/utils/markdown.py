@@ -141,6 +141,12 @@ def _heading_level(segments):
 def _transform_section_tables(main, soup):
     """Replace every wrapper table with a heading or an unwrapped content block."""
     for table in main.find_all("table"):
+        # find_all collected every table up front, including wrapper tables nested inside
+        # other wrappers. Processing an outer wrapper can decompose() its nested wrappers,
+        # after which their attrs are None and table.get() would raise. Skip those stale
+        # entries (a live tag always has an attrs dict, even when empty).
+        if table.attrs is None:
+            continue
         table_id = table.get("id", "")
         if not _WRAPPER_RE.search(table_id):
             continue

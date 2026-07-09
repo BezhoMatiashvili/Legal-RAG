@@ -33,6 +33,10 @@ KEYWORD_FIELDS = (
     # filter by it without a full scroll.
     "content_hash",
 )
+# Boolean payload indexes (matsne consolidation flag). Filter with MatchValue(value=True/False).
+BOOL_FIELDS = ("is_consolidated",)
+# Integer payload indexes (e.g. number of consolidated versions).
+INTEGER_FIELDS = ("consolidated_count",)
 # Datetime range indexes (in addition to the primary "date" index created below).
 DATETIME_FIELDS = ("date", "in_force_date", "expiry_date")
 # Full-text (MatchText) indexes for exact keyword / phrase lookup by lawyers.
@@ -120,9 +124,14 @@ def ensure_collection(client: QdrantClient, cfg: Config, *, recreate: bool = Fal
         client.create_payload_index(
             name, field_name=field, field_schema=models.PayloadSchemaType.DATETIME
         )
-    client.create_payload_index(
-        name, field_name="chunk_index", field_schema=models.PayloadSchemaType.INTEGER
-    )
+    for field in BOOL_FIELDS:
+        client.create_payload_index(
+            name, field_name=field, field_schema=models.PayloadSchemaType.BOOL
+        )
+    for field in ("chunk_index", *INTEGER_FIELDS):
+        client.create_payload_index(
+            name, field_name=field, field_schema=models.PayloadSchemaType.INTEGER
+        )
     return True
 
 
@@ -157,6 +166,8 @@ def build_payload(doc: CanonicalDoc, chunk: Chunk) -> dict:
         "registration_code": doc.registration_code,
         "parties": doc.parties,
         "status": doc.status,
+        "is_consolidated": doc.is_consolidated,
+        "consolidated_count": doc.consolidated_count,
         "in_force_date": _rfc3339(doc.in_force_date),
         "expiry_date": _rfc3339(doc.expiry_date),
         "heading": " > ".join(chunk.heading_path) or None,

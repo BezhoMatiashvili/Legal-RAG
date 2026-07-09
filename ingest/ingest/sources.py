@@ -135,6 +135,11 @@ class CanonicalDoc:
     # by design — the index is local and confidential (see prompt.md:40). Empty for sources
     # with no promoted fields.
     promoted: dict = field(default_factory=dict)
+    # Consolidation (matsne): whether the act has ≥2 consolidated versions (i.e. it has been
+    # amended/re-published), and how many versions the publication switcher lists. None for
+    # sources/documents without this concept.
+    is_consolidated: bool | None = None
+    consolidated_count: int | None = None
 
 
 @dataclass(frozen=True)
@@ -157,6 +162,8 @@ class SourceSpec:
     expiry_fields: tuple[str, ...] = ()      # date the act loses force
     url_fields: tuple[str, ...] = field(default=("source_url", "document_url"))
     promote_fields: tuple[str, ...] = ()     # raw item keys copied verbatim into payload
+    consolidated_field: str | None = None        # bool item key: has consolidated versions
+    consolidated_count_field: str | None = None  # int item key: number of consolidated versions
 
     def declared_keys(self) -> set[str]:
         """Every raw item key this spec reads — the schema-drift baseline of handled fields."""
@@ -166,7 +173,8 @@ class SourceSpec:
                       self.expiry_fields, self.url_fields, self.promote_fields):
             keys.update(group)
         for single in (self.doc_type_field, self.court_field, self.language_field,
-                       self.status_field):
+                       self.status_field, self.consolidated_field,
+                       self.consolidated_count_field):
             if single:
                 keys.add(single)
         return keys
@@ -214,6 +222,22 @@ class SourceSpec:
 
         promoted = {f: item[f] for f in self.promote_fields if item.get(f) not in (None, "", [])}
 
+        is_consolidated = None
+        if self.consolidated_field is not None:
+            raw = item.get(self.consolidated_field)
+            if isinstance(raw, bool):
+                is_consolidated = raw
+            elif raw not in (None, ""):
+                is_consolidated = bool(raw)
+        consolidated_count = None
+        if self.consolidated_count_field is not None:
+            raw = item.get(self.consolidated_count_field)
+            if raw not in (None, ""):
+                try:
+                    consolidated_count = int(raw)
+                except (TypeError, ValueError):
+                    consolidated_count = None
+
         return CanonicalDoc(
             source=self.source,
             document_id=document_id,
@@ -234,6 +258,8 @@ class SourceSpec:
             body_markdown=item.get("body_markdown") or "",
             extra=item,
             promoted=promoted,
+            is_consolidated=is_consolidated,
+            consolidated_count=consolidated_count,
         )
 
 
@@ -253,6 +279,8 @@ SOURCES: dict[str, SourceSpec] = {
         in_force_fields=("entry_into_force_date",),
         expiry_fields=("expiry_date",),
         url_fields=("document_url",),
+        consolidated_field="is_consolidated",
+        consolidated_count_field="consolidated_count",
     ),
     "ecd": SourceSpec(
         source="ecd",

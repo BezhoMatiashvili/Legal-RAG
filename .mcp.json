@@ -9,7 +9,11 @@
         "python",
         "-m",
         "ingest.mcp_server"
-      ]
+      ],
+      "env": {
+        "OMP_NUM_THREADS": "14",
+        "MKL_NUM_THREADS": "14"
+      }
     }
   }
 }

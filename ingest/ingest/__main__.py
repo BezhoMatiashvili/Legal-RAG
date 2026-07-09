@@ -159,12 +159,19 @@ def _cmd_embed(args) -> None:
         return
 
     # full-corpus resumable embed (RunPod production profile)
+    shard = None
+    if args.shard:
+        i, n = (int(x) for x in args.shard.split("/"))
+        if not (0 <= i < n):
+            raise SystemExit(f"--shard i/n must have 0<=i<n (got {args.shard!r})")
+        shard = (i, n)
+        print(f"  [shard {i}/{n}] embedding every {n}-th doc")
     sources = [args.source] if args.source != "all" else list(embed_job.SOURCES)
     grand_d = grand_c = grand_k = 0
     for source in sources:
         d, c, k = embed_job.embed_source_resumable(
             cfg, client, embedder, count_tokens, source,
-            batch_size=args.batch_size, limit=args.limit,
+            batch_size=args.batch_size, limit=args.limit, shard=shard,
         )
         print(f"  {source}: {d} docs -> {c} chunks ({k} skipped)")
         grand_d += d
@@ -261,6 +268,9 @@ def main() -> None:
     p_embed.add_argument("--limit", type=int, default=None, help="cap docs/source (full mode)")
     p_embed.add_argument("--batch-size", type=int, default=256, help="points per upsert batch")
     p_embed.add_argument("--recreate", action="store_true", help="drop & recreate the collection")
+    p_embed.add_argument("--shard", default=None, metavar="i/n",
+                         help="embed only shard i of n (0-indexed) — one process per GPU into "
+                              "the same Qdrant; each shard has its own resumable checkpoint")
     p_embed.set_defaults(func=_cmd_embed)
 
     p_search = sub.add_parser("search", help="hybrid search the collection")

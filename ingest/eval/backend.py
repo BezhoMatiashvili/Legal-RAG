@@ -167,7 +167,7 @@ class QdrantBackend:
         self.sparse_weight = sparse_weight   # manual weighted dense/sparse fusion (RRF is unweighted)
         self.max_per_doc = max_per_doc       # diversity: cap chunks per document_id
         self.mmr_lambda = mmr_lambda         # diversity: MMR trade-off (needs candidate vectors)
-        self._bm25: BM25Index | None = None
+        self._bm25 = None  # BM25Index | FullCorpusBM25, built lazily in _ensure_bm25
         self._filter = None
 
     @property
@@ -241,8 +241,26 @@ class QdrantBackend:
             )
         return hits
 
-    def _ensure_bm25(self) -> BM25Index:
+    def _ensure_bm25(self):
+        """Return the BM25 index for the collection.
+
+        Prefers the prebuilt, disk-backed full-corpus index (``eval/.bm25_full/``, built once
+        via ``python -m eval.bm25_full build``) — mandatory at the 2.45M-chunk scale, where
+        scrolling the whole collection into an in-memory ``BM25Index`` is ~17 GB and minutes
+        per query. Falls back to the in-memory scroll only for small collections (the guard
+        below refuses the impractical scroll on a large one)."""
         if self._bm25 is None:
+            from .bm25_full import FullCorpusBM25
+
+            if FullCorpusBM25.cache_exists():
+                self._bm25 = FullCorpusBM25.load(expect_collection=self.cfg.collection_name)
+                return self._bm25
+            n = self.client.count(self.cfg.collection_name, exact=False).count
+            if n > 200_000:
+                raise RuntimeError(
+                    f"BM25 over {n:,} chunks needs the prebuilt full-corpus index; run "
+                    "`python -m eval.bm25_full build` first (writes eval/.bm25_full/)."
+                )
             pairs = []
             offset = None
             while True:

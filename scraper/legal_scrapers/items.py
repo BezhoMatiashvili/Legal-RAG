@@ -46,6 +46,14 @@ class MatsneItem(scrapy.Item):
     status = scrapy.Field(input_processor=MapCompose(str.strip, class_to_status), output_processor=TakeFirst())
     additional_status = scrapy.Field(input_processor=MapCompose(str.strip), output_processor=TakeFirst())
 
+    # Consolidation metadata, derived from the detail page's #publication-switcher (the list
+    # of consolidated versions). A doc amended/re-published over time exposes ≥2 versions
+    # (consolidated); a one-shot act exposes ≤1. Set directly on the loaded item in
+    # parse_document (not via a processor), so these are plain fields.
+    is_consolidated = scrapy.Field()
+    consolidated_count = scrapy.Field()
+    consolidated_dates = scrapy.Field()
+
 
 def _strip(value):
     """Strip strings, pass through non-strings (ints/None/etc.) unchanged.

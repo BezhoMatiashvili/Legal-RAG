@@ -66,6 +66,7 @@ class Config:
     rerank_min_score: float | None
     rerank_device: str | None
     rerank_use_fp16: bool
+    rerank_remote_url: str | None
     chunk_tokens: int
     chunk_overlap: int
     chunk_min_tokens: int
@@ -95,6 +96,7 @@ def load_config() -> Config:
         rerank_min_score=_float_opt("RERANK_MIN_SCORE", 0.3),
         rerank_device=_device_opt("RERANK_DEVICE") or _device_opt("EMBED_DEVICE"),
         rerank_use_fp16=_bool("RERANK_USE_FP16", False),
+        rerank_remote_url=(os.getenv("RERANK_REMOTE_URL") or "").strip() or None,
         chunk_tokens=_int("CHUNK_TOKENS", 512),
         chunk_overlap=_int("CHUNK_OVERLAP", 80),
         chunk_min_tokens=_int("CHUNK_MIN_TOKENS", 64),

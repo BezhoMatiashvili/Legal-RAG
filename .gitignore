@@ -22,6 +22,7 @@ scraper/spider_logs.txt
 ingest/.venv
 ingest/.state/
 ingest/qdrant_storage/
+ingest/eval/.bm25_full/
 
 # Large generated data blobs (must never be committed)
 /artifacts_without_supremecourt.gz

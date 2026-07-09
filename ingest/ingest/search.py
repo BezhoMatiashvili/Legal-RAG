@@ -40,6 +40,7 @@ def build_filter(
     parties: str | None = None,
     contains: str | None = None,
     status: str | None = None,
+    is_consolidated: bool | None = None,
     date_from: str | None = None,
     date_to: str | None = None,
 ) -> models.Filter | None:
@@ -82,6 +83,12 @@ def build_filter(
         must.append(models.FieldCondition(key="text", match=models.MatchText(text=contains)))
     if status:
         must.append(models.FieldCondition(key="status", match=models.MatchValue(value=status)))
+    if is_consolidated is not None:
+        must.append(
+            models.FieldCondition(
+                key="is_consolidated", match=models.MatchValue(value=is_consolidated)
+            )
+        )
     if date_from or date_to:
         must.append(
             models.FieldCondition(
@@ -134,8 +141,17 @@ def hybrid_search(
     candidate = max(fetch_n, top_k * 5, 50)
 
     use_sparse = bool(emb.sparse.indices) and not (route and detect_language(query) == "en")
+    # Rescore the int8-quantized dense candidates against the on-disk fp32 vectors. This is
+    # Qdrant's default, made explicit so a future config change can't silently drop
+    # full-precision ranking (which would quietly cost Recall/nDCG). Sparse has no quantized
+    # form, so it takes no rescore param.
+    dense_params = models.SearchParams(
+        quantization=models.QuantizationSearchParams(rescore=True)
+    )
     prefetch = [
-        models.Prefetch(query=emb.dense, using="dense", limit=candidate, filter=flt)
+        models.Prefetch(
+            query=emb.dense, using="dense", limit=candidate, filter=flt, params=dense_params
+        )
     ]
     if use_sparse:
         prefetch.append(

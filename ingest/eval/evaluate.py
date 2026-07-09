@@ -167,8 +167,14 @@ def qdrant_deps(cfg):
     embedder = BGEM3Embedder(cfg)
     reranker = None
     if cfg.rerank_enabled:
-        from ingest.rerank import BGEReranker
-        reranker = BGEReranker(cfg)
+        import os
+        remote = os.environ.get("RERANK_REMOTE_URL")
+        if remote:  # offload cross-encoder scoring to a GPU pod (retrieval stays local)
+            from ingest.rerank import RemoteBGEReranker
+            reranker = RemoteBGEReranker(remote)
+        else:
+            from ingest.rerank import BGEReranker
+            reranker = BGEReranker(cfg)
     info = client.get_collection(cfg.collection_name)
     return client, embedder, reranker, {
         "kind": "qdrant", "collection": cfg.collection_name, "n_points": info.points_count,
@@ -298,6 +304,10 @@ def main() -> None:
                 "mode": label,
                 "relevance_level": args.relevance,
                 "top_k": args.top_k,
+                # Descriptive-only mirror of the tuning knobs folded into config_hash, so the
+                # experiment log is self-describing for ablation tables (does NOT affect the hash).
+                "knobs": {"rerank_candidates": eff_rc,
+                          **{k: v for k, v in eff.items() if k != "rerank_candidates"}},
                 "backend": index_info,
                 "metrics": aggregate(scores),
                 "cis": {m: bootstrap_ci(values(scores, m)).__dict__ for m in METRIC_NAMES},

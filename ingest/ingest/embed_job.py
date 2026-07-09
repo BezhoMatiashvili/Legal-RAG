@@ -165,15 +165,23 @@ def embed_docs(
 
 def embed_source_resumable(
     cfg: Config, client, embedder, count_tokens, source: str, *,
-    batch_size: int = 256, limit: int | None = None,
+    batch_size: int = 256, limit: int | None = None, shard: tuple[int, int] | None = None,
 ) -> tuple[int, int, int]:
     """Embed an entire source from the snapshot, resumable via a per-source checkpoint.
 
     The checkpoint's ``last_document_id`` only advances over an acknowledged (wait=True)
     upsert, so a crash + re-run never skips un-embedded docs (same durability contract as
     the ingest pipeline).
+
+    ``shard=(i, n)`` embeds only every n-th doc (those with ``global_index % n == i``) and
+    uses a shard-scoped checkpoint, so N processes (one per GPU) can embed disjoint slices
+    of the same source concurrently into the same Qdrant — point ids are deterministic per
+    (source, doc, chunk), so the shards never collide. ``shard=None`` (or n=1) is the whole
+    source with the original ``<source>.embed.json`` checkpoint.
     """
-    ckpt = _load_ckpt(cfg, source)
+    shard_i, shard_n = shard if shard else (0, 1)
+    ckpt_key = source if shard_n <= 1 else f"{source}.shard{shard_i}of{shard_n}"
+    ckpt = _load_ckpt(cfg, ckpt_key)
     resume_after = ckpt.get("last_document_id")
     skipping = resume_after is not None
     done_docs = ckpt.get("docs", 0)
@@ -190,12 +198,14 @@ def embed_source_resumable(
         store.upsert_points(client, cfg.collection_name, pending, wait=True)
         pending.clear()
         if last_doc is not None:
-            _save_ckpt(cfg, source, {
+            _save_ckpt(cfg, ckpt_key, {
                 "last_document_id": last_doc,
                 "docs": done_docs + docs, "chunks": done_chunks + chunks,
             })
 
-    for doc in iter_snapshot_docs(source):
+    for gi, doc in enumerate(iter_snapshot_docs(source)):
+        if shard_n > 1 and gi % shard_n != shard_i:
+            continue  # not this shard's doc
         if skipping:
             if doc.document_id == resume_after:
                 skipping = False
@@ -218,7 +228,7 @@ def embed_source_resumable(
     flush()
     if skipping:
         raise RuntimeError(
-            f"--resume id {resume_after!r} for {source!r} never found; delete "
-            f"{_checkpoint_path(cfg, source)} to restart."
+            f"--resume id {resume_after!r} for {ckpt_key!r} never found; delete "
+            f"{_checkpoint_path(cfg, ckpt_key)} to restart."
         )
     return docs, chunks, skipped

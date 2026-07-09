@@ -14,6 +14,8 @@ device, fp16, batching and the sigmoid normalisation. The heavy imports are lazy
 offline unit tests don't need the ML stack.
 """
 
+import os
+
 from .config import Config
 
 _MAX_LENGTH = 512   # query+chunk truncation (chunks are already ~512 tokens)
@@ -28,6 +30,25 @@ def _auto_device(torch) -> str:
     return "cpu"
 
 
+def _configure_cpu_threads(torch) -> None:
+    """Pin the cross-encoder's CPU parallelism to physical cores with a single interop
+    thread. Default torch spawns one intraop thread per *logical* core (18 on this 14-core
+    box) and, stacked across processes, oversubscribes and stalls the rerank. Threads are
+    read from ``OMP_NUM_THREADS`` (set in the MCP launch env) so torch and OpenMP agree;
+    falls back to the logical count for CLI use. ``set_num_interop_threads`` may only be
+    called before the first parallel op, so it is best-effort — the intraop cap still
+    applies. Thread count does not affect scores (fp reduction-order drift ~1e-6)."""
+    n = int(os.getenv("OMP_NUM_THREADS") or os.cpu_count() or 1)
+    try:
+        torch.set_num_threads(n)
+    except Exception:  # noqa: BLE001 - never fail rerank init over a tuning hint
+        pass
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        pass  # already past the first parallel op; the intraop cap above still holds
+
+
 class BGEReranker:
     """Cross-encoder exposing ``score(query, texts) -> list[float]`` (0..1, higher = better)."""
 
@@ -36,6 +57,8 @@ class BGEReranker:
         from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
         self._torch = torch
+        if (cfg.rerank_device or _auto_device(torch)) == "cpu":
+            _configure_cpu_threads(torch)  # before the first forward
         self.device = cfg.rerank_device or _auto_device(torch)
         self.tokenizer = AutoTokenizer.from_pretrained(cfg.rerank_model)
         model = AutoModelForSequenceClassification.from_pretrained(cfg.rerank_model)
@@ -46,14 +69,20 @@ class BGEReranker:
         self.model = model
 
     def score(self, query: str, texts: list[str]) -> list[float]:
-        """Relevance score for each ``text`` against ``query`` (sigmoid of the logit)."""
+        """Relevance score for each ``text`` against ``query`` (sigmoid of the logit).
+
+        Candidates are length-bucketed — sorted by length, batched, then scattered back to
+        input order — so each padded batch holds similarly-sized inputs instead of a 64-token
+        chunk riding in a 512-wide batch beside a 512-token one. Padding tokens are masked,
+        so the scores are identical to the unsorted order; this only removes wasted FLOPs."""
         if not texts:
             return []
         torch = self._torch
-        out: list[float] = []
-        for start in range(0, len(texts), _BATCH_SIZE):
-            batch = texts[start : start + _BATCH_SIZE]
-            pairs = [[query, t] for t in batch]
+        order = sorted(range(len(texts)), key=lambda i: len(texts[i]))
+        scores: list[float] = [0.0] * len(texts)
+        for start in range(0, len(order), _BATCH_SIZE):
+            idx = order[start : start + _BATCH_SIZE]
+            pairs = [[query, texts[i]] for i in idx]
             inputs = self.tokenizer(
                 pairs, padding=True, truncation=True, max_length=_MAX_LENGTH,
                 return_tensors="pt",
@@ -61,5 +90,35 @@ class BGEReranker:
             with torch.no_grad():
                 logits = self.model(**inputs, return_dict=True).logits.view(-1).float()
                 probs = torch.sigmoid(logits)
-            out.extend(probs.cpu().tolist())
-        return out
+            for i, p in zip(idx, probs.cpu().tolist()):
+                scores[i] = p
+        return scores
+
+
+class RemoteBGEReranker:
+    """Drop-in for :class:`BGEReranker` that delegates scoring to a remote HTTP reranker.
+
+    Used to offload the CPU-bound cross-encoder to a GPU pod during the Phase-C sweep: retrieval
+    and metrics stay local, only the (query, candidate-text) pairs cross an SSH tunnel to the
+    pod's ``runpod_rerank_server.py`` (identical model / tokenizer / max_length / sigmoid → the
+    same scores as CPU). Enabled by ``RERANK_REMOTE_URL`` (e.g. ``http://localhost:8900``); loads
+    no ML deps locally. Interface is identical: ``score(query, texts) -> list[float]``.
+    """
+
+    def __init__(self, url: str, timeout: int = 300):
+        self.url = url.rstrip("/")
+        self.timeout = timeout
+        self.device = "remote"  # parity with BGEReranker (callers may log .device)
+
+    def score(self, query: str, texts: list[str]) -> list[float]:
+        if not texts:
+            return []
+        import json
+        import urllib.request
+
+        data = json.dumps({"query": query, "texts": texts}).encode()
+        req = urllib.request.Request(
+            f"{self.url}/score", data=data,
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            return json.loads(resp.read().decode())["scores"]
