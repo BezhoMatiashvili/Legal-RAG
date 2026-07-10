@@ -15,12 +15,17 @@ dependencies = [
     "mcp[cli]>=1.2",
     "datasketch>=1.6",  # MinHash/LSH near-duplicate clustering for corpus dedup (Part 1)
     "torch",            # CPU build only — see [tool.uv.sources] below
+    "transformers>=5.12.1",
 ]
 
 [dependency-groups]
 dev = [
     "pytest>=8.0",
     "ruff>=0.6",
+]
+onnx = [
+    "onnx>=1.16",
+    "onnxruntime>=1.18",
 ]
 # Only scripts/publish_snapshot.py needs S3 (upload to the RunPod network volume); keep
 # boto3 out of the MCP runtime env:  uv run --group publish python scripts/publish_snapshot.py

@@ -173,8 +173,8 @@ def qdrant_deps(cfg):
             from ingest.rerank import RemoteBGEReranker
             reranker = RemoteBGEReranker(remote)
         else:
-            from ingest.rerank import BGEReranker
-            reranker = BGEReranker(cfg)
+            from ingest.rerank import make_reranker
+            reranker = make_reranker(cfg)
     info = client.get_collection(cfg.collection_name)
     return client, embedder, reranker, {
         "kind": "qdrant", "collection": cfg.collection_name, "n_points": info.points_count,
@@ -260,6 +260,9 @@ def main() -> None:
                     if v not in (None, "rrf") and k != "translations"}
     if translations_hash:
         active_knobs["translate_queries"] = translations_hash
+    # Env-selected reranker backend (I7) is eval config too — fold non-default into the hash.
+    if args.backend == "qdrant" and cfg.rerank_enabled and cfg.rerank_backend != "torch":
+        active_knobs["rerank_backend"] = cfg.rerank_backend
 
     deps = qdrant_deps(cfg) if args.backend == "qdrant" else None
     backend, index_info = make_backend(

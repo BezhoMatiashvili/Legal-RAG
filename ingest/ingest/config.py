@@ -73,6 +73,9 @@ class Config:
     rerank_device: str | None
     rerank_use_fp16: bool
     rerank_remote_url: str | None
+    # I7: 'torch' (default) or 'onnx' (int8 export, scripts/export_onnx_reranker.py).
+    rerank_backend: str
+    onnx_rerank_path: Path
     chunk_tokens: int
     chunk_overlap: int
     chunk_min_tokens: int
@@ -107,6 +110,11 @@ def load_config() -> Config:
         rerank_device=_device_opt("RERANK_DEVICE") or _device_opt("EMBED_DEVICE"),
         rerank_use_fp16=_bool("RERANK_USE_FP16", False),
         rerank_remote_url=(os.getenv("RERANK_REMOTE_URL") or "").strip() or None,
+        rerank_backend=((os.getenv("RERANK_BACKEND") or "").strip().lower()
+                        if (os.getenv("RERANK_BACKEND") or "").strip().lower() in ("torch", "onnx")
+                        else "torch"),
+        onnx_rerank_path=Path(os.getenv("ONNX_RERANK_PATH")
+                              or state_dir / "onnx" / "bge-reranker-v2-m3-int8.onnx"),
         chunk_tokens=_int("CHUNK_TOKENS", 512),
         chunk_overlap=_int("CHUNK_OVERLAP", 80),
         chunk_min_tokens=_int("CHUNK_MIN_TOKENS", 64),
@@ -136,5 +144,8 @@ def retrieval_fingerprint(cfg: Config) -> str:
         "chunk_overlap": cfg.chunk_overlap,
         "chunk_min_tokens": cfg.chunk_min_tokens,
     }
+    # Conditional so the fingerprint is byte-stable while the knob is at its default (G5).
+    if cfg.rerank_enabled and cfg.rerank_backend != "torch":
+        material["rerank_backend"] = cfg.rerank_backend
     blob = json.dumps(material, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(blob.encode()).hexdigest()[:16]

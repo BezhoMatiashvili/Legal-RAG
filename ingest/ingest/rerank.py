@@ -95,6 +95,64 @@ class BGEReranker:
         return scores
 
 
+class ONNXBGEReranker:
+    """int8 ONNX cross-encoder (improvement I7) — same interface/scores as BGEReranker.
+
+    Runs the dynamically-quantized export of the same model (see
+    ``scripts/export_onnx_reranker.py``) through onnxruntime on CPU: ~2x the fp32 torch
+    throughput at <0.01 nDCG cost (gated by the I7 parity eval). Tokenization is the
+    identical ``AutoTokenizer``; scoring keeps the same length-bucketed batching and
+    sigmoid normalisation, so it is a drop-in behind ``RERANK_BACKEND=onnx``.
+    """
+
+    def __init__(self, cfg: Config):
+        import numpy as np
+        import onnxruntime as ort
+        from transformers import AutoTokenizer
+
+        self._np = np
+        path = cfg.onnx_rerank_path
+        if not path.exists():
+            raise FileNotFoundError(
+                f"ONNX reranker not found at {path} — run "
+                "`uv run --group onnx python scripts/export_onnx_reranker.py` first")
+        self.tokenizer = AutoTokenizer.from_pretrained(cfg.rerank_model)
+        so = ort.SessionOptions()
+        so.intra_op_num_threads = int(os.getenv("OMP_NUM_THREADS") or os.cpu_count() or 1)
+        so.inter_op_num_threads = 1
+        self.session = ort.InferenceSession(str(path), so, providers=["CPUExecutionProvider"])
+        self.device = "onnx-cpu"  # parity with BGEReranker (callers may log .device)
+
+    def score(self, query: str, texts: list[str]) -> list[float]:
+        """Relevance for each ``text`` vs ``query`` — length-bucketed, sigmoid(logit)."""
+        if not texts:
+            return []
+        np = self._np
+        order = sorted(range(len(texts)), key=lambda i: len(texts[i]))
+        scores: list[float] = [0.0] * len(texts)
+        for start in range(0, len(order), _BATCH_SIZE):
+            idx = order[start : start + _BATCH_SIZE]
+            pairs = [[query, texts[i]] for i in idx]
+            enc = self.tokenizer(pairs, padding=True, truncation=True,
+                                 max_length=_MAX_LENGTH, return_tensors="np")
+            logits = self.session.run(
+                ["logits"],
+                {"input_ids": enc["input_ids"].astype(np.int64),
+                 "attention_mask": enc["attention_mask"].astype(np.int64)},
+            )[0].reshape(-1)
+            probs = 1.0 / (1.0 + np.exp(-logits.astype(np.float64)))
+            for i, p in zip(idx, probs.tolist()):
+                scores[i] = p
+        return scores
+
+
+def make_reranker(cfg: Config):
+    """The configured local reranker: ``RERANK_BACKEND=onnx`` → int8 ONNX, else torch."""
+    if cfg.rerank_backend == "onnx":
+        return ONNXBGEReranker(cfg)
+    return BGEReranker(cfg)
+
+
 class RemoteBGEReranker:
     """Drop-in for :class:`BGEReranker` that delegates scoring to a remote HTTP reranker.
 

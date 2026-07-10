@@ -108,9 +108,9 @@ async def _get_reranker():
                     _reranker = RemoteBGEReranker(cfg.rerank_remote_url, timeout=60)
                     logger.info("reranker: remote GPU pod at %s", cfg.rerank_remote_url)
                 else:
-                    from .rerank import BGEReranker
+                    from .rerank import make_reranker
 
-                    _reranker = await asyncio.to_thread(BGEReranker, cfg)
+                    _reranker = await asyncio.to_thread(make_reranker, cfg)
     return _reranker
 
 
