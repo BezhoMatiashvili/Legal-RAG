@@ -80,7 +80,8 @@ py 3.11–3.13, CPU torch), glued by `run_all.py`.
 ## Freshness stamp (update when corpus/serving state changes — rides the re-baseline ritual)
 
 - **Corpus:** `georgian_legal` = **2,637,645 points**; scraped universe 208,218;
-  coverage verified 0 missing (2026-07-09, `ingest/scripts/verify_all_embedded.py`).
+  coverage verified 0 missing — 207,940 embedded, 278 excluded by design (97 empty-body,
+  181 hygiene-quarantined) (2026-07-09, `ingest/scripts/verify_all_embedded.py`).
 - **Serving config:** `hybrid+rerank@50`, `retrieval_fingerprint=81c807b279399098`
   (measured pre-consolidation — re-baseline before any A/B, improvement.md §8).
-- **RunPod balance:** ~$4.30. **Stamp updated:** 2026-07-09.
+- **RunPod balance:** ~$10.53 (topped up; HANDOFF 2026-07-10). **Stamp updated:** 2026-07-10.

@@ -27,7 +27,7 @@ imports: ingest/ingest/__init__.py, ingest/ingest/config.py, ingest/ingest/embed
 - def **_atoms** `ingest/ingest/chunking.py:152`
 - def **_pack** `ingest/ingest/chunking.py:201`
 - def **chunk_document** `ingest/ingest/chunking.py:244`
-- def **build_embed_text** `ingest/ingest/chunking.py:279`
+- def **build_embed_text** `ingest/ingest/chunking.py:284`
 
 ## ingest/ingest/config.py
 - def **_bool** `ingest/ingest/config.py:17`
@@ -35,8 +35,8 @@ imports: ingest/ingest/__init__.py, ingest/ingest/config.py, ingest/ingest/embed
 - def **_float_opt** `ingest/ingest/config.py:29`
 - def **_device_opt** `ingest/ingest/config.py:40`
 - class **Config**() `ingest/ingest/config.py:54`
-- def **load_config** `ingest/ingest/config.py:85`
-- def **retrieval_fingerprint** `ingest/ingest/config.py:120`
+- def **load_config** `ingest/ingest/config.py:91`
+- def **retrieval_fingerprint** `ingest/ingest/config.py:132`
 
 ## ingest/ingest/dedup.py
 - def **content_hash** `ingest/ingest/dedup.py:30`
@@ -97,53 +97,54 @@ imports: ingest/ingest/__init__.py, ingest/ingest/config.py, ingest/ingest/embed
 - def **_hit_dict** `ingest/ingest/mcp_server.py:188`
 - def **_format_hit_md** `ingest/ingest/mcp_server.py:217`
 - class **SearchInput**(BaseModel) `ingest/ingest/mcp_server.py:243`
-- def **legal_search** `ingest/ingest/mcp_server.py:324`
-- def **_log_query_remote** `ingest/ingest/mcp_server.py:428`
-- def **_log_query** `ingest/ingest/mcp_server.py:452`
-- class **GetDocumentInput**(BaseModel) `ingest/ingest/mcp_server.py:473`
-- def **_scroll_all** `ingest/ingest/mcp_server.py:490`
-- def **_stitch_overlap** `ingest/ingest/mcp_server.py:509`
-- def **legal_get_document** `ingest/ingest/mcp_server.py:547`
-- def **_dedup_documents** `ingest/ingest/mcp_server.py:622`
-- def **_format_doc_line** `ingest/ingest/mcp_server.py:666`
-- class **LookupInput**(BaseModel) `ingest/ingest/mcp_server.py:682`
-- def **legal_lookup** `ingest/ingest/mcp_server.py:717`
-- class **BrowseInput**(BaseModel) `ingest/ingest/mcp_server.py:764`
-- def **legal_browse** `ingest/ingest/mcp_server.py:799`
-- def **_source_counts** `ingest/ingest/mcp_server.py:854`
-- def **legal_collection_info** `ingest/ingest/mcp_server.py:873`
-- def **_latest_report** `ingest/ingest/mcp_server.py:936`
-- class **StatusInput**(BaseModel) `ingest/ingest/mcp_server.py:946`
-- def **ingest_status** `ingest/ingest/mcp_server.py:966`
-- class **GetVersionsInput**(BaseModel) `ingest/ingest/mcp_server.py:1030`
-- def **legal_get_document_versions** `ingest/ingest/mcp_server.py:1052`
-- def **legal_health** `ingest/ingest/mcp_server.py:1128`
-- def **_is_our_server** `ingest/ingest/mcp_server.py:1168`
-- def **_enforce_singleton** `ingest/ingest/mcp_server.py:1178`
-- def **main** `ingest/ingest/mcp_server.py:1202`
+- def **legal_search** `ingest/ingest/mcp_server.py:325`
+- def **_log_query_remote** `ingest/ingest/mcp_server.py:453`
+- def **_log_query** `ingest/ingest/mcp_server.py:477`
+- class **GetDocumentInput**(BaseModel) `ingest/ingest/mcp_server.py:498`
+- def **_scroll_all** `ingest/ingest/mcp_server.py:515`
+- def **_stitch_overlap** `ingest/ingest/mcp_server.py:534`
+- def **legal_get_document** `ingest/ingest/mcp_server.py:572`
+- def **_dedup_documents** `ingest/ingest/mcp_server.py:651`
+- def **_format_doc_line** `ingest/ingest/mcp_server.py:695`
+- class **LookupInput**(BaseModel) `ingest/ingest/mcp_server.py:711`
+- def **legal_lookup** `ingest/ingest/mcp_server.py:746`
+- class **BrowseInput**(BaseModel) `ingest/ingest/mcp_server.py:793`
+- def **legal_browse** `ingest/ingest/mcp_server.py:840`
+- def **_source_counts** `ingest/ingest/mcp_server.py:901`
+- def **legal_collection_info** `ingest/ingest/mcp_server.py:920`
+- def **_latest_report** `ingest/ingest/mcp_server.py:983`
+- class **StatusInput**(BaseModel) `ingest/ingest/mcp_server.py:993`
+- def **ingest_status** `ingest/ingest/mcp_server.py:1013`
+- class **GetVersionsInput**(BaseModel) `ingest/ingest/mcp_server.py:1077`
+- def **legal_get_document_versions** `ingest/ingest/mcp_server.py:1099`
+- def **legal_health** `ingest/ingest/mcp_server.py:1175`
+- def **_is_our_server** `ingest/ingest/mcp_server.py:1215`
+- def **_enforce_singleton** `ingest/ingest/mcp_server.py:1225`
+- def **main** `ingest/ingest/mcp_server.py:1249`
 
 ## ingest/ingest/pipeline.py
 imports: ingest/ingest/__init__.py, ingest/ingest/chunking.py, ingest/ingest/config.py, ingest/ingest/dedup.py, ingest/ingest/sources.py
-- def **_indexed_content_hash** `ingest/ingest/pipeline.py:31`
-- def **_record_schema_drift** `ingest/ingest/pipeline.py:47`
-- def **write_ingest_report** `ingest/ingest/pipeline.py:63`
-- def **items_path** `ingest/ingest/pipeline.py:91`
-- def **_iter_lines** `ingest/ingest/pipeline.py:95`
-- def **_checkpoint_path** `ingest/ingest/pipeline.py:103`
-- def **_load_checkpoint** `ingest/ingest/pipeline.py:107`
-- def **_save_checkpoint** `ingest/ingest/pipeline.py:114`
-- def **delete_checkpoint** `ingest/ingest/pipeline.py:121`
-- def **ingest_source** `ingest/ingest/pipeline.py:125`
-- def **resolve_sources** `ingest/ingest/pipeline.py:262`
-- def **discover_runs** `ingest/ingest/pipeline.py:281`
-- def **_read_complete_lines** `ingest/ingest/pipeline.py:299`
-- def **_watch_state_path** `ingest/ingest/pipeline.py:329`
-- def **_load_watch_state** `ingest/ingest/pipeline.py:333`
-- def **_save_watch_state** `ingest/ingest/pipeline.py:342`
-- def **delete_watch_state** `ingest/ingest/pipeline.py:351`
-- def **_build_doc_points** `ingest/ingest/pipeline.py:355`
-- def **watch_drain_source** `ingest/ingest/pipeline.py:384`
-- def **watch_loop** `ingest/ingest/pipeline.py:502`
+- def **_header_v2_kwargs** `ingest/ingest/pipeline.py:31`
+- def **_indexed_content_hash** `ingest/ingest/pipeline.py:44`
+- def **_record_schema_drift** `ingest/ingest/pipeline.py:60`
+- def **write_ingest_report** `ingest/ingest/pipeline.py:76`
+- def **items_path** `ingest/ingest/pipeline.py:104`
+- def **_iter_lines** `ingest/ingest/pipeline.py:108`
+- def **_checkpoint_path** `ingest/ingest/pipeline.py:116`
+- def **_load_checkpoint** `ingest/ingest/pipeline.py:120`
+- def **_save_checkpoint** `ingest/ingest/pipeline.py:127`
+- def **delete_checkpoint** `ingest/ingest/pipeline.py:134`
+- def **ingest_source** `ingest/ingest/pipeline.py:138`
+- def **resolve_sources** `ingest/ingest/pipeline.py:275`
+- def **discover_runs** `ingest/ingest/pipeline.py:294`
+- def **_read_complete_lines** `ingest/ingest/pipeline.py:312`
+- def **_watch_state_path** `ingest/ingest/pipeline.py:342`
+- def **_load_watch_state** `ingest/ingest/pipeline.py:346`
+- def **_save_watch_state** `ingest/ingest/pipeline.py:355`
+- def **delete_watch_state** `ingest/ingest/pipeline.py:364`
+- def **_build_doc_points** `ingest/ingest/pipeline.py:368`
+- def **watch_drain_source** `ingest/ingest/pipeline.py:397`
+- def **watch_loop** `ingest/ingest/pipeline.py:515`
 
 ## ingest/ingest/progress.py
 - def **_fmt_elapsed** `ingest/ingest/progress.py:44`
@@ -196,9 +197,13 @@ imports: ingest/ingest/config.py
 - class **BGEReranker**() `ingest/ingest/rerank.py:52`
   - def __init__ `ingest/ingest/rerank.py:55`
   - def score `ingest/ingest/rerank.py:71`
-- class **RemoteBGEReranker**() `ingest/ingest/rerank.py:98`
+- class **ONNXBGEReranker**() `ingest/ingest/rerank.py:98`
   - def __init__ `ingest/ingest/rerank.py:108`
-  - def score `ingest/ingest/rerank.py:113`
+  - def score `ingest/ingest/rerank.py:126`
+- def **make_reranker** `ingest/ingest/rerank.py:149`
+- class **RemoteBGEReranker**() `ingest/ingest/rerank.py:156`
+  - def __init__ `ingest/ingest/rerank.py:166`
+  - def score `ingest/ingest/rerank.py:171`
 
 ## ingest/ingest/search.py
 imports: ingest/ingest/config.py
@@ -231,13 +236,13 @@ imports: ingest/ingest/__init__.py, ingest/ingest/config.py, ingest/ingest/embed
 - def **_valid_iso** `ingest/ingest/sources.py:71`
 - def **_parse_date** `ingest/ingest/sources.py:82`
 - class **CanonicalDoc**() `ingest/ingest/sources.py:114`
-- class **SourceSpec**() `ingest/ingest/sources.py:146`
-  - def declared_keys `ingest/ingest/sources.py:168`
-  - def _first `ingest/ingest/sources.py:182`
-  - def _parties `ingest/ingest/sources.py:189`
-  - def build `ingest/ingest/sources.py:197`
-- def **normalize** `ingest/ingest/sources.py:363`
-- def **schema_drift** `ingest/ingest/sources.py:371`
+- class **SourceSpec**() `ingest/ingest/sources.py:149`
+  - def declared_keys `ingest/ingest/sources.py:171`
+  - def _first `ingest/ingest/sources.py:185`
+  - def _parties `ingest/ingest/sources.py:192`
+  - def build `ingest/ingest/sources.py:200`
+- def **normalize** `ingest/ingest/sources.py:366`
+- def **schema_drift** `ingest/ingest/sources.py:374`
 
 ## ingest/ingest/structure.py
 - class **StructureInfo**() `ingest/ingest/structure.py:34`
@@ -373,11 +378,20 @@ imports: ingest/ingest/config.py, ingest/ingest/pipeline.py, ingest/ingest/qdran
 - def **paired_section** `ingest/scripts/build_phase_c_report.py:126`
 - def **main** `ingest/scripts/build_phase_c_report.py:142`
 
+## ingest/scripts/calibrate_min_score.py
+imports: ingest/eval/__init__.py, ingest/eval/backend.py, ingest/eval/evaluate.py, ingest/eval/translations.py, ingest/ingest/config.py, ingest/ingest/embedding.py
+- def **percentile** `ingest/scripts/calibrate_min_score.py:30`
+- def **main** `ingest/scripts/calibrate_min_score.py:37`
+
 ## ingest/scripts/embed_delta.py
 imports: ingest/ingest/config.py, ingest/ingest/embed_job.py, ingest/ingest/embedding.py, ingest/ingest/qdrant_store.py, ingest/ingest/sources.py
 - def **_iter_items** `ingest/scripts/embed_delta.py:35`
 - def **_resolve_paths** `ingest/scripts/embed_delta.py:48`
 - def **main** `ingest/scripts/embed_delta.py:58`
+
+## ingest/scripts/export_onnx_reranker.py
+imports: ingest/ingest/config.py
+- def **main** `ingest/scripts/export_onnx_reranker.py:28`
 
 ## ingest/scripts/gen_code_map.py
 - def **iter_py_files** `ingest/scripts/gen_code_map.py:57`
@@ -412,13 +426,34 @@ imports: ingest/ingest/config.py, ingest/ingest/remote_search.py
 - def **_sha256** `ingest/scripts/publish_snapshot.py:59`
 - def **create** `ingest/scripts/publish_snapshot.py:77`
 - def **_s3** `ingest/scripts/publish_snapshot.py:134`
-- def **_load_manifest** `ingest/scripts/publish_snapshot.py:153`
-- def **upload** `ingest/scripts/publish_snapshot.py:160`
-- def **_abort_quietly** `ingest/scripts/publish_snapshot.py:254`
-- def **_publish_manifest_object** `ingest/scripts/publish_snapshot.py:263`
-- def **verify** `ingest/scripts/publish_snapshot.py:271`
-- def **cleanup** `ingest/scripts/publish_snapshot.py:309`
-- def **main** `ingest/scripts/publish_snapshot.py:336`
+- def **_load_manifest** `ingest/scripts/publish_snapshot.py:155`
+- def **upload** `ingest/scripts/publish_snapshot.py:162`
+- def **_abort_quietly** `ingest/scripts/publish_snapshot.py:270`
+- def **_publish_manifest_object** `ingest/scripts/publish_snapshot.py:279`
+- def **verify** `ingest/scripts/publish_snapshot.py:287`
+- def **cleanup** `ingest/scripts/publish_snapshot.py:325`
+- def **main** `ingest/scripts/publish_snapshot.py:352`
+
+## ingest/scripts/reconcile_consolidated.py
+imports: ingest/ingest/config.py, ingest/ingest/qdrant_store.py
+- def **resolve_ids_file** `ingest/scripts/reconcile_consolidated.py:58`
+- def **sentinel_count** `ingest/scripts/reconcile_consolidated.py:79`
+- def **load_listed_ids** `ingest/scripts/reconcile_consolidated.py:90`
+- def **ensure_payload_indexes** `ingest/scripts/reconcile_consolidated.py:103`
+- def **indexed_matsne_doc_ids** `ingest/scripts/reconcile_consolidated.py:119`
+- def **count_consolidated** `ingest/scripts/reconcile_consolidated.py:149`
+- def **set_consolidated** `ingest/scripts/reconcile_consolidated.py:162`
+- def **main** `ingest/scripts/reconcile_consolidated.py:187`
+
+## ingest/scripts/reembed_export.py
+imports: ingest/ingest/config.py, ingest/ingest/qdrant_store.py
+- def **main** `ingest/scripts/reembed_export.py:33`
+
+## ingest/scripts/reembed_v2.py
+imports: ingest/ingest/chunking.py, ingest/ingest/config.py, ingest/ingest/embedding.py, ingest/ingest/qdrant_store.py
+- def **embed_text_from_payload** `ingest/scripts/reembed_v2.py:37`
+- def **iter_rows** `ingest/scripts/reembed_v2.py:57`
+- def **main** `ingest/scripts/reembed_v2.py:65`
 
 ## ingest/scripts/rerank_latency_probe.py
 imports: ingest/ingest/config.py, ingest/ingest/qdrant_store.py, ingest/ingest/rerank.py
@@ -585,13 +620,13 @@ imports: ingest/ingest/__init__.py
 - def **_healthy** `ingest/serverless/qdrant_boot.py:80`
 - def **_log_tail** `ingest/serverless/qdrant_boot.py:87`
 - def **_spawn** `ingest/serverless/qdrant_boot.py:94`
-- def **ensure_running** `ingest/serverless/qdrant_boot.py:108`
-- def **_read_json** `ingest/serverless/qdrant_boot.py:140`
-- def **_sha256** `ingest/serverless/qdrant_boot.py:147`
-- def **needs_restore** `ingest/serverless/qdrant_boot.py:158`
-- def **restore_pending** `ingest/serverless/qdrant_boot.py:171`
-- def **_collection_points** `ingest/serverless/qdrant_boot.py:178`
-- def **maybe_restore** `ingest/serverless/qdrant_boot.py:187`
+- def **ensure_running** `ingest/serverless/qdrant_boot.py:115`
+- def **_read_json** `ingest/serverless/qdrant_boot.py:147`
+- def **_sha256** `ingest/serverless/qdrant_boot.py:154`
+- def **needs_restore** `ingest/serverless/qdrant_boot.py:165`
+- def **restore_pending** `ingest/serverless/qdrant_boot.py:178`
+- def **_collection_points** `ingest/serverless/qdrant_boot.py:185`
+- def **maybe_restore** `ingest/serverless/qdrant_boot.py:194`
 
 ## scraper/legal_scrapers/__init__.py
 
@@ -632,16 +667,16 @@ imports: ingest/ingest/__init__.py
 imports: scraper/legal_scrapers/utils/markdown.py
 - def **class_to_status** `scraper/legal_scrapers/items.py:12`
 - class **MatsneItem**(scrapy.Item) `scraper/legal_scrapers/items.py:22`
-- def **_strip** `scraper/legal_scrapers/items.py:58`
-- def **_f** `scraper/legal_scrapers/items.py:67`
-- def **_body** `scraper/legal_scrapers/items.py:72`
-- def **_list** `scraper/legal_scrapers/items.py:78`
-- class **EcdItem**(scrapy.Item) `scraper/legal_scrapers/items.py:84`
-- class **ConstcourtItem**(scrapy.Item) `scraper/legal_scrapers/items.py:103`
-- class **NaprItem**(scrapy.Item) `scraper/legal_scrapers/items.py:119`
-- class **TbappealItem**(scrapy.Item) `scraper/legal_scrapers/items.py:136`
-- class **SupremecourtItem**(scrapy.Item) `scraper/legal_scrapers/items.py:148`
-- class **TasItem**(scrapy.Item) `scraper/legal_scrapers/items.py:163`
+- def **_strip** `scraper/legal_scrapers/items.py:61`
+- def **_f** `scraper/legal_scrapers/items.py:70`
+- def **_body** `scraper/legal_scrapers/items.py:75`
+- def **_list** `scraper/legal_scrapers/items.py:81`
+- class **EcdItem**(scrapy.Item) `scraper/legal_scrapers/items.py:87`
+- class **ConstcourtItem**(scrapy.Item) `scraper/legal_scrapers/items.py:106`
+- class **NaprItem**(scrapy.Item) `scraper/legal_scrapers/items.py:122`
+- class **TbappealItem**(scrapy.Item) `scraper/legal_scrapers/items.py:139`
+- class **SupremecourtItem**(scrapy.Item) `scraper/legal_scrapers/items.py:151`
+- class **TasItem**(scrapy.Item) `scraper/legal_scrapers/items.py:166`
 
 ## scraper/legal_scrapers/middlewares.py
 imports: scraper/legal_scrapers/utils/user_agents.py
@@ -714,17 +749,20 @@ imports: scraper/legal_scrapers/items.py, scraper/legal_scrapers/spiders/base.py
 
 ## scraper/legal_scrapers/spiders/matsne_spider.py
 imports: scraper/legal_scrapers/items.py, scraper/legal_scrapers/spiders/base.py, scraper/legal_scrapers/utils/search_urls.py
-- class **MatsneSpider**(BaseLegalSpider) `scraper/legal_scrapers/spiders/matsne_spider.py:23`
-  - def from_crawler `scraper/legal_scrapers/spiders/matsne_spider.py:32`
-  - def start `scraper/legal_scrapers/spiders/matsne_spider.py:37`
-  - def _load_seed_urls `scraper/legal_scrapers/spiders/matsne_spider.py:87`
-  - def spider_idle `scraper/legal_scrapers/spiders/matsne_spider.py:117`
-  - def start_phase `scraper/legal_scrapers/spiders/matsne_spider.py:136`
-  - def build_request `scraper/legal_scrapers/spiders/matsne_spider.py:144`
-  - def follow_request `scraper/legal_scrapers/spiders/matsne_spider.py:158`
-  - def parse `scraper/legal_scrapers/spiders/matsne_spider.py:171`
-  - def _split_requests `scraper/legal_scrapers/spiders/matsne_spider.py:217`
-  - def parse_document `scraper/legal_scrapers/spiders/matsne_spider.py:257`
+- class **MatsneSpider**(BaseLegalSpider) `scraper/legal_scrapers/spiders/matsne_spider.py:24`
+  - def from_crawler `scraper/legal_scrapers/spiders/matsne_spider.py:33`
+  - def _doc_type `scraper/legal_scrapers/spiders/matsne_spider.py:39`
+  - def _record_main_listed_id `scraper/legal_scrapers/spiders/matsne_spider.py:62`
+  - def start `scraper/legal_scrapers/spiders/matsne_spider.py:82`
+  - def _load_seed_urls `scraper/legal_scrapers/spiders/matsne_spider.py:139`
+  - def spider_closed `scraper/legal_scrapers/spiders/matsne_spider.py:169`
+  - def spider_idle `scraper/legal_scrapers/spiders/matsne_spider.py:187`
+  - def start_phase `scraper/legal_scrapers/spiders/matsne_spider.py:206`
+  - def build_request `scraper/legal_scrapers/spiders/matsne_spider.py:214`
+  - def follow_request `scraper/legal_scrapers/spiders/matsne_spider.py:228`
+  - def parse `scraper/legal_scrapers/spiders/matsne_spider.py:241`
+  - def _split_requests `scraper/legal_scrapers/spiders/matsne_spider.py:291`
+  - def parse_document `scraper/legal_scrapers/spiders/matsne_spider.py:334`
 
 ## scraper/legal_scrapers/spiders/napr_spider.py
 imports: scraper/legal_scrapers/items.py, scraper/legal_scrapers/spiders/base.py, scraper/legal_scrapers/utils/dates.py, scraper/legal_scrapers/utils/documents.py, scraper/legal_scrapers/utils/json_api.py
@@ -828,11 +866,11 @@ imports: scraper/legal_scrapers/utils/markdown.py, scraper/legal_scrapers/utils/
 - def **safe_html_to_markdown** `scraper/legal_scrapers/utils/markdown.py:333`
 
 ## scraper/legal_scrapers/utils/search_urls.py
-- def **first_qs_value** `scraper/legal_scrapers/utils/search_urls.py:37`
-- def **sub_windows** `scraper/legal_scrapers/utils/search_urls.py:42`
-- def **build_search_url** `scraper/legal_scrapers/utils/search_urls.py:67`
-- def **generate_start_url_batches** `scraper/legal_scrapers/utils/search_urls.py:74`
-- def **generate_start_urls** `scraper/legal_scrapers/utils/search_urls.py:97`
+- def **first_qs_value** `scraper/legal_scrapers/utils/search_urls.py:46`
+- def **sub_windows** `scraper/legal_scrapers/utils/search_urls.py:51`
+- def **build_search_url** `scraper/legal_scrapers/utils/search_urls.py:76`
+- def **generate_start_url_batches** `scraper/legal_scrapers/utils/search_urls.py:91`
+- def **generate_start_urls** `scraper/legal_scrapers/utils/search_urls.py:116`
 
 ## scraper/legal_scrapers/utils/text.py
 - def **plain_text_to_markdown** `scraper/legal_scrapers/utils/text.py:11`
