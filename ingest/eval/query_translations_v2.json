@@ -1,0 +1,122 @@
+{
+ "version": "v2",
+ "note": "EN→KA translations for golden_set_v2 cross_lingual queries. v1 ids (q001–q103 range) carried over verbatim from query_translations_v1.json; new ids authored with the v2 batches. Loader: eval/translations.py (byte-match validated).",
+ "translations": {
+  "q002": {
+   "query": "Can a preventive measure decided at the pre-trial hearing be appealed to the investigative chamber?",
+   "ka": "შეიძლება თუ არა წინასასამართლო სხდომაზე შეფარდებული აღკვეთის ღონისძიების გასაჩივრება საგამოძიებო კოლეგიაში?"
+  },
+  "q006": {
+   "query": "How does securing a claim protect the property rights of individuals and legal entities?",
+   "ka": "როგორ იცავს სარჩელის უზრუნველყოფა ფიზიკური და იურიდიული პირების ქონებრივ უფლებებს?"
+  },
+  "q011": {
+   "query": "court ruling warning that unaffordable bail becomes concealed detention",
+   "ka": "სასამართლოს განჩინება — ხელმიუწვდომელი ოდენობის გირაო ფარულ პატიმრობად იქცევა"
+  },
+  "q014": {
+   "query": "court verdict on illegal drug use for personal consumption without a doctor's prescription",
+   "ka": "განაჩენი ექიმის დანიშნულების გარეშე ნარკოტიკული საშუალების უკანონო მოხმარებაზე პირადი მოხმარებისთვის"
+  },
+  "q029": {
+   "query": "Tbilisi permit for the reconstruction of an existing underground pedestrian crossing",
+   "ka": "თბილისში არსებული მიწისქვეშა საცალფეხო გადასასვლელის რეკონსტრუქციის ნებართვა"
+  },
+  "q030": {
+   "query": "glazed duplicated facade addition on the first floor of a shopping center in Tbilisi",
+   "ka": "სავაჭრო ცენტრის პირველ სართულზე შემინული დუბლირებული ფასადის მოწყობა თბილისში"
+  },
+  "q033": {
+   "query": "public registry decision on the buyer's obligation to pay the purchase price under a sale contract",
+   "ka": "საჯარო რეესტრის გადაწყვეტილება ნასყიდობის ხელშეკრულებით მყიდველის მიერ ნასყიდობის ფასის გადახდის ვალდებულებაზე"
+  },
+  "q039": {
+   "query": "administrative complaint denied because the general meeting notice omitted the record date",
+   "ka": "ადმინისტრაციული საჩივარი არ დაკმაყოფილდა, რადგან საერთო კრების მოწვევის შეტყობინებაში აღრიცხვის დღე არ იყო მითითებული"
+  },
+  "q042": {
+   "query": "registration of ownership over a 35.47 sq.m half-basement refused by the public registry",
+   "ka": "საჯარო რეესტრის უარი 35.47 კვ.მ ნახევარსარდაფზე საკუთრების უფლების რეგისტრაციაზე"
+  },
+  "q046": {
+   "query": "termination of registered lease and sublease rights based on a 2021 lease agreement in the public registry",
+   "ka": "რეგისტრირებული იჯარისა და ქვეიჯარის უფლებების შეწყვეტა 2021 წლის იჯარის ხელშეკრულების საფუძველზე საჯარო რეესტრში"
+  },
+  "q048": {
+   "query": "Did the Public Registry uphold or reject the administrative complaint that sought annulment of the property registration?",
+   "ka": "დააკმაყოფილა თუ არა საჯარო რეესტრმა ადმინისტრაციული საჩივარი ქონების რეგისტრაციის ბათილად ცნობის მოთხოვნით?"
+  },
+  "q054": {
+   "query": "What does the State Security Academy assess candidates for admission to the service?",
+   "ka": "რას აფასებს უსაფრთხოების აკადემია სამსახურში მისაღები კანდიდატების შერჩევისას?"
+  },
+  "q059": {
+   "query": "amendment to Defense Ministry order on state symbols annexes",
+   "ka": "ცვლილება თავდაცვის მინისტრის ბრძანებაში სახელმწიფო სიმბოლოების დანართების შესახებ"
+  },
+  "q060": {
+   "query": "What happens to military servicemembers who are relieved from their posts and sent as students to various training institutions?",
+   "ka": "რა ხდება სამხედრო მოსამსახურეების მიმართ, რომლებიც თანამდებობიდან თავისუფლდებიან და მსმენელებად იგზავნებიან სხვადასხვა სასწავლო დაწესებულებაში?"
+  },
+  "q064": {
+   "query": "Can Ministry of Internal Affairs staff keep using the old uniform after the uniform regulation was amended?",
+   "ka": "შეუძლიათ თუ არა შინაგან საქმეთა სამინისტროს მოსამსახურეებს ძველი ფორმის ტანსაცმლის გამოყენება ფორმის ტანსაცმლის წესში ცვლილების შემდეგ?"
+  },
+  "q066": {
+   "query": "Which article and paragraph of the defense attachés department regulation did the Minister of Defense order amend?",
+   "ka": "თავდაცვის მინისტრის ბრძანებით სამხედრო ატაშეების დეპარტამენტის დებულების რომელი მუხლი და პუნქტი შეიცვალა?"
+  },
+  "q079": {
+   "query": "domestic violence against a minor child, burn injury from a hot stove",
+   "ka": "ოჯახური ძალადობა არასრულწლოვანი ბავშვის მიმართ, დამწვრობა გახურებული ღუმელისგან"
+  },
+  "q082": {
+   "query": "Did the appeals court grant the prosecutor's request for a real prison sentence in this domestic threat case?",
+   "ka": "დააკმაყოფილა თუ არა სააპელაციო სასამართლომ პროკურორის მოთხოვნა რეალური თავისუფლების აღკვეთის დანიშვნაზე ოჯახური მუქარის საქმეზე?"
+  },
+  "q083": {
+   "query": "counterfeit fake 100 US dollar banknote case Georgia court",
+   "ka": "ყალბი 100 აშშ დოლარის ბანკნოტის დამზადებისა და გასაღების საქმე საქართველოს სასამართლო"
+  },
+  "q084": {
+   "query": "Why was the acquittal in a death-threat case upheld on appeal?",
+   "ka": "რატომ დარჩა ძალაში გამამართლებელი განაჩენი სიცოცხლის მოსპობის მუქარის საქმეზე სააპელაციო წესით გასაჩივრებისას?"
+  },
+  "q086": {
+   "query": "Did the Tbilisi appeals court uphold the first-instance verdict in this theft plea-agreement case?",
+   "ka": "დაუტოვა თუ არა ძალაში თბილისის სააპელაციო სასამართლომ პირველი ინსტანციის განაჩენი ქურდობის საქმეზე საპროცესო შეთანხმებით?"
+  },
+  "q088": {
+   "query": "Does labeling a person an abuser before a guilty court verdict violate the presumption of innocence?",
+   "ka": "არღვევს თუ არა პირის მოძალადედ მოხსენიება გამამტყუნებელი განაჩენის გამოტანამდე უდანაშაულობის პრეზუმფციას?"
+  },
+  "q118": {
+   "query": "Does the Legal Department of Georgia's Ministry of Finance represent the ministry in courts and private arbitration?",
+   "ka": "წარმოადგენს თუ არა საქართველოს ფინანსთა სამინისტროს იურიდიული დეპარტამენტი სამინისტროს საქართველოს სასამართლოებსა და კერძო არბიტრაჟში?"
+  },
+  "q110": {
+   "query": "Which country's honorary consulate was approved to open in Telavi, Georgia, and what is its consular district?",
+   "ka": "რომელი ქვეყნის საპატიო საკონსულოს გახსნაზე გაიცა თანხმობა ქალაქ თელავში და რა არის მისი საკონსულო ოლქი?"
+  },
+  "q131": {
+   "query": "What functions does the Central Registry Division of the Georgian Ministry of Defence administration perform with regard to NATO classified information?",
+   "ka": "რა ფუნქციებს ასრულებს საქართველოს თავდაცვის სამინისტროს ადმინისტრაციის ცენტრალური რეგისტრის სამმართველო ნატოს კლასიფიცირებულ ინფორმაციასთან დაკავშირებით?"
+  },
+  "q153": {
+   "query": "Which authority in Georgia is the competent body empowered to investigate civil aviation accidents and incidents?",
+   "ka": "რომელი ორგანოა საქართველოში უფლებამოსილი კომპეტენტური ორგანო, რომელიც იძიებს სამოქალაქო ავიაციის სფეროში მომხდარ საავიაციო შემთხვევებსა და ინციდენტებს?"
+  },
+  "q107": {
+   "query": "What does the hospital sector development master plan regulate about the distribution of hospital beds across Georgia's regions and cities?",
+   "ka": "რას აწესრიგებს ჰოსპიტალური სექტორის განვითარების გენერალური გეგმა საწოლების საქართველოს რეგიონებსა და ქალაქებში გადანაწილების შესახებ?"
+  },
+  "q105": {
+   "query": "What development coefficients (K-1, K-2, K-3) were set for the plot at 54 Uznadze Street in Tbilisi?",
+   "ka": "რა განაშენიანების კოეფიციენტები (კ-1, კ-2, კ-3) განისაზღვრა თბილისში, უზნაძის ქუჩა №54-ზე მდებარე მიწის ნაკვეთისთვის?"
+  },
+  "q126": {
+   "query": "Is a construction permit required to place a non-volumetric advertising sign as a sticker on a building facade on Vazha-Pshavela Avenue in Tbilisi?",
+   "ka": "საჭიროა თუ არა მშენებლობის ნებართვა არამოცულობითი სარეკლამო აბრის სტიკერის სახით განთავსებისთვის შენობის ფასადზე ვაჟა-ფშაველას გამზირზე თბილისში?"
+  }
+ }
+}
