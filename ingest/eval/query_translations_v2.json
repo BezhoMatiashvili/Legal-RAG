@@ -185,6 +185,46 @@
   "q339": {
    "query": "What did the Georgian National Archive letter No. 69/34655 establish about the household members in Public Registry complaint No. 36287/17?",
    "ka": "რა დაადგინა საქართველოს ეროვნული არქივის №69/34655 წერილმა კომლის წევრების შესახებ საჯარო რეესტრის №36287/17 საჩივრის ფარგლებში?"
+  },
+  "q273": {
+   "query": "Did the Georgian Constitutional Court agree with notaries Lela Intskirveli and Ekaterine Chachanidze that taxing notarial activity as non-entrepreneurial economic activity violates the constitutional protection of property?",
+   "ka": "დაეთანხმა თუ არა საქართველოს საკონსტიტუციო სასამართლო ნოტარიუსებს — ლელა ინწკირველსა და ეკატერინე ჩაჩანიძეს — რომ სანოტარო საქმიანობის არასამეწარმეო ეკონომიკურ საქმიანობად დაბეგვრა საკუთრების კონსტიტუციურ დაცვას არღვევს?"
+  },
+  "q284": {
+   "query": "Which provision of Georgia's Criminal Procedure Code do Mamuka Khazaradze and Badri Japaridze contest for letting courts convict a person even though the limitation period for criminal prosecution has already expired?",
+   "ka": "საქართველოს სისხლის სამართლის საპროცესო კოდექსის რომელ ნორმას ასაჩივრებენ მამუკა ხაზარაძე და ბადრი ჯაფარიძე, რომელიც სასამართლოს პირის მსჯავრდების საშუალებას აძლევს მაშინაც, როცა სისხლისსამართლებრივი დევნის ხანდაზმულობის ვადა უკვე გასულია?"
+  },
+  "q288": {
+   "query": "Which Criminal Code article does Nino Akhvlediani's constitutional complaint ask to be struck down for failing the standards of legal certainty and foreseeability?",
+   "ka": "სისხლის სამართლის კოდექსის რომელი მუხლის არაკონსტიტუციურად ცნობას ითხოვს ნინო ახვლედიანის კონსტიტუციური სარჩელი სამართლებრივი განსაზღვრულობისა და განჭვრეტადობის სტანდარტების დარღვევის გამო?"
+  },
+  "q266": {
+   "query": "What maximum administrative detention periods set by Georgia's Code of Administrative Offenses do Vasil Zhizhiashvili and Giorgi Gotsiridze challenge before the Constitutional Court?",
+   "ka": "ადმინისტრაციული დაკავების რა მაქსიმალურ ვადებს, რომლებიც ადმინისტრაციულ სამართალდარღვევათა კოდექსითაა დადგენილი, ასაჩივრებენ ვასილ ჟიჟიაშვილი და გიორგი გოცირიძე საკონსტიტუციო სასამართლოში?"
+  },
+  "q277": {
+   "query": "What did the Kutaisi Court of Appeal decide in case No. 3/b-548-18 about the Public Registry's refusal to register the 54.96 sq.m land plot in Batumi?",
+   "ka": "რა გადაწყვიტა ქუთაისის სააპელაციო სასამართლომ №3/ბ-548-18 საქმეზე, რომელიც ბათუმში 54,96 კვ.მ მიწის ნაკვეთის რეგისტრაციაზე საჯარო რეესტრის უარს ეხებოდა?"
+  },
+  "q280": {
+   "query": "On what grounds did the Kutaisi City Court refuse a former Baghdati tax inspection employee's claim against the Revenue Service for 473.76 GEL of salary arrears accrued in 1998-2000?",
+   "ka": "რა საფუძვლით უთხრა უარი ქუთაისის საქალაქო სასამართლომ ბაღდათის საგადასახადო ინსპექციის ყოფილი თანამშრომლის სარჩელს შემოსავლების სამსახურის წინააღმდეგ 1998-2000 წლებში დარიცხული 473,76 ლარის სახელფასო დავალიანების გამო?"
+  },
+  "q278": {
+   "query": "Under the December 2013 amendment to Georgia's Law on Accounting and Financial Reporting Audit, until what date was membership of auditors in professional organizations not required?",
+   "ka": "2013 წლის დეკემბრის ცვლილებით „ბუღალტრული აღრიცხვისა და ფინანსური ანგარიშგების აუდიტის შესახებ“ საქართველოს კანონში, რომელ თარიღამდე არ მოითხოვებოდა აუდიტორების პროფესიულ ორგანიზაციებში გაწევრება?"
+  },
+  "q282": {
+   "query": "Was Georgia's Ministry of Economy and Sustainable Development authorized in April 2012 to buy state property valuation services through simplified procurement?",
+   "ka": "მიეცა თუ არა საქართველოს ეკონომიკისა და მდგრადი განვითარების სამინისტროს 2012 წლის აპრილში უფლება, სახელმწიფო ქონების შეფასების მომსახურება გამარტივებული შესყიდვით შეესყიდა?"
+  },
+  "q262": {
+   "query": "Under Georgia's 2004 amendment No 312, until when was the operation of the Law on Trade in Tobacco Products suspended?",
+   "ka": "საქართველოს 2004 წლის №312 ცვლილებით, რა ვადით შეჩერდა „თამბაქოს ნაწარმით ვაჭრობის შესახებ“ კანონის მოქმედება?"
+  },
+  "q261": {
+   "query": "On what basis did Georgia's Public Registry order the registration proceedings reopened for apartment No. 13, whose owner claimed its area should be 175.1 rather than 139.2 square meters?",
+   "ka": "რა საფუძველზე დაავალა საქართველოს საჯარო რეესტრმა სარეგისტრაციო წარმოების განახლება №13 ბინაზე, რომლის მესაკუთრეც ამტკიცებდა, რომ ფართობი 139.2-ის ნაცვლად 175.1 კვ.მ უნდა ყოფილიყო?"
   }
  }
 }
