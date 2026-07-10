@@ -55,11 +55,28 @@ def _resolve_paths(cfg, args) -> list[Path]:
     return paths
 
 
+def _collect_docs(source: str, paths: list[Path]) -> tuple[list, int]:
+    """Normalize + dedup (last wins) the items in ``paths`` under one ``source``."""
+    docs: dict[str, object] = {}
+    malformed = 0
+    for item in _iter_items(paths):
+        try:
+            doc = normalize(source, item)
+        except Exception:  # noqa: BLE001 - a malformed record must not abort the delta
+            malformed += 1
+            continue
+        docs[doc.document_id] = doc
+    return list(docs.values()), malformed
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--items", nargs="*", help="explicit items.jsonl path(s)")
+    ap.add_argument("--items-dir",
+                    help="dir of per-source files named <source>.jsonl (multi-source delta); "
+                         "source is the filename stem, normalized independently")
     ap.add_argument("--source", default="matsne",
-                    help="source name for sources.normalize (default: matsne)")
+                    help="source name for sources.normalize (default: matsne; ignored for --items-dir)")
     ap.add_argument("--runs-since", help="include run dirs whose id >= this (e.g. 20260709T080007Z)")
     ap.add_argument("--collection", help="target collection (on the pod: georgian_legal_delta)")
     ap.add_argument("--batch-size", type=int, default=256)
@@ -71,22 +88,28 @@ def main() -> None:
     if args.collection:
         cfg = dataclasses.replace(cfg, collection_name=args.collection)
 
-    paths = _resolve_paths(cfg, args)
-    if not paths:
-        raise SystemExit("no items.jsonl found (pass --items or --runs-since)")
+    # Multi-source mode: one <source>.jsonl per source, each normalized under its own source.
+    if args.items_dir:
+        by_source: list[tuple[str, list[Path]]] = [
+            (p.stem, [p]) for p in sorted(Path(args.items_dir).glob("*.jsonl")) if p.stat().st_size]
+        if not by_source:
+            raise SystemExit(f"no non-empty <source>.jsonl in {args.items_dir}")
+    else:
+        paths = _resolve_paths(cfg, args)
+        if not paths:
+            raise SystemExit("no items.jsonl found (pass --items, --items-dir, or --runs-since)")
+        by_source = [(args.source, paths)]
 
-    docs: dict[str, object] = {}  # dedup by document_id, last wins
+    docs = []
     malformed = 0
-    for item in _iter_items(paths):
-        try:
-            doc = normalize(args.source, item)
-        except Exception:  # noqa: BLE001 - a malformed record must not abort the delta
-            malformed += 1
-            continue
-        docs[doc.document_id] = doc
-    docs = list(docs.values())
+    per_src = {}
+    for source, paths in by_source:
+        d, m = _collect_docs(source, paths)
+        docs.extend(d)
+        malformed += m
+        per_src[source] = len(d)
     n_cons = sum(1 for d in docs if d.is_consolidated)
-    print(f"delta: {len(docs)} unique docs from {len(paths)} file(s) "
+    print(f"delta: {len(docs)} unique docs {per_src} "
           f"({n_cons} consolidated, {malformed} malformed skipped) → {cfg.collection_name!r}")
 
     if args.dry_run:
