@@ -276,24 +276,51 @@ def chunk_document(
     return chunks
 
 
+# Georgian status words for the v2 embed header — queries are Georgian, so the legal-force
+# marker embeds in the vocabulary users actually search with.
+_STATUS_KA = {"in_force": "ძალაშია", "repealed": "ძალადაკარგულია", "pending": "ძალაში შესვლამდე"}
+
+
 def build_embed_text(
     text: str,
     *,
     title: str | None = None,
     document_type: str | None = None,
     heading_path: list[str] | None = None,
+    document_number: str | None = None,
+    date: str | None = None,
+    status: str | None = None,
+    is_consolidated: bool | None = None,
 ) -> str:
     """Context-enriched text to **embed** (the stored/displayed ``text`` stays clean).
 
     Prepends ``title > document_type > section/article path`` so a short clause is embedded
     with the context that disambiguates it — a Georgian legal query often matches the act
     title or article heading, not the bare clause body. Prepended to the embedded text only.
+
+    v2 header (improvement I6; callers gate on ``cfg.embed_header_v2``): passing any of
+    ``document_number`` / ``date`` / ``status`` / ``is_consolidated`` inserts one
+    ``№N · YYYY-MM-DD · ძალაშია · კონსოლიდირებული`` segment after ``document_type`` —
+    identifying metadata in the embedded prefix cuts retrieval failures on
+    boilerplate-heavy corpora (Anthropic Contextual Retrieval; amendment acts are exactly
+    that). With the v2 params left ``None`` the output is byte-identical to the v1 header.
     """
     parts: list[str] = []
     if title:
         parts.append(title)
     if document_type:
         parts.append(document_type)
+    meta: list[str] = []
+    if document_number and document_number not in ("0", "-"):
+        meta.append(f"№{document_number}")
+    if date:
+        meta.append(str(date)[:10])
+    if status:
+        meta.append(_STATUS_KA.get(status, status))
+    if is_consolidated:
+        meta.append("კონსოლიდირებული")
+    if meta:
+        parts.append(" · ".join(meta))
     if heading_path:
         parts.extend(heading_path)
     ctx = " > ".join(p for p in parts if p)

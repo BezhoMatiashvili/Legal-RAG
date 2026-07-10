@@ -28,6 +28,19 @@ from .sources import SOURCES, normalize, schema_drift
 logger = logging.getLogger("ingest.pipeline")
 
 
+def _header_v2_kwargs(cfg: Config, doc) -> dict:
+    """The I6 v2-header fields for ``build_embed_text`` — empty dict when the knob is off
+    (v1 embed text stays byte-identical)."""
+    if not getattr(cfg, "embed_header_v2", False):
+        return {}
+    return {
+        "document_number": doc.document_number,
+        "date": doc.date or doc.date_raw,  # ISO first; str()[:10] in build_embed_text
+        "status": doc.status,
+        "is_consolidated": doc.is_consolidated,
+    }
+
+
 def _indexed_content_hash(client, cfg: Config, source: str, document_id: str) -> str | None:
     """``content_hash`` of the doc's chunk-0 already in Qdrant, or None if not indexed.
 
@@ -213,7 +226,7 @@ def ingest_source(
             embedded = embedder.encode_passages([
                 build_embed_text(
                     c.text, title=doc.title, document_type=doc.document_type,
-                    heading_path=c.heading_path,
+                    heading_path=c.heading_path, **_header_v2_kwargs(cfg, doc),
                 )
                 for c in chunks
             ])
@@ -367,7 +380,7 @@ def _build_doc_points(cfg: Config, embedder, count_tokens, doc) -> tuple[list, i
     embedded = embedder.encode_passages([
         build_embed_text(
             c.text, title=doc.title, document_type=doc.document_type,
-            heading_path=c.heading_path,
+            heading_path=c.heading_path, **_header_v2_kwargs(cfg, doc),
         )
         for c in chunks
     ])

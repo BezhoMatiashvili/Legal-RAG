@@ -79,6 +79,9 @@ class Config:
     chunk_tokens: int
     chunk_overlap: int
     chunk_min_tokens: int
+    # I6: v2 embed headers (№/date/status/consolidation in the embedded prefix).
+    # Changing this INVALIDATES existing vectors — only flip together with a re-embed.
+    embed_header_v2: bool
     artifacts_root: Path
     state_dir: Path
     query_log_enabled: bool
@@ -118,6 +121,7 @@ def load_config() -> Config:
         chunk_tokens=_int("CHUNK_TOKENS", 512),
         chunk_overlap=_int("CHUNK_OVERLAP", 80),
         chunk_min_tokens=_int("CHUNK_MIN_TOKENS", 64),
+        embed_header_v2=_bool("EMBED_HEADER_V2", False),
         artifacts_root=artifacts_root.resolve(),
         state_dir=state_dir,
         query_log_enabled=_bool("QUERY_LOG_ENABLED", True),
