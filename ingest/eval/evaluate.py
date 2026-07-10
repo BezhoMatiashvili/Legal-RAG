@@ -89,20 +89,35 @@ def build_fake_corpus(gold, bodies, chunk_cfg, count_tokens, *, n_distractors=20
     sources = sorted({s for s, _ in gold_set})
     per_source = max(1, n_distractors // len(sources))
     for source in sources:
-        path = goldset.DEFAULT_SNAPSHOT_DOCS / f"{source}.jsonl"
         candidates: list[tuple[str, str]] = []
-        with open(path, encoding="utf-8") as f:
-            for line in f:
-                if not line.strip():
-                    continue
-                d = json.loads(line)
-                if (source, d["document_id"]) not in gold_set:
-                    candidates.append((d["document_id"], d["body_markdown"]))
-                if len(candidates) >= scan_cap:
-                    break
+        seen_ids: set[str] = set()
+        # Primary root first keeps the v1 candidate order (hence rng.sample) unchanged.
+        for path in bodies.source_files(source):
+            if len(candidates) >= scan_cap:
+                break
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    d = json.loads(line)
+                    if (source, d["document_id"]) not in gold_set and d["document_id"] not in seen_ids:
+                        seen_ids.add(d["document_id"])
+                        candidates.append((d["document_id"], d["body_markdown"]))
+                    if len(candidates) >= scan_cap:
+                        break
         for document_id, body in rng.sample(candidates, min(per_source, len(candidates))):
             add(source, document_id, body)
     return records
+
+
+def eval_set_knob(version: str) -> dict[str, str]:
+    """config_hash material for the eval-set choice.
+
+    v1 contributes nothing so every historical row's hash stays byte-stable (same
+    default-off rule as the other knobs); any other version folds in as a knob, giving
+    v2 runs their own forever-comparable config rows.
+    """
+    return {} if version == "v1" else {"eval_set": version}
 
 
 def run_mode(backend, gold, rel, mode, level, k):
@@ -213,6 +228,9 @@ def main() -> None:
     ap.add_argument("--mmr-lambda", type=float, default=None, help="diversity: MMR trade-off 0..1")
     ap.add_argument("--translate-queries", metavar="PATH", default=None,
                     help="I2: authored EN→KA query-translation JSON (embeds the KA text)")
+    ap.add_argument("--golden-set", choices=sorted(goldset.EVAL_SETS), default="v1",
+                    help="I5: eval-set version; v2 adds pairs whose gold docs may live in "
+                         "snapshots/v2-delta (v1 stays the frozen gating yardstick)")
     ap.add_argument("--ab", action="store_true",
                     help="paired A/B: --mode with knobs OFF (A) vs the given knobs ON (B)")
     ap.add_argument("--log", action="store_true", help="append runs to the experiment log")
@@ -228,9 +246,12 @@ def main() -> None:
     tok_kind = args.tokenizer or ("word" if args.backend == "fake" else "bge")
     count_tokens = _token_counter(tok_kind, cfg.embed_model)
 
-    gold = goldset.load_golden_set()
-    holdout = goldset.load_holdout()
-    bodies = goldset.SnapshotBodies(needed=goldset.gold_docs(gold))
+    eval_spec = goldset.EVAL_SETS[args.golden_set]
+    gold = goldset.load_golden_set(eval_spec.gold)
+    holdout = goldset.load_holdout(eval_spec.holdout)
+    bodies = goldset.SnapshotBodies(
+        root=eval_spec.roots[0], needed=goldset.gold_docs(gold), extra_roots=eval_spec.roots[1:]
+    )
 
     n_spans = goldset.reground(gold, bodies)
     goldset.enforce_holdout(gold, holdout)
@@ -238,7 +259,7 @@ def main() -> None:
     print(
         f"Loaded {len(gold)} gold queries · {len(holdout)} holdout docs · "
         f"re-grounding {n_spans}/0 drift · span-coverage {n_linted}/0 empty "
-        f"(eval_set={goldset.EVAL_SET_VERSION}, tokenizer={tok_kind})"
+        f"(eval_set={eval_spec.version}, tokenizer={tok_kind})"
     )
 
     rel = build_query_relevance(gold, bodies, chunk_cfg, count_tokens)
@@ -249,6 +270,12 @@ def main() -> None:
         from .translations import load_query_translations
 
         translations, translations_hash = load_query_translations(Path(args.translate_queries), gold)
+        uncovered = {q.query for q in gold if q.query_language == "en"} - set(translations)
+        if uncovered:
+            print(
+                f"WARNING: translations cover {len(translations)} EN queries; {len(uncovered)} EN "
+                f"gold queries have none (wrong file for --golden-set {args.golden_set}?)"
+            )
     knobs = {
         "rerank_candidates": args.rerank_candidates, "fusion": args.fusion,
         "prefetch_limit": args.prefetch_limit, "hnsw_ef": args.hnsw_ef, "rescore": rescore,
@@ -260,6 +287,8 @@ def main() -> None:
                     if v not in (None, "rrf") and k != "translations"}
     if translations_hash:
         active_knobs["translate_queries"] = translations_hash
+    # I5: non-default eval set is eval config too — v1 folds nothing, so history is stable.
+    active_knobs.update(eval_set_knob(args.golden_set))
     # Env-selected reranker backend (I7) is eval config too — fold non-default into the hash.
     if args.backend == "qdrant" and cfg.rerank_enabled and cfg.rerank_backend != "torch":
         active_knobs["rerank_backend"] = cfg.rerank_backend
@@ -297,12 +326,13 @@ def main() -> None:
                   f"p={c.p_value:.4f} → {c.verdict}")
 
     if args.log:
-        eval_hash = goldset.eval_set_hash()
+        eval_hash = goldset.eval_set_hash(eval_spec.gold)
         for label, (scores, lat) in results.items():
             base_mode = label.split("+")[0]
             # In --ab, the base label logs with knobs OFF; every other run logs the active
             # knobs. Plain runs (no knobs) hash exactly as before → historical rows comparable.
-            eff = {} if (args.ab and label == base_mode) else active_knobs
+            # The eval set is not a knob you can switch off — the --ab base keeps it.
+            eff = dict(eval_set_knob(args.golden_set)) if (args.ab and label == base_mode) else active_knobs
             eff_rc = eff.get("rerank_candidates") or cfg.rerank_candidates
             ch = explog.config_hash({
                 "mode": base_mode, "relevance": args.relevance, "top_k": args.top_k,
@@ -312,7 +342,7 @@ def main() -> None:
             })
             record = {
                 "timestamp": explog.now_iso(),
-                "eval_set_version": goldset.EVAL_SET_VERSION,
+                "eval_set_version": eval_spec.version,
                 "eval_set_hash": eval_hash,
                 "config_hash": ch,
                 "mode": label,

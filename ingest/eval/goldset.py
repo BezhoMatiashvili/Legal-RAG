@@ -16,7 +16,7 @@ load we:
 import hashlib
 import json
 import unicodedata
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -27,7 +27,33 @@ INGEST_ROOT = EVAL_DIR.parent
 DEFAULT_GOLD = EVAL_DIR / "golden_set_v1.jsonl"
 DEFAULT_HOLDOUT = EVAL_DIR / "holdout_doc_ids.json"
 DEFAULT_SNAPSHOT_DOCS = INGEST_ROOT / "snapshots" / "v1" / "docs"
-EVAL_SET_VERSION = "v1"
+EVAL_SET_VERSION = "v1"  # default eval set; runs select others via EVAL_SETS
+
+DEFAULT_GOLD_V2 = EVAL_DIR / "golden_set_v2.jsonl"
+DEFAULT_HOLDOUT_V2 = EVAL_DIR / "holdout_doc_ids_v2.json"
+V2_DELTA_DOCS = INGEST_ROOT / "snapshots" / "v2-delta" / "docs"
+
+
+@dataclass(frozen=True)
+class EvalSetSpec:
+    """One eval-set version: golden file, holdout file, and snapshot roots (primary first).
+
+    ``roots`` order is load-bearing: on a ``document_id`` collision the primary (first)
+    root's body wins, so a delta snapshot can never shadow the frozen v1 bodies.
+    """
+
+    version: str
+    gold: Path
+    holdout: Path
+    roots: tuple[Path, ...]
+
+
+EVAL_SETS: dict[str, EvalSetSpec] = {
+    "v1": EvalSetSpec("v1", DEFAULT_GOLD, DEFAULT_HOLDOUT, (DEFAULT_SNAPSHOT_DOCS,)),
+    "v2": EvalSetSpec(
+        "v2", DEFAULT_GOLD_V2, DEFAULT_HOLDOUT_V2, (DEFAULT_SNAPSHOT_DOCS, V2_DELTA_DOCS)
+    ),
+}
 
 
 def _nfc(text: str) -> str:
@@ -121,32 +147,77 @@ class SnapshotBodies:
     Pass ``needed`` (the set of ``(source, document_id)`` the harness will request) to keep
     only those bodies in memory — the docs jsonl are multi-GB, so loading everything would
     cost gigabytes. ``needed=None`` loads a whole source (general use, not the eval path).
+
+    ``extra_roots`` layers additive snapshot deltas (e.g. ``snapshots/v2-delta/docs``) under
+    the primary root: all roots are consulted, the primary wins on a doc-id collision, and a
+    source file may be absent from any root as long as at least one root has it. The cache
+    stays keyed per (root, source), so a v1-only instance and a multi-root instance share
+    the v1 entries.
     """
 
-    def __init__(self, root: Path = DEFAULT_SNAPSHOT_DOCS, needed: set[tuple[str, str]] | None = None):
-        self.root = Path(root)
+    def __init__(
+        self,
+        root: Path = DEFAULT_SNAPSHOT_DOCS,
+        needed: set[tuple[str, str]] | None = None,
+        *,
+        extra_roots: Sequence[Path] = (),
+    ):
+        self.roots = [Path(root), *(Path(r) for r in extra_roots)]
+        self.root = self.roots[0]
         self._needed: dict[str, set[str]] | None = None
         if needed is not None:
             self._needed = {}
             for source, document_id in needed:
                 self._needed.setdefault(source, set()).add(document_id)
 
+    def source_files(self, source: str) -> list[Path]:
+        """Existing per-root docs files for ``source``, primary root first."""
+        return [r / f"{source}.jsonl" for r in self.roots if (r / f"{source}.jsonl").exists()]
+
+    def _merged_cache(self, source: str) -> dict[str, str]:
+        merged: dict[str, str] = {}
+        for root in reversed(self.roots):  # primary applied last → wins on collision
+            merged.update(_SOURCE_CACHE.get((str(root), source), {}))
+        return merged
+
     def _load_source(self, source: str) -> dict[str, str]:
         want = None if self._needed is None else self._needed.get(source, set())
-        key = (str(self.root), source)
-        cached = _SOURCE_CACHE.get(key, {})
-        if want is not None and want <= set(cached):
-            return cached  # everything we need is already loaded
-        table = dict(cached)
-        with open(self.root / f"{source}.jsonl", encoding="utf-8") as f:
-            for line in f:
-                if not line.strip():
-                    continue
-                d = json.loads(line)
-                if want is None or d["document_id"] in want:
-                    table[d["document_id"]] = d["body_markdown"]
-        _SOURCE_CACHE[key] = table
-        return table
+        if len(self.roots) == 1:
+            key = (str(self.root), source)
+            cached = _SOURCE_CACHE.get(key, {})
+            if want is not None and want <= set(cached):
+                return cached  # everything we need is already loaded
+            table = dict(cached)
+            with open(self.root / f"{source}.jsonl", encoding="utf-8") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    d = json.loads(line)
+                    if want is None or d["document_id"] in want:
+                        table[d["document_id"]] = d["body_markdown"]
+            _SOURCE_CACHE[key] = table
+            return table
+
+        merged = self._merged_cache(source)
+        if want is not None and want <= set(merged):
+            return merged  # everything we need is already loaded across the roots
+        paths = [root / f"{source}.jsonl" for root in self.roots]
+        if not any(p.exists() for p in paths):
+            raise FileNotFoundError(f"no docs file for source {source!r} in any snapshot root: {paths}")
+        for root, path in zip(self.roots, paths):
+            if not path.exists():
+                continue
+            key = (str(root), source)
+            table = dict(_SOURCE_CACHE.get(key, {}))
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    d = json.loads(line)
+                    if want is None or d["document_id"] in want:
+                        table[d["document_id"]] = d["body_markdown"]
+            _SOURCE_CACHE[key] = table
+        return self._merged_cache(source)
 
     def body(self, source: str, document_id: str) -> str:
         try:
