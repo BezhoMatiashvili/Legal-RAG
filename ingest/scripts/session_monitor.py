@@ -745,6 +745,92 @@ def gpu_state() -> dict:
     return st
 
 
+# --- I6 re-embed pipeline panel (2026-07-10) --------------------------------------
+# Stage markers emitted by scripts/runpod_orchestrate_reembed.py (O.log lines) — ordered;
+# the LAST marker seen wins, so the panel tracks the pipeline monotonically.
+_REEMBED_STAGES = [
+    ("packaging payload", "packaging rows"),
+    ("provisioned pod", "pod provisioned"),
+    ("payload push", "uploading rows to pod"),
+    ("reembed launched", "embedding on GPU (v2 headers)"),
+    ("DONE marker", "embed complete"),
+    ("tunnel up", "eval over tunnel (hybrid)"),
+    ("rerank server healthy", "eval over tunnel (rerank@50)"),
+    ("GATE verdict: PASS", "GATE PASS — pulling snapshot"),
+    ("GATE verdict: FAIL", "GATE FAIL — nothing restored"),
+    ("snapshot pulled", "restoring locally as georgian_legal_v2"),
+    ("restored `georgian_legal_v2`", "restored locally"),
+    ("I6 REEMBED COMPLETE", "complete"),
+]
+
+
+def _args_alive(substr: str) -> bool:
+    """True iff a python/bash process's FULL argument string contains ``substr``.
+
+    Unlike ``_script_alive`` (per-token match), this handles multi-word needles like
+    ``-m ingest watch``; tail/grep watchers are excluded by the exe check."""
+    for r in _ps_rows():
+        parts = r["args"].split()
+        if len(parts) < 2:
+            continue
+        exe = parts[0].rsplit("/", 1)[-1]
+        if exe.startswith(("python", "bash")) and substr in " ".join(parts[1:]):
+            return True
+    return False
+
+
+def reembed_state() -> dict:
+    """The post-scrape I6 pipeline: local delta embed → orchestrated v2 re-embed."""
+    st: dict = {"delta": None, "orch": None}
+
+    dlog = GPU_WORKDIR / "delta_embed_all.log"
+    try:
+        lines = dlog.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        lines = []
+    if lines:
+        stage = "starting"
+        for ln in lines:
+            if "embedding source:" in ln:
+                stage = "embedding " + ln.split("embedding source:")[-1].strip(" =")
+            elif "re-verify coverage" in ln:
+                stage = "verifying coverage"
+            elif "DELTA EMBED ALL DONE" in ln:
+                stage = "complete"
+            elif "MISSING" in ln and " 0 MISSING" not in ln:
+                stage = "verify: " + ln.strip()[:80]
+        alive = _args_alive("delta_embed_all.sh") or _args_alive("-m ingest watch")
+        if not alive and stage not in ("complete",) and not stage.startswith("verify"):
+            stage += " (process gone?)"
+        st["delta"] = {"stage": stage, "tail": lines[-1][-160:], "alive": alive}
+
+    olog = GPU_WORKDIR / "reembed_v2.log"
+    try:
+        olines = olog.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        olines = []
+    if olines:
+        stage = "starting"
+        cost = None
+        for ln in olines:
+            for marker, label in _REEMBED_STAGES:
+                if marker in ln:
+                    stage = label
+            if "COST:" in ln:
+                cost = ln.split("COST:")[-1].strip()
+        alive = _script_alive("runpod_orchestrate_reembed.py")
+        if not alive and stage != "complete":
+            stage += " (orchestrator gone?)"
+        orch = {"stage": stage, "tail": olines[-1][-160:], "alive": alive, "cost": cost}
+        try:
+            orch["verdict"] = json.loads(
+                (GPU_WORKDIR / "out_reembed_v2" / "verdict.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            orch["verdict"] = None
+        st["orch"] = orch
+    return st
+
+
 def build_state() -> dict:
     return {
         "now": time.strftime("%H:%M:%S"),
@@ -755,6 +841,7 @@ def build_state() -> dict:
         "scrape": scrape_state(),
         "qdrant": qdrant_state(),
         "coverage": coverage_state(),
+        "reembed": reembed_state(),
         "processes": processes_state(),
     }
 

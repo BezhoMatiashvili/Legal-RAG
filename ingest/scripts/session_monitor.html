@@ -132,6 +132,12 @@
     <div class="card" id="gpucard"><div class="empty">no delta-embed run yet</div></div>
   </div>
 
+  <h2 class="section">Pipeline · I6 v2 re-embed (delta → re-baseline → GPU re-embed → gate)</h2>
+  <div class="two" style="margin-bottom:6px">
+    <div class="card" id="deltacard"><div class="empty">no post-scrape delta embed yet</div></div>
+    <div class="card" id="reembedcard"><div class="empty">I6 orchestrator not launched yet</div></div>
+  </div>
+
   <h2 class="section">Embedding coverage → Qdrant</h2>
   <div class="card" id="covcard" style="margin-bottom:6px">
     <div class="empty">no coverage report yet — run <code>scripts/verify_all_embedded.py</code></div>
@@ -220,6 +226,7 @@ function render(s){
   renderScrape(s.scrape||{active:false});
   renderGpu(s.gpu||{active:false});
   renderCoverage(s.coverage||{}, s.qdrant||{}, s.gpu||{});
+  renderReembed(s.reembed||{});
 
   lastProcs = s.processes || [];
   renderProcs();
@@ -307,6 +314,31 @@ function covSteps(cov, g){
   const detail=cov.verify_running?cov.verify_detail:cov.merge_running?cov.merge_detail:null;
   return `<div class="steps">${steps}</div>`
     +(detail?`<div class="said" style="margin-top:8px">⏳ ${esc(detail)}</div>`:'');
+}
+
+function renderReembed(r){
+  const d = r.delta, o = r.orch;
+  if (d){
+    const cls = d.stage==='complete' ? 'ok' : (d.alive ? 'warn' : 'bad');
+    $('deltacard').innerHTML =
+      `<div><b>Post-scrape delta embed</b> <span class="chip ${cls}">${esc(d.stage)}</span></div>
+       <div class="muted" style="margin-top:7px;font-size:12px">${esc(d.tail||'')}</div>`;
+  }
+  if (o){
+    const v = o.verdict;
+    const cls = /complete|PASS|restored/.test(o.stage) ? 'ok' : (/FAIL|gone/.test(o.stage) ? 'bad' : 'warn');
+    let vhtml = '';
+    if (v && v.rerank){
+      vhtml = `<div style="margin-top:6px;font-size:12.5px">gate: <b class="${v.pass?'ok':'bad'}">${v.pass?'PASS':'FAIL'}</b>
+        · rerank nDCG@10 <b>${(v.rerank.ndcg10||0).toFixed(3)}</b> (v1: 0.320)
+        · R@10 <b>${(v.rerank.recall10||0).toFixed(3)}</b></div>`;
+    }
+    $('reembedcard').innerHTML =
+      `<div><b>I6 orchestrator (v2 headers, 4-GPU)</b> <span class="chip ${cls}">${esc(o.stage)}</span></div>
+       ${vhtml}
+       ${o.cost?`<div class="muted" style="margin-top:4px;font-size:12px">cost: ${esc(o.cost)}</div>`:''}
+       <div class="muted" style="margin-top:7px;font-size:12px">${esc(o.tail||'')}</div>`;
+  }
 }
 
 function renderCoverage(cov, qd, gpu){

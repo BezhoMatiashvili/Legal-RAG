@@ -43,9 +43,15 @@ EMBED_SH = Path(__file__).resolve().parent / "runpod_reembed_v2.sh"
 RERANK_SERVER = Path(__file__).resolve().parent / "runpod_rerank_server.py"
 TRANSLATIONS = "eval/query_translations_v1.json"
 
-# Poll deadline scales with GPU speed (2.64M chunks; ~7.7k/min on a 4090).
-DEADLINE_BY_GPU = {"NVIDIA GeForce RTX 4090": 9 * 3600}
-DEADLINE_DEFAULT = 16 * 3600
+# 4-way sharded embed (user-requested speedup). A5000s first: at 4×$0.27/hr the whole
+# pipeline lands ≈$4.6; 4×4090 would bill ≈$9 — too close to the $9.85 balance.
+GPU_COUNT = 4
+GPU_PREFERENCE = ["NVIDIA RTX A5000", "NVIDIA GeForce RTX 3090", "NVIDIA GeForce RTX 4090"]
+# Poll deadline scales with per-GPU speed (2.64M chunks / 4 shards).
+DEADLINE_BY_GPU = {"NVIDIA GeForce RTX 4090": 3 * 3600,
+                   "NVIDIA GeForce RTX 3090": 4 * 3600,
+                   "NVIDIA RTX A5000": 5 * 3600}
+DEADLINE_DEFAULT = 8 * 3600
 POLL_S = 60
 DEAD_CHECKS = 6
 TUNNEL_QDRANT = 16333
@@ -125,6 +131,41 @@ def step_package() -> str:
     return passphrase
 
 
+def step_provision_multi(pubkey: str) -> tuple[str, str, float]:
+    """Provision a GPU_COUNT-GPU pod, cheapest-capable type first (O.step_provision is 1-GPU)."""
+    mutation = ("mutation($input:PodFindAndDeployOnDemandInput!){ "
+                "podFindAndDeployOnDemand(input:$input){ id imageName machineId } }")
+    for gpu_id in GPU_PREFERENCE:
+        price, stock = O.gpu_price(gpu_id)
+        if price is None:
+            O.log(f"  {gpu_id}: no secure price/stock — skipping")
+            continue
+        O.log(f"  {gpu_id} ×{GPU_COUNT}: ${price}/GPU/hr (${price * GPU_COUNT:.2f}/hr) stock={stock}")
+        for attempt in range(1, 4):
+            variables = {"input": {
+                "cloudType": "SECURE", "gpuCount": GPU_COUNT, "gpuTypeId": gpu_id,
+                "minMemoryInGb": 20, "minVcpuCount": 8, "name": "georgian-legal-reembed-v2",
+                "imageName": O.IMAGE, "dockerArgs": "", "ports": "22/tcp",
+                "volumeInGb": 120, "containerDiskInGb": 60, "volumeMountPath": "/workspace",
+                "supportPublicIp": True, "startSsh": True,
+                "env": [{"key": "PUBLIC_KEY", "value": pubkey}],
+            }}
+            try:
+                data = O.gql(mutation, variables)
+            except RuntimeError as e:
+                O.log(f"  deploy attempt {attempt} error: {e}")
+                time.sleep(20)
+                continue
+            pod = data.get("podFindAndDeployOnDemand")
+            if pod and pod.get("id"):
+                (O.WORKDIR / "pod.id").write_text(pod["id"])
+                O.log(f"provisioned {GPU_COUNT}x{gpu_id} pod {pod['id']} (${price * GPU_COUNT:.2f}/hr)")
+                return pod["id"], gpu_id, price * GPU_COUNT
+            O.log(f"  deploy attempt {attempt}: null (no {GPU_COUNT}x capacity), retrying...")
+            time.sleep(20)
+    raise RuntimeError(f"could not provision any {GPU_COUNT}-GPU pod (preference exhausted)")
+
+
 def step_launch(ip: str, port: int, passphrase: str) -> None:
     O.push_content(ip, port, "/dev/shm/p.env",
                    "export PASSPHRASE=%s\n" % shlex.quote(passphrase), mode="600")
@@ -140,7 +181,7 @@ def step_launch(ip: str, port: int, passphrase: str) -> None:
         "openssl enc -d -aes-256-cbc -pbkdf2 -pass env:PASSPHRASE "
         "-in payload.tar.enc | tar xf -\n"
         f"export COLLECTION_NAME={V2_COLLECTION} QDRANT_VER={O.QDRANT_VER} "
-        "EMBED_BATCH_SIZE=256 WORK=/workspace SHARDS=1\n"
+        f"EMBED_BATCH_SIZE=256 WORK=/workspace SHARDS={GPU_COUNT}\n"
         "bash /workspace/runpod_reembed_v2.sh\n"
         'echo "EXIT=$?" >> /workspace/out/embed.log\n'
     )
@@ -320,7 +361,7 @@ def main() -> None:
     pubkey = O.step_keypair()
     verdict = False
     try:
-        O._pod_id, gpu_used, O._price = O.step_provision(pubkey)
+        O._pod_id, gpu_used, O._price = step_provision_multi(pubkey)
         O._provisioned_at = time.time()
         O._ip, O._port = O.step_wait_ssh(O._pod_id)
         O.ensure_pod_tools(O._ip, O._port)
