@@ -149,6 +149,42 @@
   "q193": {
    "query": "According to judge Manuchar Kapanadze's ruling No. 1g-48 of 16 January 2015 at the Tbilisi Court of Appeals investigative panel, when is the presence of a legal entity's representative mandatory during a seizure or search?",
    "ka": "მოსამართლე მანუჩარ კაპანაძის 2015 წლის 16 იანვრის 1გ-48 განჩინების მიხედვით (თბილისის სააპელაციო სასამართლოს საგამოძიებო კოლეგია), როდის არის სავალდებულო იურიდიული პირის წარმომადგენლის დასწრება ამოღების ან ჩხრეკის დროს?"
+  },
+  "q345": {
+   "query": "Why does Sandro Urushadze's constitutional complaint argue that Georgia's military conscription deferral for an only child discriminates based on the parent's sex?",
+   "ka": "რატომ ამტკიცებს სანდრო ურუშაძის კონსტიტუციური სარჩელი, რომ ერთადერთი შვილისთვის სამხედრო გაწვევის გადავადების ქართული წესი მშობლის სქესის ნიშნით დისკრიმინაციულია?"
+  },
+  "q332": {
+   "query": "Can the owner of seized bank accounts in Georgia challenge the court's seizure order without holding the status of an accused? This was contested by the Georgian Development Research Institute after its accounts at Progress Bank were attached.",
+   "ka": "შეუძლია თუ არა დაყადაღებული საბანკო ანგარიშების მესაკუთრეს საქართველოში სასამართლოს ყადაღის განჩინების გასაჩივრება, თუ მას ბრალდებულის სტატუსი არ აქვს? ეს გაასაჩივრა „საქართველოს განვითარების კვლევითმა ინსტიტუტმა“ „პროგრეს ბანკში“ არსებული ანგარიშების დაყადაღების შემდეგ."
+  },
+  "q347": {
+   "query": "In Khashuri district court case 130210119003041187 about an installment car sale, did the seller who took the vehicle back have to refund the money the buyer had already paid?",
+   "ka": "ხაშურის რაიონული სასამართლოს საქმეში 130210119003041187 ავტომანქანის განვადებით ნასყიდობის თაობაზე, მოეთხოვა თუ არა გამყიდველს, რომელმაც მანქანა უკან დაიბრუნა, მყიდველის მიერ უკვე გადახდილი თანხის დაბრუნება?"
+  },
+  "q337": {
+   "query": "How often are sessions of Georgia's pardon commission convened under presidential decree No 441 of 2007, which amended decree No 277 on the rules for granting clemency, and who convenes them?",
+   "ka": "პრეზიდენტის 2007 წლის №441 ბრძანებულების მიხედვით, რომლითაც ცვლილება შევიდა შეწყალების გამოყენების წესის შესახებ №277 ბრძანებულებაში, რამდენად ხშირად მოიწვევა შეწყალების კომისიის სხდომები და ვინ იწვევს მათ?"
+  },
+  "q353": {
+   "query": "By what deadline did Georgian government ordinance No. 1641 of 2016 require Georgian Railway to complete the Tbilisi railway bypass project?",
+   "ka": "რა ვადაში მოეთხოვა სს „საქართველოს რკინიგზას“ თბილისის შემოვლითი რკინიგზის პროექტის დასრულება საქართველოს მთავრობის 2016 წლის №1641 განკარგულებით?"
+  },
+  "q342": {
+   "query": "How much money did the Georgian government allocate from its reserve fund under ordinance No. 1760 of 2017 for customs clearance of a vehicle transferred by the Ministry of Foreign Affairs to the governor's administration?",
+   "ka": "რა ოდენობის თანხა გამოუყო საქართველოს მთავრობამ სარეზერვო ფონდიდან 2017 წლის №1760 განკარგულებით გუბერნატორის ადმინისტრაციას საგარეო საქმეთა სამინისტროს მიერ გადაცემული ავტომანქანის განბაჟებისთვის?"
+  },
+  "q334": {
+   "query": "What instruction did the Council of Ministers of the Georgian SSR approve by its resolution No. 558 of 29 August 1957 concerning registration of civil status acts?",
+   "ka": "რა ინსტრუქცია დაამტკიცა საქართველოს სსრ მინისტრთა საბჭომ 1957 წლის 29 აგვისტოს №558 დადგენილებით მოქალაქეობრივი მდგომარეობის აქტების რეგისტრაციასთან დაკავშირებით?"
+  },
+  "q330": {
+   "query": "Under the Georgian SSR Civil Code, how did a refutation have to be made if information defaming a person's honor and dignity was published in the press and was untrue?",
+   "ka": "საქართველოს სსრ სამოქალაქო სამართლის კოდექსის მიხედვით, როგორ უნდა მომხდარიყო უარყოფა, თუ პირის პატივისა და ღირსების შემლახველი ცნობები პრესაში იყო გავრცელებული და სინამდვილეს არ შეეფერებოდა?"
+  },
+  "q339": {
+   "query": "What did the Georgian National Archive letter No. 69/34655 establish about the household members in Public Registry complaint No. 36287/17?",
+   "ka": "რა დაადგინა საქართველოს ეროვნული არქივის №69/34655 წერილმა კომლის წევრების შესახებ საჯარო რეესტრის №36287/17 საჩივრის ფარგლებში?"
   }
  }
 }
