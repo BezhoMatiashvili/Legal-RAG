@@ -28,7 +28,9 @@ def test_config_rejects_unknown_backend(monkeypatch):
 def test_fingerprint_unchanged_for_torch_changes_for_onnx():
     torch_cfg = _cfg(rerank_backend="torch", rerank_enabled=True)
     onnx_cfg = _cfg(rerank_backend="onnx", rerank_enabled=True)
-    assert retrieval_fingerprint(torch_cfg) == retrieval_fingerprint(_cfg(rerank_enabled=True))
+    # torch is the fingerprint-neutral default; onnx must fork the fingerprint.
+    assert retrieval_fingerprint(torch_cfg) == retrieval_fingerprint(
+        _cfg(rerank_backend="torch", rerank_enabled=True))
     assert retrieval_fingerprint(onnx_cfg) != retrieval_fingerprint(torch_cfg)
 
 

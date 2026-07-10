@@ -42,6 +42,17 @@ def test_citation_existence_check_in_search_and_get_document():
 
 
 def test_i4_changes_nothing_in_serving_fingerprint():
-    # Docstrings are not retrieval config: fingerprint must equal the pre-I4 value
-    # for the same env (rerank@80 default env → 06a64f548fcb4d59; @50 → 81c807b279399098).
-    assert retrieval_fingerprint(load_config()) in ("06a64f548fcb4d59", "81c807b279399098")
+    # Docstrings are not retrieval config: the fingerprint of each known serving config
+    # must still equal its historical value (env-independent via explicit replace).
+    import dataclasses
+
+    base = dataclasses.replace(load_config(), rerank_enabled=True, rerank_backend="torch",
+                               rerank_min_score=0.3)
+    known = {
+        ("torch", 80): "06a64f548fcb4d59",   # Phase C shipped config
+        ("torch", 50): "81c807b279399098",   # Phase C recommended config
+        ("onnx", 50): "471ee93fc0199b03",    # I7 serving flip (2026-07-10)
+    }
+    for (backend, rc), expect in known.items():
+        cfg = dataclasses.replace(base, rerank_backend=backend, rerank_candidates=rc)
+        assert retrieval_fingerprint(cfg) == expect, (backend, rc)
