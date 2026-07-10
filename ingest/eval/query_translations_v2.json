@@ -117,6 +117,38 @@
   "q126": {
    "query": "Is a construction permit required to place a non-volumetric advertising sign as a sticker on a building facade on Vazha-Pshavela Avenue in Tbilisi?",
    "ka": "საჭიროა თუ არა მშენებლობის ნებართვა არამოცულობითი სარეკლამო აბრის სტიკერის სახით განთავსებისთვის შენობის ფასადზე ვაჟა-ფშაველას გამზირზე თბილისში?"
+  },
+  "q182": {
+   "query": "Is imprisonment as a criminal punishment for marijuana consumption under Article 273 of the Georgian Criminal Code compatible with the Constitution?",
+   "ka": "შეესაბამება თუ არა კონსტიტუციას სისხლის სამართლის კოდექსის 273-ე მუხლით მარიხუანის მოხმარებისთვის სასჯელად თავისუფლების აღკვეთის გამოყენება?"
+  },
+  "q168": {
+   "query": "Can a conviction for marijuana use under Article 273 of the Georgian Criminal Code be reviewed as a newly discovered circumstance after the Constitutional Court's 30 November 2017 decision?",
+   "ka": "შეიძლება თუ არა 273-ე მუხლით მარიხუანის მოხმარებისთვის გამოტანილი განაჩენის გადასინჯვა ახლად გამოვლენილ გარემოებათა გამო საკონსტიტუციო სასამართლოს 2017 წლის 30 ნოემბრის გადაწყვეტილების შემდეგ?"
+  },
+  "q197": {
+   "query": "Can a Georgian court recognize a 1979 marriage registration as valid when the marriage act record lacks the spouses' signatures and a biometric passport was refused for that reason?",
+   "ka": "შეუძლია თუ არა სასამართლოს 1979 წლის ქორწინების რეგისტრაციის ნამდვილად ცნობა, როდესაც ქორწინების აქტის ჩანაწერში მექორწინეთა ხელმოწერა არ ფიქსირდება და ამ მიზეზით ბიომეტრიულ პასპორტზე უარი ეთქვათ?"
+  },
+  "q156": {
+   "query": "What punishment did the Gori District Court impose on a father found guilty of domestic violence against his 17-year-old daughter committed in the presence of another minor child?",
+   "ka": "რა სასჯელი დაუნიშნა გორის რაიონულმა სასამართლომ მამას, რომელიც დამნაშავედ ცნო 17 წლის ქალიშვილის მიმართ ოჯახში ძალადობისთვის, ჩადენილი სხვა არასრულწლოვნის თანდასწრებით?"
+  },
+  "q176": {
+   "query": "Can a certificate of inheritance and a subsequent gift contract be annulled in Georgia when the claimant heir missed the six-month period for accepting the estate?",
+   "ka": "შეიძლება თუ არა სამკვიდრო მოწმობისა და შემდგომი ჩუქების ხელშეკრულების ბათილად ცნობა, როდესაც მოსარჩელე მემკვიდრემ სამკვიდროს მიღების ექვსთვიანი ვადა გაუშვა?"
+  },
+  "q198": {
+   "query": "How are disputed healthcare cases from 2014 and 2015 reimbursed under Georgia's decree approving the 2016 state health programmes?",
+   "ka": "როგორ ანაზღაურდება 2014 და 2015 წლების სადავო სამედიცინო შემთხვევები 2016 წლის ჯანმრთელობის დაცვის სახელმწიფო პროგრამების დამტკიცების შესახებ დადგენილების მიხედვით?"
+  },
+  "q180": {
+   "query": "Why did the National Agency of Public Registry reject administrative complaint No. 43770/17 against the 18 February 2025 refusal to register a public-law restriction on a Tbilisi property?",
+   "ka": "რატომ არ დააკმაყოფილა საჯარო რეესტრის ეროვნულმა სააგენტომ №43770/17 ადმინისტრაციული საჩივარი თბილისში მდებარე უძრავ ნივთზე საჯარო-სამართლებრივი შეზღუდვის რეგისტრაციაზე 2025 წლის 18 თებერვლის უარის წინააღმდეგ?"
+  },
+  "q193": {
+   "query": "According to judge Manuchar Kapanadze's ruling No. 1g-48 of 16 January 2015 at the Tbilisi Court of Appeals investigative panel, when is the presence of a legal entity's representative mandatory during a seizure or search?",
+   "ka": "მოსამართლე მანუჩარ კაპანაძის 2015 წლის 16 იანვრის 1გ-48 განჩინების მიხედვით (თბილისის სააპელაციო სასამართლოს საგამოძიებო კოლეგია), როდის არის სავალდებულო იურიდიული პირის წარმომადგენლის დასწრება ამოღების ან ჩხრეკის დროს?"
   }
  }
 }
