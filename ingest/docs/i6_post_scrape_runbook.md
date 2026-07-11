@@ -67,3 +67,33 @@ Qdrant → gate (rerank nDCG ≥ ref +0.02, no slice −0.02) → pull + restore
 - **FAIL:** nothing was restored; ledger row with the numbers; the $ spent bought the answer.
   Delete `~/gpu_embed_work/out_reembed_v2` leftovers.
 - Either way: verify `pods=[]`, record COST line, update memory.
+
+---
+
+## STATUS 2026-07-11: I6 SHELVED (corpus complete; blocked on GPU capacity + budget)
+
+Corpus completed on GPU (delta merged, 2,654,818 pts, 0 missing, green). I6 v2-header
+re-embed attempted but shelved:
+- **4-GPU / 1×4090 capacity unavailable** (RunPod SUPPLY_CONSTRAINT); only A5000 offered
+  (~3-4× slower → ~17h, doesn't fit time/budget).
+- **Batch-size perf bug FOUND + FIXED**: `reembed_v2.py` used BATCH=64 (starved the 4090s,
+  ~90/s on 2×4090); now `BATCH=int(os.getenv("EMBED_BATCH_SIZE") or 256)` → ~256/s expected.
+- Balance $4.71 — too tight for a 4090 (~$4.8 for a ~5.8h single-GPU run).
+
+**Everything is staged for a one-command relaunch when 4090 (or 2-4×4090) capacity +
+~$6-8 budget align:**
+1. Rows already exported: `.state/reembed_v2/rows` (14 files, 2,654,818). Re-export only if
+   the corpus changed again: `.venv/bin/python scripts/reembed_export.py --out .state/reembed_v2/rows`.
+2. References already computed: `.state/ref_v2.json` (v1-headers @ current corpus, v2 golden
+   set 337, rerank@50 nDCG **0.450** → gate needs **≥0.470**). Re-run `scratchpad/ref_v2_driver.sh`
+   only if the corpus changed.
+3. In `scripts/runpod_orchestrate_reembed.py`: set `GPU_COUNTS=[4,2,1]` (or `[2,1]`),
+   `GPU_PREFERENCE` 4090-first, `BUDGET_CEILING` to your funded amount (e.g. 6.5).
+4. Launch: `nohup .venv/bin/python scripts/runpod_orchestrate_reembed.py > ~/gpu_embed_work/reembed_v2.log 2>&1 &`
+   It embeds all chunks with v2 headers → evals over tunnel on the frozen v2 golden set →
+   gate (rerank nDCG ≥ ref+0.02, no slice regression) → restores `georgian_legal_v2` ONLY on PASS.
+   Progress bar: `python scripts/reembed_progress.py --total 2654818 --collection georgian_legal_v2 &`
+   + monitor :8770.
+
+Better still (per improvement.md I6): run it **piggybacked on the next re-embed** you do for
+any other reason, so it's not a standalone spend.
