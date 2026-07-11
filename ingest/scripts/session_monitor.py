@@ -835,6 +835,11 @@ def reembed_state() -> dict:
                 (GPU_WORKDIR / "out_reembed_v2" / "verdict.json").read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             orch["verdict"] = None
+        try:  # live embed progress from the pod-side poller (reembed_progress.py)
+            prog = json.loads((GPU_WORKDIR / "reembed_progress.json").read_text(encoding="utf-8"))
+            orch["progress"] = prog if "embedded" in prog else None
+        except (OSError, json.JSONDecodeError):
+            orch["progress"] = None
         st["orch"] = orch
     return st
 

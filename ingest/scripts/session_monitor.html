@@ -329,6 +329,16 @@ function renderReembed(r){
     const v = o.verdict;
     const cls = /complete|PASS|restored/.test(o.stage) ? 'ok' : (/FAIL|gone/.test(o.stage) ? 'bad' : 'warn');
     let vhtml = '';
+    const p = o.progress;
+    if (p && p.embedded != null){
+      const pct = p.pct || 0;
+      vhtml += `<div style="margin-top:8px">
+        <div style="display:flex;justify-content:space-between;font-size:12px;color:#c9d4e0">
+          <span><b>${p.embedded.toLocaleString()}</b> / ${p.total.toLocaleString()} embedded</span>
+          <span>${p.remaining.toLocaleString()} remaining · ${pct}%</span></div>
+        <div style="height:9px;background:var(--panel2);border:1px solid var(--border);border-radius:5px;overflow:hidden;margin-top:3px">
+          <div style="height:100%;width:${pct}%;background:var(--green)"></div></div></div>`;
+    }
     if (v && v.rerank){
       vhtml = `<div style="margin-top:6px;font-size:12.5px">gate: <b class="${v.pass?'ok':'bad'}">${v.pass?'PASS':'FAIL'}</b>
         · rerank nDCG@10 <b>${(v.rerank.ndcg10||0).toFixed(3)}</b> (v1: 0.320)
