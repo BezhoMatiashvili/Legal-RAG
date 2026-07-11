@@ -153,7 +153,8 @@ class QdrantBackend:
                  *, fusion: str = "rrf", prefetch_limit: int | None = None,
                  hnsw_ef: int | None = None, rescore: bool | None = None,
                  sparse_weight: float | None = None, max_per_doc: int | None = None,
-                 mmr_lambda: float | None = None, translations: dict[str, str] | None = None):
+                 mmr_lambda: float | None = None, translations: dict[str, str] | None = None,
+                 citation_route: str | None = None):
         self.cfg = cfg
         self.client = client
         self.embedder = embedder
@@ -171,6 +172,7 @@ class QdrantBackend:
         # Substituted before encoding, so routing/sparse/rerank all see the Georgian text;
         # queries without an entry (all KA ones) are untouched by construction.
         self.translations = translations
+        self.citation_route = citation_route  # I1: pin exact citation hits ("ids" | "full")
         self._bm25 = None  # BM25Index | FullCorpusBM25, built lazily in _ensure_bm25
         self._filter = None
 
@@ -299,6 +301,16 @@ class QdrantBackend:
         t0 = time.perf_counter()
         emb = self.embedder.encode_query(query)
         lat["embed"] = time.perf_counter() - t0
+
+        pinned = []
+        if self.citation_route:
+            from ingest.citations import citation_lookup, extract_citation
+
+            t0 = time.perf_counter()
+            ref = extract_citation(query, mode=self.citation_route)
+            if ref is not None:
+                pinned = citation_lookup(self.client, self.cfg.collection_name, emb.dense, ref)
+            lat["search"] += time.perf_counter() - t0
         coll = self.cfg.collection_name
         sp = self._search_params(models)
         want_vec = self.mmr_lambda is not None
@@ -342,7 +354,7 @@ class QdrantBackend:
                     limit=fetch_n, with_payload=True, with_vectors=want_vec,
                 )
                 points = res.points
-        lat["search"] = time.perf_counter() - t0
+        lat["search"] += time.perf_counter() - t0  # += : citation lookup time added above
 
         if mode == "rerank" and self.reranker is not None and points:
             from ingest.search import rerank_points
@@ -359,5 +371,10 @@ class QdrantBackend:
                                mmr_lambda=self.mmr_lambda, query_vec=emb.dense)
         else:
             points = points[:k]
+
+        if pinned:
+            from ingest.citations import pin_points
+
+            points = pin_points(pinned, points, k)
 
         return self._points_to_hits(points), lat

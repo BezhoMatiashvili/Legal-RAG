@@ -229,6 +229,8 @@ def main() -> None:
     ap.add_argument("--mmr-lambda", type=float, default=None, help="diversity: MMR trade-off 0..1")
     ap.add_argument("--translate-queries", metavar="PATH", default=None,
                     help="I2: authored EN→KA query-translation JSON (embeds the KA text)")
+    ap.add_argument("--citation-route", choices=("ids", "full"), default=None,
+                    help="I1: pin exact citation/alias matches above semantic hits")
     ap.add_argument("--golden-set", choices=sorted(goldset.EVAL_SETS), default="v2",
                     help="I5: eval-set version (default v2 — the gating yardstick since 2026-07-11, "
                          "frozen at 337 pairs, hash 753e2985315be3e4). Pass --golden-set v1 for the "
@@ -283,6 +285,7 @@ def main() -> None:
         "prefetch_limit": args.prefetch_limit, "hnsw_ef": args.hnsw_ef, "rescore": rescore,
         "sparse_weight": args.sparse_weight, "max_per_doc": args.max_per_doc,
         "mmr_lambda": args.mmr_lambda, "translations": translations,
+        "citation_route": args.citation_route,
     }
     # The raw translation dict never enters config_hash/logs — its file content hash does.
     active_knobs = {k: v for k, v in knobs.items()

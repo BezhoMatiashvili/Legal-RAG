@@ -50,6 +50,12 @@ def _device_opt(name: str) -> str | None:
     return raw
 
 
+def _route_opt(name: str) -> str | None:
+    """Citation-route mode: ``ids`` | ``full``; anything else (unset/empty/off) → None."""
+    raw = (os.getenv(name) or "").strip().lower()
+    return raw if raw in ("ids", "full") else None
+
+
 @dataclass(frozen=True)
 class Config:
     qdrant_url: str
@@ -82,6 +88,8 @@ class Config:
     # I6: v2 embed headers (№/date/status/consolidation in the embedded prefix).
     # Changing this INVALIDATES existing vectors — only flip together with a re-embed.
     embed_header_v2: bool
+    # I1: citation exact-match routing — None = off, "ids" | "full".
+    citation_route: str | None
     artifacts_root: Path
     state_dir: Path
     query_log_enabled: bool
@@ -122,6 +130,7 @@ def load_config() -> Config:
         chunk_overlap=_int("CHUNK_OVERLAP", 80),
         chunk_min_tokens=_int("CHUNK_MIN_TOKENS", 64),
         embed_header_v2=_bool("EMBED_HEADER_V2", False),
+        citation_route=_route_opt("CITATION_ROUTE"),
         artifacts_root=artifacts_root.resolve(),
         state_dir=state_dir,
         query_log_enabled=_bool("QUERY_LOG_ENABLED", True),
@@ -151,5 +160,7 @@ def retrieval_fingerprint(cfg: Config) -> str:
     # Conditional so the fingerprint is byte-stable while the knob is at its default (G5).
     if cfg.rerank_enabled and cfg.rerank_backend != "torch":
         material["rerank_backend"] = cfg.rerank_backend
+    if cfg.citation_route:  # conditional: fingerprint byte-stable while the knob is off (G5)
+        material["citation_route"] = cfg.citation_route
     blob = json.dumps(material, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(blob.encode()).hexdigest()[:16]

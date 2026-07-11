@@ -8,6 +8,7 @@ import re
 
 from qdrant_client import models
 
+from .citations import citation_lookup, extract_citation, pin_points
 from .config import Config
 
 _MKHEDRULI_RE = re.compile(r"[ა-ჿ]")
@@ -131,6 +132,15 @@ def hybrid_search(
     emb = embedder.encode_query(query)
     flt = build_filter(**filters)
 
+    # Citation exact-match routing (CITATION_ROUTE, I1): resolve an explicit citation through
+    # the keyword-indexed payload fields and pin its chunks above the semantic results. Skipped
+    # when the caller already filters. Knob off / no citation / no hit ⇒ unchanged path below.
+    pinned = []
+    if getattr(cfg, "citation_route", None) and flt is None:
+        ref = extract_citation(query, mode=cfg.citation_route)
+        if ref is not None:
+            pinned = citation_lookup(client, cfg.collection_name, emb.dense, ref)
+
     # How many candidates to fuse before reranking. With a reranker we want a deep pool
     # so the cross-encoder has real recall to work with; without one, the old top_k*5/50.
     diversity_on = max_per_doc is not None or mmr_lambda is not None
@@ -179,11 +189,12 @@ def hybrid_search(
             top_k=len(points) if diversity_on else top_k, min_score=rerank_min_score,
         )
     if diversity_on:
-        return diversify(points, top_k=top_k, max_per_doc=max_per_doc,
-                         mmr_lambda=mmr_lambda, query_vec=emb.dense)
-    if reranker is None:
-        return points[:top_k]
-    return points
+        points = diversify(points, top_k=top_k, max_per_doc=max_per_doc,
+                           mmr_lambda=mmr_lambda, query_vec=emb.dense)
+    elif reranker is None:
+        points = points[:top_k]
+    # Pin AFTER rerank/diversity so nothing can demote an exact citation hit.
+    return pin_points(pinned, points, top_k) if pinned else points
 
 
 def _point_dense(pt):
