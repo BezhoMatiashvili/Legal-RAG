@@ -239,6 +239,17 @@ unchanged), plus a manual smoke: 5 scripted hard queries through the direct CLI 
 
 ### I5 — Grow the golden set to 150–250 pairs  `[measurement power]`
 
+**Status (2026-07-11): LANDED (partial) — `golden_set_v2.jsonl` at 337 verified pairs** (103 frozen v1
+byte-identical + 234 new). Harness plumbing complete and committed: `--golden-set {v1,v2}` flag,
+multi-root `SnapshotBodies` (v1 + additive `snapshots/v2-delta/`), `scripts/build_snapshot_delta.py`,
+`scripts/validate_golden_batch.py`, `scripts/sample_goldset_candidates.py` (seed 20260710), 34 new
+tests. New `temporal` query_type added (breakdown() is data-driven). Acceptance eval logged (v2 hybrid
+nDCG@10 0.385 / R@10 0.528 @ 2,638,482 pts; v1 consistency reproduces recall10 0.359, eval_set_hash
+frozen). **Gating STAYS on v1 until user sign-off.** Remaining to hit 500 / per-slice n≥80: verify+append
+batches 6 (50, machine-clean) + b3-reworks (15) + author b7/b8 (~97) — authored/pending work preserved in
+`ingest/eval/.golden_v2_pending/`; the session subagent limit stopped the last three batches. This
+unblocks I1 (citation slice now has 67 pairs whose gold IS the cited act, `is_consolidated` base laws).
+
 **Why:** at n=103, IR-eval statistics (Webber/Moffat/Zobel: ≥150 topics; ~164–262 topics to detect
 δ≈0.033) say we cannot certify small wins — G3 above exists because of this. Every later
 improvement gets sharper the moment this lands.
@@ -350,6 +361,7 @@ the §1 baselines before the next gate decision. Never compare across corpus sta
 | 2026-07-10 | I3 fusion/sparse-weight sweep (translations ON) | 2,637,645 | hybrid `--sparse-weight {0.2,0.3,0.5,0.7,1.0}`, `--fusion dbsf`, each `--translate-queries` | best w=0.7: overall nDCG +0.004 (gate ≥+0.02) | w=0.7 trades XL nDCG −0.038 for KA +0.015; w=1.0 XL nDCG −0.080 (G2 fail); dbsf 0.198 < RRF 0.211; low w collapses KA | — | **NO KEEP** (config unchanged: RRF, unweighted) | slice trade-off persists even with translations; per-translated-weight composite projects +0.017 < gate → second variant not spent. prefetch/ef/rescore latency knobs not run (serving bottleneck is the reranker → I7) |
 | 2026-07-10 | **I4 agentic playbook + abstention + existence-check** | 2,637,645 | docstrings only; calibration `scripts/calibrate_min_score.py` rc=50, translations on, GPU | gate = G5 only: 264 tests pass, ruff clean, fingerprint unchanged, retrieval untouched | tool descriptions verified via `mcp.list_tools()` (all markers render); CLI smoke sane | — | **KEPT** | abstention threshold **0.92** from calibration (top-1 hit p1=0.926; scores saturate — misses median 0.997, so identity check carries the contract; only 10% of misses fall below 0.92). RERANK_MIN_SCORE stays 0.3 (calibration measured top-1 only). ⚠ MCP server must be reconnected (/mcp) to serve the new docstrings |
 | 2026-07-10 | **I7 ONNX int8 reranker** | 2,637,645 | rerank@50, translations on, `RERANK_BACKEND=onnx` (CPU) vs fp32 GPU reference | **nDCG 0.320 vs 0.320 (Δ=0.000, gate ≤0.01) · rerank p50 28.2 s vs ~72 s fp32 CPU (0.39×, gate ≤0.5×)** | all slices within noise (XL nDCG −0.002, citation R@5 +0.059); probe: top-10 overlap 9–10/10, ρ≥0.97 | — | **KEPT** (knob, default torch) | 570 MB int8 via `scripts/export_onnx_reranker.py` (torch exporter; optimum refused — would downgrade transformers <5). int8 scores drift ≤0.1 → re-calibrate abstention before making onnx the serving default |
+| 2026-07-11 | **I5 golden_set_v2 (partial)** | 2,638,482 | measurement tooling — not a retrieval change | n/a (grows the yardstick, doesn't move it): v2 = 337 verified pairs vs v1 103 (natural_question 75, legal_citation 67, cross_lingual 60, keyword 55, temporal 40, paraphrase 40) | v2 hybrid slice signal @2,638,482: temporal 0.795 nDCG (easiest), paraphrase 0.105 (hardest, by design zero content-word overlap), citation 0.393, XL 0.382; v1 consistency: eval_set_hash 985e1bc3e5cbf51e frozen, recall10 0.359 reproduces | — | **LANDED (partial); gating stays v1** | loader invariants green (reground/lint 337/337); v1 path byte-identical (no eval_set knob), v2 folds `eval_set:v2` → distinct config_hash; batches 1-5 + b3 first-pass committed; b6/b3-rework/b7/b8 pending in `.golden_v2_pending/` (subagent session limit). Commits 4eb2e0e→64fea5a |
 
 ---
 
