@@ -225,6 +225,22 @@
   "q261": {
    "query": "On what basis did Georgia's Public Registry order the registration proceedings reopened for apartment No. 13, whose owner claimed its area should be 175.1 rather than 139.2 square meters?",
    "ka": "რა საფუძველზე დაავალა საქართველოს საჯარო რეესტრმა სარეგისტრაციო წარმოების განახლება №13 ბინაზე, რომლის მესაკუთრეც ამტკიცებდა, რომ ფართობი 139.2-ის ნაცვლად 175.1 კვ.მ უნდა ყოფილიყო?"
+  },
+  "q213": {
+   "query": "Under Georgia's state referral assistance programme, is government approval required to change a patient's provider clinic or to increase the requested funding amount?",
+   "ka": "საჭიროებს თუ არა მთავრობასთან შეთანხმებას რეფერალური დახმარების სახელმწიფო პროგრამის ფარგლებში პაციენტის პროვაიდერი კლინიკის შეცვლა ან მოთხოვნილი თანხის გაზრდა?"
+  },
+  "q214": {
+   "query": "Can Georgia's Central Election Commission hand over its ballot boxes and voting booths for free temporary use without an auction, and to whom?",
+   "ka": "შეუძლია თუ არა საქართველოს ცენტრალურ საარჩევნო კომისიას საარჩევნო ყუთებისა და კენჭისყრის კაბინების უსასყიდლოდ, აუქციონის გარეშე გადაცემა და ვისთვის?"
+  },
+  "q205": {
+   "query": "What did the Investigation Service of Georgia's Ministry of Finance request from the Public Registry in the case about fraudulent registration of state forest fund lands?",
+   "ka": "რა მოითხოვა საქართველოს ფინანსთა სამინისტროს საგამოძიებო სამსახურმა საჯარო რეესტრისგან სახელმწიფო სატყეო ფონდის მიწების თაღლითური რეგისტრაციის საქმეში?"
+  },
+  "q232": {
+   "query": "Can someone other than the owner apply to the Tbilisi architecture service for permission to alter a garage, or is a notarized power of attorney required?",
+   "ka": "შეუძლია თუ არა მესაკუთრის გარდა სხვა პირს მიმართოს თბილისის არქიტექტურის სამსახურს ავტოფარეხის გადაკეთების ნებართვისთვის, თუ ნოტარიულად დამოწმებული მინდობილობაა საჭირო?"
   }
  }
 }
