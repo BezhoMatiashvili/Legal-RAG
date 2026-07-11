@@ -750,8 +750,9 @@ def gpu_state() -> dict:
 # the LAST marker seen wins, so the panel tracks the pipeline monotonically.
 _REEMBED_STAGES = [
     ("packaging payload", "packaging rows"),
-    ("provisioned pod", "pod provisioned"),
-    ("payload push", "uploading rows to pod"),
+    ("payload encrypted", "packaged (2GB) — provisioning"),
+    ("provisioned ", "pod provisioned"),
+    ("pod tools ready", "uploading 2GB payload to pod"),
     ("reembed launched", "embedding on GPU (v2 headers)"),
     ("DONE marker", "embed complete"),
     ("tunnel up", "eval over tunnel (hybrid)"),
