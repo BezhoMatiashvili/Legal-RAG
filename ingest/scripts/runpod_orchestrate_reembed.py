@@ -47,9 +47,13 @@ GOLDEN_SET = "v2"  # frozen 337-pair superset of v1; has temporal + more citatio
 # Sharded embed (user asked for 4 GPUs to speed up). Multi-GPU secure pods are supply-
 # constrained, so cascade the count 4→2→1: grab the most parallelism actually available.
 # Per-GPU cost is ~flat, so fewer GPUs = same $, just slower wall-clock.
-GPU_COUNTS = [4, 2, 1]
-GPU_PREFERENCE = ["NVIDIA RTX A5000", "NVIDIA GeForce RTX 3090", "NVIDIA GeForce RTX 4090",
-                  "NVIDIA RTX 4000 Ada Generation"]  # last: cheap, usually in stock
+# Single GPU (2026-07-11): balance is tight ($4.74) so run one cheap-first GPU; the batch=256
+# fix makes a single 4090 finish in ~5-6h. Cascade kept as a list for reuse but 1-only here.
+GPU_COUNTS = [1]
+# Cheapest-first by $/hr (4000Ada $0.26 < A5000 $0.27 < 3090 $0.44 < 4090 $0.69): a cheap GPU
+# completes the whole run well under the $4.74 balance (slower); 4090 is last resort.
+GPU_PREFERENCE = ["NVIDIA RTX 4000 Ada Generation", "NVIDIA RTX A5000",
+                  "NVIDIA GeForce RTX 3090", "NVIDIA GeForce RTX 4090"]
 ACTUAL_GPUS = 1  # set by step_provision_cascade to the count actually obtained
 # Single-GPU wall-clock for the full 2.65M chunks; deadline = this / actual_count + buffer.
 DEADLINE_1GPU_S = {"NVIDIA GeForce RTX 4090": 6 * 3600,
@@ -61,7 +65,7 @@ POLL_S = 60
 DEAD_CHECKS = 6
 TUNNEL_QDRANT = 16333
 TUNNEL_RERANK = 18900
-BUDGET_CEILING = 6.5  # refuse to keep going past this estimated spend ($; balance $9.85)
+BUDGET_CEILING = 4.0  # clean-abort with room for eval+pull under the $4.74 balance
 
 # References = v1-header LIVE collection at the CURRENT corpus on the v2 golden set (337)
 # with v2 translations, written by scripts/scratchpad/ref_v2_driver.sh. (v2 ⊇ v1, so these
