@@ -249,7 +249,7 @@ def main() -> None:
         from ingest.qdrant_store import make_client
 
         client = make_client(cfg)
-        payload_hashes = fetch_payload_hashes(client, args.collection or cfg.qdrant_collection, id_map)
+        payload_hashes = fetch_payload_hashes(client, args.collection or cfg.collection_name, id_map)
 
     manifest = build_delta(
         id_map,

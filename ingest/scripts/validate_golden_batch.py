@@ -251,7 +251,7 @@ def fetch_live_payloads(batch: list, collection: str | None = None) -> dict[tupl
 
     cfg = load_config()
     client = make_client(cfg)
-    coll = collection or cfg.qdrant_collection
+    coll = collection or cfg.collection_name
     docs = {(q.gold_source, q.gold_document_id) for q in batch}
     pid_map = {point_id(s, d, 0): (s, d) for s, d in docs}
     out: dict[tuple[str, str], dict] = {}
