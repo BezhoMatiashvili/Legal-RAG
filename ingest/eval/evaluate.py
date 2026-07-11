@@ -113,9 +113,10 @@ def build_fake_corpus(gold, bodies, chunk_cfg, count_tokens, *, n_distractors=20
 def eval_set_knob(version: str) -> dict[str, str]:
     """config_hash material for the eval-set choice.
 
-    v1 contributes nothing so every historical row's hash stays byte-stable (same
-    default-off rule as the other knobs); any other version folds in as a knob, giving
-    v2 runs their own forever-comparable config rows.
+    v1 is the hash-neutral anchor: it contributes nothing so every pre-switch row (all
+    computed when v1 was the default) keeps its hash byte-stable — we can never fold a
+    knob into v1 retroactively. Every other version (v2 is the default gate since
+    2026-07-11) folds in as a knob, so its runs are distinct, forever-comparable rows.
     """
     return {} if version == "v1" else {"eval_set": version}
 
@@ -228,9 +229,10 @@ def main() -> None:
     ap.add_argument("--mmr-lambda", type=float, default=None, help="diversity: MMR trade-off 0..1")
     ap.add_argument("--translate-queries", metavar="PATH", default=None,
                     help="I2: authored EN→KA query-translation JSON (embeds the KA text)")
-    ap.add_argument("--golden-set", choices=sorted(goldset.EVAL_SETS), default="v1",
-                    help="I5: eval-set version; v2 adds pairs whose gold docs may live in "
-                         "snapshots/v2-delta (v1 stays the frozen gating yardstick)")
+    ap.add_argument("--golden-set", choices=sorted(goldset.EVAL_SETS), default="v2",
+                    help="I5: eval-set version (default v2 — the gating yardstick since 2026-07-11, "
+                         "frozen at 337 pairs, hash 753e2985315be3e4). Pass --golden-set v1 for the "
+                         "frozen historical anchor; v1 config_hashes stay comparable to pre-switch rows.")
     ap.add_argument("--ab", action="store_true",
                     help="paired A/B: --mode with knobs OFF (A) vs the given knobs ON (B)")
     ap.add_argument("--log", action="store_true", help="append runs to the experiment log")
