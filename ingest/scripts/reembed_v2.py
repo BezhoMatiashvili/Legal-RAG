@@ -27,11 +27,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from qdrant_client import models  # noqa: E402
 
 from ingest.chunking import build_embed_text  # noqa: E402
+import os  # noqa: E402
+
 from ingest.config import load_config  # noqa: E402
 from ingest.embedding import BGEM3Embedder  # noqa: E402
 from ingest.qdrant_store import ensure_collection, make_client, sparse_vector  # noqa: E402
 
-BATCH = 64
+# Batch fed to the GPU per encode+upsert. 64 badly underutilizes a 4090 (measured ~47/s;
+# batch 256 matches the production embed's ~128/s per GPU). Read from EMBED_BATCH_SIZE
+# (the pod sets it to 256) so it's tunable without a code edit.
+BATCH = int(os.getenv("EMBED_BATCH_SIZE") or 256)
 
 
 def embed_text_from_payload(p: dict, *, v2: bool) -> str:
