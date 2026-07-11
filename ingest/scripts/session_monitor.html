@@ -319,9 +319,10 @@ function covSteps(cov, g){
 function renderReembed(r){
   const d = r.delta, o = r.orch;
   if (d){
-    const cls = d.stage==='complete' ? 'ok' : (d.alive ? 'warn' : 'bad');
+    const cls = /complete/.test(d.stage) ? 'ok' : (/gone/.test(d.stage) ? 'bad' : 'warn');
     $('deltacard').innerHTML =
-      `<div><b>Post-scrape delta embed</b> <span class="chip ${cls}">${esc(d.stage)}</span></div>
+      `<div><b>GPU delta · complete live (4,370 missing docs)</b> <span class="chip ${cls}">${esc(d.stage)}</span></div>
+       ${d.cost?`<div class="muted" style="margin-top:4px;font-size:12px">cost: ${esc(d.cost)}</div>`:''}
        <div class="muted" style="margin-top:7px;font-size:12px">${esc(d.tail||'')}</div>`;
   }
   if (o){

@@ -41,7 +41,8 @@ STAGE = O.WORKDIR / "reembed_stage"
 OUT = O.WORKDIR / "out_reembed_v2"
 EMBED_SH = Path(__file__).resolve().parent / "runpod_reembed_v2.sh"
 RERANK_SERVER = Path(__file__).resolve().parent / "runpod_rerank_server.py"
-TRANSLATIONS = "eval/query_translations_v1.json"
+TRANSLATIONS = "eval/query_translations_v2.json"  # covers all 60 v2 EN pairs
+GOLDEN_SET = "v2"  # frozen 337-pair superset of v1; has temporal + more citation (I6's targets)
 
 # 4-way sharded embed (user-requested speedup). A5000s first: at 4×$0.27/hr the whole
 # pipeline lands ≈$4.6; 4×4090 would bill ≈$9 — too close to the $9.85 balance.
@@ -58,17 +59,20 @@ TUNNEL_QDRANT = 16333
 TUNNEL_RERANK = 18900
 BUDGET_CEILING = 6.5  # refuse to keep going past this estimated spend ($; balance $9.85)
 
-# v1 references — the 2026-07-10 rows at the SAME corpus (2,637,645 pts, translations on):
-# hybrid from experiments.jsonl (config 5f40...*), rerank@50 fp32 from experiments_gpu.jsonl.
-REF_HYBRID = {"ndcg10": 0.211, "recall10": 0.359}
-REF_RERANK = {
-    "ndcg10": 0.320, "recall10": 0.427,
-    "slices": {  # per_query_type + per_language: (ndcg10, recall10)
-        "cross_lingual": (0.329, 0.500), "keyword": (0.369, 0.429),
-        "legal_citation": (0.475, 0.647), "natural_question": (0.310, 0.406),
-        "paraphrase": (0.0, 0.0), "ka": (0.318, 0.407), "en": (0.329, 0.500),
-    },
-}
+# References = v1-header LIVE collection at the CURRENT corpus on the v2 golden set (337)
+# with v2 translations, written by scripts/scratchpad/ref_v2_driver.sh. (v2 ⊇ v1, so these
+# guard the v1 pairs too; temporal+citation slices measure I6's benefit.)
+REF_FILE = O.INGEST / ".state" / "ref_v2.json"
+
+
+def _load_refs() -> tuple[dict, dict]:
+    ref = json.loads(REF_FILE.read_text(encoding="utf-8"))
+    hyb = ref["hybrid"]
+    rr = {"ndcg10": ref["rerank"]["ndcg10"], "recall10": ref["rerank"]["recall10"],
+          "slices": {k: tuple(v) for k, v in ref["rerank"]["slices"].items()}}
+    return hyb, rr
+
+
 GATE_MIN_GAIN = 0.02
 GATE_SLICE_TOL = 0.02
 
@@ -282,7 +286,7 @@ def _eval_env(**over) -> dict:
 def _run_eval(args: list[str], env: dict, log_path: Path, timeout: int) -> dict:
     n_before = sum(1 for _ in open(log_path, encoding="utf-8")) if log_path.exists() else 0
     cmd = [str(O.INGEST / ".venv/bin/python"), "-m", "eval.evaluate",
-           "--backend", "qdrant", "--relevance", "chunk",
+           "--backend", "qdrant", "--relevance", "chunk", "--golden-set", GOLDEN_SET,
            "--translate-queries", TRANSLATIONS, "--log", "--log-path", str(log_path), *args]
     O.log("eval: " + " ".join(args))
     r = subprocess.run(cmd, cwd=O.INGEST, env=env, capture_output=True, timeout=timeout)
@@ -305,17 +309,21 @@ def step_eval() -> tuple[dict, dict]:
 
 
 def step_gate(hyb: dict, rr: dict) -> bool:
+    ref_hyb, ref_rr = _load_refs()  # written by ref_v2_driver.sh; raises if absent
     ok = True
     h_ndcg = hyb["metrics"]["ndcg10"]
     r_ndcg = rr["metrics"]["ndcg10"]
-    O.log(f"GATE hybrid  nDCG {h_ndcg:.3f} vs v1 {REF_HYBRID['ndcg10']:.3f} "
-          f"(Δ{h_ndcg - REF_HYBRID['ndcg10']:+.3f})")
-    O.log(f"GATE rerank  nDCG {r_ndcg:.3f} vs v1 {REF_RERANK['ndcg10']:.3f} "
-          f"(Δ{r_ndcg - REF_RERANK['ndcg10']:+.3f}, need +{GATE_MIN_GAIN})")
-    if r_ndcg < REF_RERANK["ndcg10"] + GATE_MIN_GAIN:
+    O.log(f"GATE hybrid  nDCG {h_ndcg:.3f} vs ref {ref_hyb['ndcg10']:.3f} "
+          f"(Δ{h_ndcg - ref_hyb['ndcg10']:+.3f})")
+    O.log(f"GATE rerank  nDCG {r_ndcg:.3f} vs ref {ref_rr['ndcg10']:.3f} "
+          f"(Δ{r_ndcg - ref_rr['ndcg10']:+.3f}, need +{GATE_MIN_GAIN})")
+    if r_ndcg < ref_rr["ndcg10"] + GATE_MIN_GAIN:
         ok = False
     slices = {**rr["per_query_type"], **rr["per_language"]}
-    for name, (ref_n, ref_r) in REF_RERANK["slices"].items():
+    for name, ref in ref_rr["slices"].items():
+        if ref is None:
+            continue
+        ref_n, ref_r = ref
         got = slices.get(name, {})
         dn = got.get("ndcg10", 0) - ref_n
         dr = got.get("recall10", 0) - ref_r
@@ -353,6 +361,9 @@ def step_pull_and_restore(ip: str, port: int, expected_points: int) -> None:
 
 def main() -> None:
     OUT.mkdir(parents=True, exist_ok=True)
+    if not REF_FILE.exists():  # fail before spending pod money
+        raise SystemExit(f"reference file {REF_FILE} missing — run ref_v2_driver.sh first")
+    _load_refs()  # validate it parses now, not at gate time (after $ spent)
     atexit.register(_cleanup)
     signal.signal(signal.SIGINT, O._sig)
     signal.signal(signal.SIGTERM, O._sig)

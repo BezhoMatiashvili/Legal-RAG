@@ -783,26 +783,34 @@ def reembed_state() -> dict:
     """The post-scrape I6 pipeline: local delta embed → orchestrated v2 re-embed."""
     st: dict = {"delta": None, "orch": None}
 
-    dlog = GPU_WORKDIR / "delta_embed_all.log"
+    # GPU multi-source delta orchestrator (completes live georgian_legal after a scrape).
+    dlog = GPU_WORKDIR / "delta_multi.log"
     try:
         lines = dlog.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
         lines = []
     if lines:
-        stage = "starting"
+        _DELTA_STAGES = [
+            ("staged sources", "packaging missing docs"),
+            ("provisioned pod", "pod provisioned"),
+            ("payload push", "uploading to pod"),
+            ("delta launched", "embedding missing docs on GPU"),
+            ("pod delta embed done", "embed complete"),
+            ("pulled + tar-verified", "pulling snapshot"),
+            ("restored `georgian_legal_delta`", "merging into live"),
+            ("MULTI-SOURCE DELTA COMPLETE", "complete — live updated"),
+        ]
+        stage, cost = "starting", None
         for ln in lines:
-            if "embedding source:" in ln:
-                stage = "embedding " + ln.split("embedding source:")[-1].strip(" =")
-            elif "re-verify coverage" in ln:
-                stage = "verifying coverage"
-            elif "DELTA EMBED ALL DONE" in ln:
-                stage = "complete"
-            elif "MISSING" in ln and " 0 MISSING" not in ln:
-                stage = "verify: " + ln.strip()[:80]
-        alive = _args_alive("delta_embed_all.sh") or _args_alive("-m ingest watch")
-        if not alive and stage not in ("complete",) and not stage.startswith("verify"):
-            stage += " (process gone?)"
-        st["delta"] = {"stage": stage, "tail": lines[-1][-160:], "alive": alive}
+            for marker, label in _DELTA_STAGES:
+                if marker in ln:
+                    stage = label
+            if "COST:" in ln:
+                cost = ln.split("COST:")[-1].strip()
+        alive = _args_alive("runpod_orchestrate_delta_multi.py")
+        if not alive and "COMPLETE" not in "".join(lines[-3:]):
+            stage += " (orchestrator gone?)"
+        st["delta"] = {"stage": stage, "tail": lines[-1][-160:], "alive": alive, "cost": cost}
 
     olog = GPU_WORKDIR / "reembed_v2.log"
     try:
