@@ -44,15 +44,19 @@ RERANK_SERVER = Path(__file__).resolve().parent / "runpod_rerank_server.py"
 TRANSLATIONS = "eval/query_translations_v2.json"  # covers all 60 v2 EN pairs
 GOLDEN_SET = "v2"  # frozen 337-pair superset of v1; has temporal + more citation (I6's targets)
 
-# 4-way sharded embed (user-requested speedup). A5000s first: at 4×$0.27/hr the whole
-# pipeline lands ≈$4.6; 4×4090 would bill ≈$9 — too close to the $9.85 balance.
-GPU_COUNT = 4
-GPU_PREFERENCE = ["NVIDIA RTX A5000", "NVIDIA GeForce RTX 3090", "NVIDIA GeForce RTX 4090"]
-# Poll deadline scales with per-GPU speed (2.64M chunks / 4 shards).
-DEADLINE_BY_GPU = {"NVIDIA GeForce RTX 4090": 3 * 3600,
-                   "NVIDIA GeForce RTX 3090": 4 * 3600,
-                   "NVIDIA RTX A5000": 5 * 3600}
-DEADLINE_DEFAULT = 8 * 3600
+# Sharded embed (user asked for 4 GPUs to speed up). Multi-GPU secure pods are supply-
+# constrained, so cascade the count 4→2→1: grab the most parallelism actually available.
+# Per-GPU cost is ~flat, so fewer GPUs = same $, just slower wall-clock.
+GPU_COUNTS = [4, 2, 1]
+GPU_PREFERENCE = ["NVIDIA RTX A5000", "NVIDIA GeForce RTX 3090", "NVIDIA GeForce RTX 4090",
+                  "NVIDIA RTX 4000 Ada Generation"]  # last: cheap, usually in stock
+ACTUAL_GPUS = 1  # set by step_provision_cascade to the count actually obtained
+# Single-GPU wall-clock for the full 2.65M chunks; deadline = this / actual_count + buffer.
+DEADLINE_1GPU_S = {"NVIDIA GeForce RTX 4090": 6 * 3600,
+                   "NVIDIA GeForce RTX 3090": 8 * 3600,
+                   "NVIDIA RTX A5000": 8 * 3600,
+                   "NVIDIA RTX 4000 Ada Generation": 12 * 3600}
+DEADLINE_1GPU_DEFAULT = 12 * 3600
 POLL_S = 60
 DEAD_CHECKS = 6
 TUNNEL_QDRANT = 16333
@@ -135,20 +139,23 @@ def step_package() -> str:
     return passphrase
 
 
-def step_provision_multi(pubkey: str) -> tuple[str, str, float]:
-    """Provision a GPU_COUNT-GPU pod, cheapest-capable type first (O.step_provision is 1-GPU)."""
+def step_provision_cascade(pubkey: str) -> tuple[str, str, float]:
+    """Provision the most GPUs actually available: try counts 4→2→1, each across the GPU
+    preference list. Sets the module-level ACTUAL_GPUS to what was obtained (drives shards
+    + deadline). Cost is ~flat per GPU, so a smaller pod is the same $, just slower."""
+    global ACTUAL_GPUS
     mutation = ("mutation($input:PodFindAndDeployOnDemandInput!){ "
                 "podFindAndDeployOnDemand(input:$input){ id imageName machineId } }")
-    for gpu_id in GPU_PREFERENCE:
-        price, stock = O.gpu_price(gpu_id)
-        if price is None:
-            O.log(f"  {gpu_id}: no secure price/stock — skipping")
-            continue
-        O.log(f"  {gpu_id} ×{GPU_COUNT}: ${price}/GPU/hr (${price * GPU_COUNT:.2f}/hr) stock={stock}")
-        for attempt in range(1, 4):
+    for count in GPU_COUNTS:
+        for gpu_id in GPU_PREFERENCE:
+            price, stock = O.gpu_price(gpu_id)
+            if price is None:
+                continue
+            O.log(f"  trying {gpu_id} ×{count}: ${price}/GPU/hr (${price * count:.2f}/hr) stock={stock}")
             variables = {"input": {
-                "cloudType": "SECURE", "gpuCount": GPU_COUNT, "gpuTypeId": gpu_id,
-                "minMemoryInGb": 20, "minVcpuCount": 8, "name": "georgian-legal-reembed-v2",
+                "cloudType": "SECURE", "gpuCount": count, "gpuTypeId": gpu_id,
+                "minMemoryInGb": 20, "minVcpuCount": max(4, 2 * count),
+                "name": "georgian-legal-reembed-v2",
                 "imageName": O.IMAGE, "dockerArgs": "", "ports": "22/tcp",
                 "volumeInGb": 120, "containerDiskInGb": 60, "volumeMountPath": "/workspace",
                 "supportPublicIp": True, "startSsh": True,
@@ -157,17 +164,17 @@ def step_provision_multi(pubkey: str) -> tuple[str, str, float]:
             try:
                 data = O.gql(mutation, variables)
             except RuntimeError as e:
-                O.log(f"  deploy attempt {attempt} error: {e}")
-                time.sleep(20)
+                O.log(f"    {gpu_id}×{count}: {str(e)[-120:]}")
                 continue
             pod = data.get("podFindAndDeployOnDemand")
             if pod and pod.get("id"):
                 (O.WORKDIR / "pod.id").write_text(pod["id"])
-                O.log(f"provisioned {GPU_COUNT}x{gpu_id} pod {pod['id']} (${price * GPU_COUNT:.2f}/hr)")
-                return pod["id"], gpu_id, price * GPU_COUNT
-            O.log(f"  deploy attempt {attempt}: null (no {GPU_COUNT}x capacity), retrying...")
-            time.sleep(20)
-    raise RuntimeError(f"could not provision any {GPU_COUNT}-GPU pod (preference exhausted)")
+                ACTUAL_GPUS = count
+                O.log(f"provisioned {count}x{gpu_id} pod {pod['id']} (${price * count:.2f}/hr)")
+                return pod["id"], gpu_id, price * count
+            O.log(f"    {gpu_id}×{count}: no capacity")
+        O.log(f"  no {count}-GPU capacity on any type; trying fewer GPUs...")
+    raise RuntimeError("could not provision any pod (4/2/1 GPU all exhausted)")
 
 
 def step_launch(ip: str, port: int, passphrase: str) -> None:
@@ -185,7 +192,7 @@ def step_launch(ip: str, port: int, passphrase: str) -> None:
         "openssl enc -d -aes-256-cbc -pbkdf2 -pass env:PASSPHRASE "
         "-in payload.tar.enc | tar xf -\n"
         f"export COLLECTION_NAME={V2_COLLECTION} QDRANT_VER={O.QDRANT_VER} "
-        f"EMBED_BATCH_SIZE=256 WORK=/workspace SHARDS={GPU_COUNT}\n"
+        f"EMBED_BATCH_SIZE=256 WORK=/workspace SHARDS={ACTUAL_GPUS}\n"
         "bash /workspace/runpod_reembed_v2.sh\n"
         'echo "EXIT=$?" >> /workspace/out/embed.log\n'
     )
@@ -372,7 +379,7 @@ def main() -> None:
     pubkey = O.step_keypair()
     verdict = False
     try:
-        O._pod_id, gpu_used, O._price = step_provision_multi(pubkey)
+        O._pod_id, gpu_used, O._price = step_provision_cascade(pubkey)
         O._provisioned_at = time.time()
         O._ip, O._port = O.step_wait_ssh(O._pod_id)
         O.ensure_pod_tools(O._ip, O._port)
@@ -382,7 +389,8 @@ def main() -> None:
         _retry(lambda: O.push_file(EMBED_SH, "/workspace/runpod_reembed_v2.sh",
                                    O._ip, O._port, timeout=120), what="embed script push")
         step_launch(O._ip, O._port, passphrase)
-        deadline = DEADLINE_BY_GPU.get(gpu_used, DEADLINE_DEFAULT)
+        # deadline = single-GPU wall-clock / actual shard count, + 1h buffer
+        deadline = DEADLINE_1GPU_S.get(gpu_used, DEADLINE_1GPU_DEFAULT) / ACTUAL_GPUS + 3600
         points = step_poll(O._ip, O._port, deadline, O._price or 0.0, O._provisioned_at)
         step_tunnel(O._ip, O._port)
         step_start_rerank_server(O._ip, O._port)
