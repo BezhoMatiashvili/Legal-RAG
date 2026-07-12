@@ -55,6 +55,28 @@ def _load_unanswerable(path: Path) -> list[str]:
     return [x["query"] if isinstance(x, dict) else x for x in data]
 
 
+def _chunkable_gold(gold, bodies, chunk_cfg, count_tokens):
+    """Drop queries whose gold doc body can't be chunked (e.g. an embedded base64 atom that
+    exceeds the chunk budget and can't be split). Returns (survivors, dropped_ids).
+
+    Makes the answer-eval robust to that data/chunker edge case instead of crashing the whole
+    run; the caller logs the dropped ids so coverage changes are never silent."""
+    from ingest.chunking import chunk_document
+
+    verdict: dict[tuple[str, str], bool] = {}
+    ok, dropped = [], []
+    for q in gold:
+        key = (q.gold_source, q.gold_document_id)
+        if key not in verdict:
+            try:
+                chunk_document(bodies.body(*key), count_tokens=count_tokens, **chunk_cfg)
+                verdict[key] = True
+            except Exception:  # noqa: BLE001 — un-chunkable body; skip rather than crash
+                verdict[key] = False
+        (ok if verdict[key] else dropped).append(q)
+    return ok, [q.id for q in dropped]
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Deterministic answer-quality eval for the legal RAG.")
     ap.add_argument("--backend", choices=("fake", "qdrant"), default="qdrant")
@@ -86,6 +108,10 @@ def main() -> None:
         root=spec.roots[0], needed=goldset.gold_docs(gold), extra_roots=spec.roots[1:])
     n_spans = goldset.reground(gold, bodies)               # fail loud on hygiene drift
     goldset.enforce_holdout(gold, holdout)                 # fail loud on contamination
+    gold, dropped = _chunkable_gold(gold, bodies, chunk_cfg, count_tokens)
+    if dropped:
+        print(f"WARNING: skipped {len(dropped)} query(ies) with an un-chunkable gold doc "
+              f"(e.g. base64 atom): {dropped}")
     goldset.lint_span_coverage(gold, bodies, count_tokens=count_tokens, **chunk_cfg)
     rel = build_query_relevance(gold, bodies, chunk_cfg, count_tokens)
 
@@ -106,7 +132,7 @@ def main() -> None:
     answerable_top1: list[float] = []
     for q in gold:
         hits, _lat = backend.search(q.query, args.mode, args.top_k)
-        scores.append(score_answer(q, hits, set(rel[q.id]["chunk"])))
+        scores.append(score_answer(q, hits, set(rel[q.id]["chunk"]), threshold=args.abstention_threshold))
         if hits:
             answerable_top1.append(hits[0].score)
 
@@ -134,6 +160,10 @@ def main() -> None:
     print(f"  span-coverage@10:        {overall['span_coverage_at_10']:.3f}  "
           f"(≈chunk-Recall at v2 single-span; distinct at v3)")
     print(f"  fully-grounded@10:       {overall['fully_grounded_at_10']:.3f}")
+    print(f"  confident-wrong (known): {overall['known_item_confident_wrong']:.3f}  "
+          f"(score>={args.abstention_threshold:.2f} but WRONG doc — hallucination a score-gate lets through; "
+          f"meaningful in rerank mode)")
+    print(f"  mean top-1 score:        {overall['mean_top1_score']:.3f}")
     print("\n  identity@1 by query_type:")
     for t, agg in by_type.items():
         print(f"    {t:<18} n={agg['n']:<3} id@1={agg['identity_at_1']:.3f} id@10={agg['identity_at_10']:.3f}")

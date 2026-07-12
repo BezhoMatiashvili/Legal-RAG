@@ -10,6 +10,7 @@ from eval.answer_eval import (
     abstention_correctness,
     aggregate_answer_scores,
     breakdown_by,
+    confident_wrong,
     fully_grounded_at_k,
     identity_at_1,
     identity_at_k,
@@ -17,6 +18,7 @@ from eval.answer_eval import (
     score_answer,
     span_coverage_at_k,
     top1_doc,
+    top1_score,
 )
 from eval.goldset import GoldQuery
 from eval.metrics import Hit
@@ -197,3 +199,35 @@ def test_abstention_empty_groups_do_not_crash():
     assert r.n_answerable == 0 and r.n_unanswerable == 0
     assert r.retention == 0.0 and r.correct_refusal == 0.0
     assert r.false_refusal == 0.0 and r.false_accept == 0.0
+
+
+# ---- confident-wrong (the demonstrated "high score, wrong doc" hallucination) ----------
+
+
+def test_top1_score():
+    assert top1_score([_hit("D1", 0, score=0.88)]) == 0.88
+    assert top1_score([]) == 0.0
+
+
+def test_confident_wrong_known_item_high_score_wrong_doc():
+    hits = [_hit("WRONG", 0, score=0.99)]  # rank-1 confident but the wrong law
+    assert confident_wrong(hits, _gold(qtype="legal_citation", gdoc="D1"), threshold=0.92) is True
+
+
+def test_confident_wrong_negatives():
+    g = _gold(qtype="legal_citation", gdoc="D1")
+    assert confident_wrong([_hit("D1", 0, score=0.99)], g, 0.92) is False       # right doc
+    assert confident_wrong([_hit("WRONG", 0, score=0.50)], g, 0.92) is False     # low score → gate abstains
+    g2 = _gold(qtype="paraphrase", gdoc="D1")                                    # not a known-item type
+    assert confident_wrong([_hit("WRONG", 0, score=0.99)], g2, 0.92) is False
+    assert confident_wrong([], g, 0.92) is False                                 # no hits
+
+
+def test_aggregate_includes_confident_wrong_and_mean_score():
+    scores = [
+        score_answer(_gold("q1", "legal_citation", gdoc="D1"), [_hit("WRONG", 0, score=0.99)], set(), threshold=0.92),
+        score_answer(_gold("q2", "legal_citation", gdoc="D2"), [_hit("D2", 0, score=0.95)], set(), threshold=0.92),
+    ]
+    agg = aggregate_answer_scores(scores)
+    assert agg["known_item_confident_wrong"] == 0.5           # q1 confident-wrong, q2 correct
+    assert abs(agg["mean_top1_score"] - 0.97) < 1e-9

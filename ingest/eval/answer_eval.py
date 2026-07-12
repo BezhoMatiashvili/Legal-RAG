@@ -60,6 +60,25 @@ def top1_doc(hits: Sequence[Hit]) -> tuple[str, str] | None:
     return order[0] if order else None  # reduce_ranking yields 2-tuples at doc level
 
 
+def top1_score(hits: Sequence[Hit]) -> float:
+    """Reranker score (calibrated 0..1 in rerank mode) of the rank-1 hit; 0.0 if none."""
+    return float(hits[0].score) if hits else 0.0
+
+
+def confident_wrong(hits: Sequence[Hit], q: GoldQuery, threshold: float = DEFAULT_ABSTENTION_THRESHOLD) -> bool:
+    """Rank-1 hit scores ABOVE the abstention threshold yet is NOT the gold document.
+
+    This is the demonstrated legal hallucination mode ("high score, wrong law/case"): a
+    score-only abstention gate at ``threshold`` would confidently serve this wrong document.
+    Only meaningful when the score is calibrated (rerank mode). Restricted to KNOWN-ITEM
+    queries, where "the wrong document at rank 1" is unambiguously an error to catch."""
+    return (
+        q.query_type in KNOWN_ITEM_TYPES
+        and top1_score(hits) >= threshold
+        and not identity_at_1(hits, q)
+    )
+
+
 def identity_at_1(hits: Sequence[Hit], q: GoldQuery) -> bool:
     """Is the rank-1 retrieved document the exact gold document? (answer would cite it)."""
     return top1_doc(hits) == gold_doc_key(q)
@@ -104,9 +123,14 @@ class AnswerScore:
     fully_grounded_at_10: bool
     top1_doc: tuple[str, str] | None
     gold_doc: tuple[str, str]
+    top1_score: float
+    confident_wrong: bool
 
 
-def score_answer(q: GoldQuery, hits: Sequence[Hit], gold_chunks: set[Key], *, k: int = 10) -> AnswerScore:
+def score_answer(
+    q: GoldQuery, hits: Sequence[Hit], gold_chunks: set[Key], *,
+    k: int = 10, threshold: float = DEFAULT_ABSTENTION_THRESHOLD,
+) -> AnswerScore:
     """Compute all per-query deterministic answer signals for one query."""
     return AnswerScore(
         id=q.id,
@@ -119,6 +143,8 @@ def score_answer(q: GoldQuery, hits: Sequence[Hit], gold_chunks: set[Key], *, k:
         fully_grounded_at_10=fully_grounded_at_k(hits, gold_chunks, k),
         top1_doc=top1_doc(hits),
         gold_doc=gold_doc_key(q),
+        top1_score=top1_score(hits),
+        confident_wrong=confident_wrong(hits, q, threshold),
     )
 
 
@@ -138,6 +164,11 @@ def aggregate_answer_scores(scores: Sequence[AnswerScore]) -> dict[str, float | 
         "n_known_item": len(known),
         "known_item_identity_at_1": _mean([1.0 if s.identity_at_1 else 0.0 for s in known]),
         "known_item_identity_at_10": _mean([1.0 if s.identity_at_10 else 0.0 for s in known]),
+        # confident-wrong = rank-1 scores >= threshold but is NOT the gold doc (the
+        # "confident hallucination" rate a score-only abstention gate would let through).
+        # Only set True for known-item queries → rate is over the known-item denominator.
+        "known_item_confident_wrong": _mean([1.0 if s.confident_wrong else 0.0 for s in known]),
+        "mean_top1_score": _mean([s.top1_score for s in scores]),
     }
 
 
