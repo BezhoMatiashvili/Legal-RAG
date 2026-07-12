@@ -102,13 +102,13 @@ def main() -> None:
     count_tokens = _token_counter(tok_kind, cfg.embed_model)
 
     spec = goldset.EVAL_SETS[args.golden_set]
-    gold = goldset.load_golden_set(spec.gold)
+    gold_all = goldset.load_golden_set(spec.gold)          # full set (translations validate vs this)
     holdout = goldset.load_holdout(spec.holdout)
     bodies = goldset.SnapshotBodies(
-        root=spec.roots[0], needed=goldset.gold_docs(gold), extra_roots=spec.roots[1:])
-    n_spans = goldset.reground(gold, bodies)               # fail loud on hygiene drift
-    goldset.enforce_holdout(gold, holdout)                 # fail loud on contamination
-    gold, dropped = _chunkable_gold(gold, bodies, chunk_cfg, count_tokens)
+        root=spec.roots[0], needed=goldset.gold_docs(gold_all), extra_roots=spec.roots[1:])
+    n_spans = goldset.reground(gold_all, bodies)           # fail loud on hygiene drift
+    goldset.enforce_holdout(gold_all, holdout)             # fail loud on contamination
+    gold, dropped = _chunkable_gold(gold_all, bodies, chunk_cfg, count_tokens)
     if dropped:
         print(f"WARNING: skipped {len(dropped)} query(ies) with an un-chunkable gold doc "
               f"(e.g. base64 atom): {dropped}")
@@ -119,7 +119,9 @@ def main() -> None:
     if args.translate_queries:
         from .translations import load_query_translations
 
-        translations, _ = load_query_translations(Path(args.translate_queries), gold)
+        # Validate against the FULL set: the guard may drop cross-lingual queries whose
+        # translation entries would otherwise look "unknown". Extra entries are harmless.
+        translations, _ = load_query_translations(Path(args.translate_queries), gold_all)
 
     knobs = {"rerank_candidates": args.rerank_candidates, "translations": translations,
              "citation_route": args.citation_route}
