@@ -1,0 +1,34 @@
+# Python-generated files
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+.scrapy
+
+# Scraping artifacts
+artifacts/
+scraper/output.json
+scraper/spider_logs.txt
+
+# Secrets
+.env
+
+# Qdrant ingestion (ingest/)
+ingest/.venv
+ingest/.state/
+ingest/qdrant_storage/
+ingest/eval/.bm25_full/
+
+# Large generated data blobs (must never be committed)
+/artifacts_without_supremecourt.gz
+/ingest/snapshots/
+
+# Multi-session coordination scratch (see coordination/README.md)
+/coordination/

@@ -1,0 +1,19 @@
+[project]
+name = "legal"
+version = "0.1.0"
+description = "Scrapy crawlers for Georgian legal sources (matsne, napr, ecd, constcourt, tas, tbappeal) — the scraper half of the Georgia Legal Search RAG pipeline."
+requires-python = ">=3.14"
+dependencies = [
+    "mammoth>=1.12.0",
+    "markdownify>=1.2.2",
+    "pdfplumber>=0.11.10",
+    "rich>=15.0.0",
+    "scrapy>=2.16.0",
+    "scrapy-playwright>=0.0.47",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.19",
+    "pytest>=8",  # root tests/ (scraper world); CI's scraper job runs `uv run pytest tests/`
+]

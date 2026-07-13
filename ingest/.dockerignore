@@ -1,0 +1,19 @@
+# Keep the worker image free of secrets and data. .env is the critical one: config.py
+# calls load_dotenv(), so a baked .env would silently override the endpoint's env vars
+# (and leak QDRANT_API_KEY / RUNPOD_API_KEY into a public image). NOTE: unlike gitignore,
+# dockerignore patterns without **/ are anchored to the context root — the **/ forms
+# below cover nested copies too.
+**/.env
+**/.env.*
+.state/
+.venv/
+qdrant_storage/
+snapshots/
+eval/
+tests/
+notebooks/
+docs/
+**/__pycache__/
+**/*.pyc
+**/*.snapshot
+**/*.log

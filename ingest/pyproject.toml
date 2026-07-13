@@ -1,0 +1,59 @@
+[project]
+name = "legal-ingest"
+version = "0.1.0"
+description = "Ingest scraped Georgian legal documents into Qdrant (hybrid dense+sparse RAG)"
+# BGE-M3 needs torch, which has no Python 3.14 wheels yet, so this ingestion tool is a
+# standalone project pinned below 3.14 (the scraper stays on 3.14).
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "qdrant-client>=1.12",
+    "FlagEmbedding>=1.2.10",
+    "python-dotenv>=1.0",
+    "tqdm>=4.66",
+    "rich>=13",
+    "mcp[cli]>=1.2",
+    "datasketch>=1.6",  # MinHash/LSH near-duplicate clustering for corpus dedup (Part 1)
+    "torch",            # CPU build only — see [tool.uv.sources] below
+    "transformers>=5.12.1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+onnx = [
+    "onnx>=1.16",
+    "onnxruntime>=1.18",
+]
+# Only scripts/publish_snapshot.py needs S3 (upload to the RunPod network volume); keep
+# boto3 out of the MCP runtime env:  uv run --group publish python scripts/publish_snapshot.py
+publish = [
+    "boto3>=1.34",
+]
+
+[tool.uv]
+# This is an application, not a library — don't try to build/install it as a package.
+package = false
+
+# Serving runs on CPU (GPU work happens on RunPod, in its own env). Pull the CPU-only
+# torch build from PyTorch's CPU index — the default PyPI wheel drags in ~6 GB of CUDA
+# runtime (nvidia-*, torch-cuda) that is useless on this box and makes `uv sync` crawl.
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+markers = [
+    "snapshot: requires the local multi-GB immutable corpus snapshot (release/integration gate)",
+]
+
+[tool.ruff]
+# Exploratory notebooks aren't part of the lint surface (viz-only, user-authored).
+extend-exclude = ["notebooks"]

@@ -1,0 +1,23 @@
+# GPU dependency set for the RunPod serverless worker image.
+#
+# Deliberately NOT derived from ingest/pyproject.toml: that env pins CPU-only torch via
+# [tool.uv.sources] (right for the local box, wrong for the worker). These are the exact
+# pins already proven on RunPod GPUs by scripts/runpod_embed_delta.sh — torch floats on
+# the cu124 index just like that script installs it, so the resolved combo matches the
+# stack the corpus was embedded and G2-verified with.
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch
+FlagEmbedding==1.4.0
+transformers==5.12.1
+tokenizers==0.22.2
+accelerate==1.14.0
+sentencepiece==0.2.1
+safetensors==0.8.0
+qdrant-client>=1.12
+python-dotenv>=1.0
+tqdm>=4.66
+rich>=13
+datasketch>=1.6
+mcp[cli]>=1.2
+pydantic>=2
+runpod>=1.7

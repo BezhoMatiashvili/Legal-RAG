@@ -1,0 +1,21 @@
+services:
+  qdrant:
+    # Pinned to the exact version the serverless worker bundles (ingest/serverless/):
+    # Qdrant snapshots are only guaranteed compatible within the same minor version,
+    # so a drive-by `docker compose pull` to a newer minor would break publishes.
+    image: qdrant/qdrant:v1.18.2
+    container_name: legal-qdrant
+    # Bound to loopback, so the index/dashboard is never world-exposed by default — no
+    # API key needed for local dev. For any SHARED/REMOTE host you must BOTH:
+    #   1) uncomment the environment block below and set QDRANT_API_KEY in .env, and
+    #   2) only then expose a non-loopback port.
+    # The Python client (qdrant_store.make_client) independently refuses to talk to a
+    # non-local QDRANT_URL without QDRANT_API_KEY, or to send a key over non-HTTPS.
+    ports:
+      - "127.0.0.1:6333:6333"   # REST + dashboard (http://localhost:6333/dashboard)
+      - "127.0.0.1:6334:6334"   # gRPC
+    environment:
+      QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY:?set QDRANT_API_KEY in .env}
+    volumes:
+      - ./qdrant_storage:/qdrant/storage
+    restart: unless-stopped

@@ -1,0 +1,59 @@
+# Continuous integration for the two Python worlds in this repository:
+#   * ingest/ — the RAG system (uv project, py 3.11–3.13, CPU torch). Ruff and pytest pin
+#     point-id determinism, retrieval-fingerprint stability, remote wire shape, and id parity.
+#   * scraper + root tests — Scrapy world (py >= 3.14). Ruff + pytest.
+#
+# No live Qdrant / GPU / model download is required: the ingest tests are self-contained
+# (fakes/ephemeral collections), and RERANK_ENABLED=false keeps the cross-encoder unloaded.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ingest:
+    name: ingest — ruff, pytest
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ingest
+    env:
+      RERANK_ENABLED: "false"   # ram-discipline: never load the ~2.3GB cross-encoder in CI
+      OMP_NUM_THREADS: "2"
+      MKL_NUM_THREADS: "2"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Sync (CPU-only torch from the pytorch-cpu index)
+        run: uv sync --dev
+      - name: Ruff
+        run: uv run ruff check .
+      - name: Pytest
+        # The three `snapshot` tests require the intentionally-untracked 6.5 GB corpus and
+        # are a separate release gate on the data host. Everything hermetic runs here.
+        run: uv run pytest -q -m "not snapshot"
+
+  scraper:
+    name: scraper — ruff, pytest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Sync
+        run: uv sync --dev
+      - name: Ruff
+        run: uv run ruff check scraper tests run_all.py
+      - name: Pytest
+        run: uv run pytest tests/ -q
