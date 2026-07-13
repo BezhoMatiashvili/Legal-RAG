@@ -104,6 +104,20 @@ def test_common_georgian_genitive_code_references_resolve():
         assert ref.filters == {"registration_code": registration_code}
 
 
+def test_active_corpus_law_aliases_are_retained():
+    laws = _laws()
+    cases = {
+        "გარემოსდაცვითი შეფასების კოდექსი": "360160000.05.001.018492",
+        "ნარჩენების მართვის კოდექსი": "360160000.05.001.017608",
+        "საქართველოს ტყის კოდექსი": "390000000.05.001.019838",
+        "ტყის კოდექსი": "390000000.05.001.019838",
+    }
+    for query, registration_code in cases.items():
+        ref = extract_citation(query, mode="full", aliases=laws)
+        assert ref is not None
+        assert ref.filters == {"registration_code": registration_code}
+
+
 def test_known_ambiguous_or_repealed_shortcuts_are_not_present():
     aliases = {_norm(alias) for entry in _laws() for alias in entry["aliases"]}
     assert "კონსტიტუცია" not in aliases
