@@ -106,16 +106,17 @@ class ONNXBGEReranker:
     """
 
     def __init__(self, cfg: Config):
-        import numpy as np
-        import onnxruntime as ort
-        from transformers import AutoTokenizer
-
-        self._np = np
         path = cfg.onnx_rerank_path
         if not path.exists():
             raise FileNotFoundError(
                 f"ONNX reranker not found at {path} — run "
                 "`uv run --group onnx python scripts/export_onnx_reranker.py` first")
+
+        import numpy as np
+        import onnxruntime as ort
+        from transformers import AutoTokenizer
+
+        self._np = np
         self.tokenizer = AutoTokenizer.from_pretrained(cfg.rerank_model)
         so = ort.SessionOptions()
         so.intra_op_num_threads = int(os.getenv("OMP_NUM_THREADS") or os.cpu_count() or 1)

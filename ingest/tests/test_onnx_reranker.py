@@ -1,5 +1,6 @@
 """Unit tests for the int8 ONNX reranker knob (improvement I7) — no model load."""
 
+import builtins
 import dataclasses
 from pathlib import Path
 
@@ -34,7 +35,15 @@ def test_fingerprint_unchanged_for_torch_changes_for_onnx():
     assert retrieval_fingerprint(onnx_cfg) != retrieval_fingerprint(torch_cfg)
 
 
-def test_onnx_reranker_fails_loud_without_export():
+def test_onnx_reranker_fails_loud_without_export(monkeypatch):
+    real_import = builtins.__import__
+
+    def guarded_import(name, *args, **kwargs):
+        if name == "onnxruntime":
+            raise AssertionError("optional runtime imported before model path validation")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
     cfg = _cfg(rerank_backend="onnx", onnx_rerank_path=Path("/nonexistent/model.onnx"))
     with pytest.raises(FileNotFoundError, match="export_onnx_reranker"):
         ONNXBGEReranker(cfg)
