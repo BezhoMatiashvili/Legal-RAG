@@ -4,7 +4,7 @@ import json
 import unicodedata
 from pathlib import Path
 
-from ingest.citations import extract_citation
+from ingest.citations import extract_citation, load_aliases
 
 
 ALIAS_PATH = Path(__file__).parents[1] / "ingest" / "data" / "law_aliases.json"
@@ -22,9 +22,11 @@ def _norm(value: str) -> str:
 def test_alias_table_uses_the_loader_schema_and_effective_targets():
     laws = _laws()
     assert len(laws) >= 40
+    assert load_aliases() == laws
 
     titles = set()
-    targets = set()
+    document_targets = set()
+    registration_codes = set()
     for entry in laws:
         assert set(entry) == {
             "canonical_title",
@@ -40,14 +42,17 @@ def test_alias_table_uses_the_loader_schema_and_effective_targets():
         assert "filters" not in entry and "document_number" not in entry
 
         title = _norm(entry["canonical_title"])
-        target = (entry["source"], entry["document_id"], entry["registration_code"])
+        document_target = (entry["source"], entry["document_id"])
+        registration_code = entry["registration_code"]
         assert title not in titles
-        assert target not in targets
+        assert document_target not in document_targets
+        assert registration_code not in registration_codes
         titles.add(title)
-        targets.add(target)
+        document_targets.add(document_target)
+        registration_codes.add(registration_code)
 
 
-def test_aliases_are_trimmed_nfc_and_never_cross_target_collisions():
+def test_aliases_are_trimmed_nfc_and_unique_across_targets():
     seen: dict[str, str] = {}
     for entry in _laws():
         for alias in entry["aliases"]:
