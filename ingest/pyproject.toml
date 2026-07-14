@@ -51,6 +51,9 @@ explicit = true
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
+markers = [
+    "snapshot: requires the local multi-GB immutable corpus snapshot (release/integration gate)",
+]
 
 [tool.ruff]
 # Exploratory notebooks aren't part of the lint surface (viz-only, user-authored).

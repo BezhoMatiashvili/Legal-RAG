@@ -22,21 +22,37 @@ class Embedded:
     sparse: Sparse
 
 
+def _embedding_model_source(model_name: str, revision: str | None) -> str:
+    """Resolve a pinned Hub model to its immutable local snapshot directory.
+
+    ``BGEM3FlagModel`` does not forward a Hugging Face ``revision`` to all of its
+    internal loaders. Resolving first is therefore the only way to ensure its model
+    and tokenizer come from the same configured commit. The legacy unpinned path is
+    deliberately untouched.
+    """
+    if revision is None:
+        return model_name
+    from huggingface_hub import snapshot_download
+
+    return snapshot_download(repo_id=model_name, revision=revision)
+
+
 class BGEM3Embedder:
     def __init__(self, cfg: Config):
         from FlagEmbedding import BGEM3FlagModel
 
+        model_source = _embedding_model_source(cfg.embed_model, cfg.embedding_revision)
         kwargs = {"use_fp16": cfg.embed_use_fp16}
         if cfg.embed_device:
             kwargs["devices"] = cfg.embed_device
         try:
-            self.model = BGEM3FlagModel(cfg.embed_model, **kwargs)
+            self.model = BGEM3FlagModel(model_source, **kwargs)
         except TypeError:
             # Older FlagEmbedding used `device` instead of `devices`.
             kwargs.pop("devices", None)
             if cfg.embed_device:
                 kwargs["device"] = cfg.embed_device
-            self.model = BGEM3FlagModel(cfg.embed_model, **kwargs)
+            self.model = BGEM3FlagModel(model_source, **kwargs)
         self.batch_size = cfg.embed_batch_size
 
     def _encode(self, texts: list[str]) -> list[Embedded]:
@@ -66,11 +82,14 @@ class BGEM3Embedder:
         return self._encode([text])[0]
 
 
-def make_token_counter(model_name: str) -> Callable[[str], int]:
+def make_token_counter(
+    model_name: str, revision: str | None = None
+) -> Callable[[str], int]:
     """A token counter using the model's own tokenizer (accurate chunk sizing)."""
     from transformers import AutoTokenizer
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    kwargs = {"revision": revision} if revision is not None else {}
+    tokenizer = AutoTokenizer.from_pretrained(model_name, **kwargs)
 
     def count(text: str) -> int:
         if not text:

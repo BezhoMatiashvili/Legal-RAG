@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # ingest/ root →
 from qdrant_client import models  # noqa: E402
 
 from ingest.config import load_config  # noqa: E402
+from ingest.operational import refuse_legacy_operation  # noqa: E402
 from ingest.pipeline import items_path  # noqa: E402
 
 
@@ -50,6 +51,7 @@ def _flush(client, collection: str, ids: list[str], value: bool) -> int:
 
 
 def main() -> None:
+    refuse_legacy_operation("in-place consolidation payload backfill")
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--run", default="latest", help="matsne run to read items from (default: latest)")
     ap.add_argument("--batch", type=int, default=300,
@@ -59,6 +61,11 @@ def main() -> None:
     ap.add_argument("--only-consolidated", action="store_true",
                     help="only set is_consolidated=true (skip the heavy false pass); the "
                     "high-value flag, and far lighter on Qdrant")
+    ap.add_argument("--write-false", action="store_true",
+                    help="opt IN to the false pass. Off by default since the listing-based "
+                    "scripts/reconcile_consolidated.py became the authority: this script's "
+                    "switcher-derived false would wrongly unflag never-amended main "
+                    "(consolidated) acts that reconcile marked true")
     ap.add_argument("--collection", help="override collection name")
     args = ap.parse_args()
 
@@ -102,7 +109,12 @@ def main() -> None:
             if not doc_id or doc_id in seen:
                 continue
             seen.add(doc_id)
-            is_consolidated = bool((doc.get("consolidated_publications") or "").strip())
+            # Trust the item's own flag when present (doc_type=main crawls stamp True by
+            # listing provenance even without a switcher); fall back to the switcher
+            # heuristic for older items that only carry consolidated_publications.
+            is_consolidated = bool(doc.get("is_consolidated")) or bool(
+                (doc.get("consolidated_publications") or "").strip()
+            )
             if is_consolidated:
                 true_ids.append(doc_id)
                 n_true += 1
@@ -110,7 +122,7 @@ def main() -> None:
                     n_written += _flush(client, collection, true_ids, True)
                     true_ids = []
                     time.sleep(args.sleep)  # throttle so a long run can't overwhelm Qdrant
-            elif not args.only_consolidated:
+            elif args.write_false and not args.only_consolidated:
                 false_ids.append(doc_id)
                 n_false += 1
                 if len(false_ids) >= args.batch:
@@ -119,7 +131,7 @@ def main() -> None:
                     time.sleep(args.sleep)
 
     n_written += _flush(client, collection, true_ids, True)
-    if not args.only_consolidated:
+    if args.write_false and not args.only_consolidated:
         n_written += _flush(client, collection, false_ids, False)
 
     print(

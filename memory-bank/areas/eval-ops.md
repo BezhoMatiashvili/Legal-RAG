@@ -14,13 +14,14 @@ This area is the measurement-and-operations half of the repo. `ingest/eval/` is 
 - `.venv/bin/python scripts/verify_all_embedded.py [--sources a,b]` → embed-coverage ground truth, exit 0/1 (`ingest/scripts/verify_all_embedded.py:main`).
 - `.venv/bin/python scripts/verify_delta_embedded.py --runs-since <id>` → per-id chunk-count check for delta runs (`ingest/scripts/verify_delta_embedded.py:main`).
 - `.venv/bin/python scripts/verify_matsne_completeness.py` → live-site completeness audits (`ingest/scripts/verify_matsne_completeness.py:main`).
-- `.venv/bin/python scripts/embed_delta.py` (runs ON the GPU pod) + `.venv/bin/python scripts/merge_delta_collection.py [--dry-run]` → delta embed into `georgian_legal_delta`, then explicit merge into the main collection (`ingest/scripts/merge_delta_collection.py:main`).
-- `.venv/bin/python scripts/runpod_orchestrate.py | runpod_orchestrate_delta.py | runpod_orchestrate_multi.py [terminate]` → GPU embed orchestrators with always-terminate guarantees (`ingest/scripts/runpod_orchestrate.py:main`, `ingest/scripts/runpod_orchestrate_delta.py:main`, `ingest/scripts/runpod_orchestrate_multi.py:main`).
-- `uv run --group publish python scripts/publish_snapshot.py --create|--upload|--verify|--cleanup` → manifest-last snapshot publish to the RunPod network volume (`ingest/scripts/publish_snapshot.py:main`).
+- `.venv/bin/python scripts/validate_supremecourt_partial.py --run-dir <run>` → offline fail-closed admission of the exact graceful four-hour cumulative Supreme Court artifact before dry-run/coverage/GPU work, including independently derived cursors and recursive parent scope/hash/content preservation for resumed runs (`ingest/scripts/validate_supremecourt_partial.py:main`).
+- `.venv/bin/python scripts/embed_delta.py --dry-run --strict ...` → exact source-aware document/chunk manifest without Qdrant writes; actual run-scoped writes require `--apply` and `QDRANT_WRITE_APPROVED=1`.
+- `.venv/bin/python scripts/runpod_orchestrate_delta.py --source <source> --items ... --run-id ... --apply` → one Secure RTX 4090 source-aware delta with separate Qdrant write/recreate and spend approvals, a repository-wide spend lock, continuous reserve checks, and unconditional confirmed termination (`ingest/scripts/runpod_orchestrate_delta.py:main`).
+- `scripts/publish_snapshot.py --upload|--verify --apply --cold-restore-confirmed` → schema-v2 generation transport only; implicit-main `--create` is disabled and upload still requires a proven conditional activator (`ingest/scripts/publish_snapshot.py:main`).
 - `bash ingest/scripts/daily_ingest.sh [--dry-run]` → scrape → `python -m ingest watch --once` → verify_all_embedded gate; flock + coordination-lock aware; systemd units in `ingest/systemd/`.
 - `python scripts/build_phase_c_report.py [--log ...] [--sweep-log ...]` → experiments.jsonl → markdown tables (`ingest/scripts/build_phase_c_report.py:load_rows`).
 - `.venv/bin/python scripts/rerank_latency_probe.py [out.json]` → isolated CPU rerank p50/p95 per depth (`ingest/scripts/rerank_latency_probe.py:main`).
-- `.venv/bin/python scripts/backfill_consolidation.py` → payload-only `is_consolidated` backfill, no re-embed; user-owned per improvement.md (`ingest/scripts/backfill_consolidation.py:main`).
+- `.venv/bin/python scripts/backfill_consolidation.py` → LEGACY switcher-derived payload-only `is_consolidated` backfill (false pass now opt-in `--write-false`); superseded as authority by `ingest/scripts/reconcile_consolidated.py:main` (listing-based, 2026-07-10); user-owned per improvement.md (`ingest/scripts/backfill_consolidation.py:main`).
 
 ## Modules
 
@@ -96,10 +97,10 @@ One-time full-corpus GPU embed orchestrator and the shared RunPod library: encry
 - `ingest/scripts/runpod_orchestrate_multi.py:main` — 4x4090 sharded variant.
 
 ### Delta pipeline (embed_delta / merge_delta_collection / runpod_orchestrate_delta / verify_delta_embedded)
-Ships only new run items to a GPU pod, embeds into `georgian_legal_delta`, pulls the snapshot back, restores locally, then an explicit separate merge.
-- `ingest/scripts/runpod_orchestrate_delta.py:main` — provision → `ingest/scripts/runpod_orchestrate_delta.py:stage_delta_items` → embed on pod (drives `runpod_embed_delta.sh` → embed_delta.py) → pull snapshot (1800s timeout after the 2026-07-09 truncated-tar incident) → `ingest/scripts/runpod_orchestrate_delta.py:step_restore_delta`; try/finally + atexit terminate.
-- `ingest/scripts/embed_delta.py:main` — normalizes RAW run items via `ingest/ingest/sources.py:normalize` — deliberately NOT the snapshot loader, which drops consolidation metadata.
-- `ingest/scripts/merge_delta_collection.py:main` — scroll delta → upsert points verbatim into the main collection (`ingest/scripts/merge_delta_collection.py:merge_collection`); idempotent/additive because point ids are deterministic UUIDv5 over (source, document_id, chunk_index) assigned at embed time by `ingest/ingest/qdrant_store.py:point_id` (id-scheme parity, not a call); `ingest/scripts/merge_delta_collection.py:dry_run` self-test.
+Ships only explicit source items to a uniquely named GPU collection, validates the returned snapshot, restores the staging collection locally, then leaves merge as a separate guarded operation.
+- `ingest/scripts/runpod_orchestrate_delta.py:main` — exact host dry-run and pre-spend local-Qdrant/absent-target proof → owner-only exclusive spend lock → live balance/zero-pod/Secure-4090 stock+price/cleanup-margin/$2-reserve gate → package/key → repeat the live gate immediately before deploy → exactly one provider- and hardware-attested 4090 → monotonic parent billing alarm across all blocking paid work → separate pre-embed checksum → strict embed → snapshot SHA/count/ID/UUID/chunk validation → signal-shielded strict name/ID reconciliation and confirmed termination → target recheck and approved unique local restore. Budget exhaustion bypasses retries; non-strict cleanup never forgets an uncertain deploy name.
+- `ingest/scripts/embed_delta.py:main` — source-aware RAW normalization and exact tokenizer/chunker manifest parity; writes only an explicit run-scoped collection after the dual CLI/env approval.
+- `ingest/scripts/merge_delta_collection.py:run_merge_workflow` — exact run-manifest preflight, Qdrant write lock, durable hashed rollback, idempotent merge/stale-tail cleanup, exact post-check + existing-Supreme preservation, rollback on failure, and cleanup only of the manifest-bound staging collection. The legacy CLI entry point is intentionally disabled under the generation migration.
 - `ingest/scripts/verify_delta_embedded.py:delta_doc_ids` + `ingest/scripts/verify_delta_embedded.py:main` — exact per-id chunk-count verification for `--runs-since` deltas.
 
 ### ingest/scripts/verify_all_embedded.py
@@ -115,9 +116,9 @@ Read-only stdlib dashboards.
 - `ingest/scripts/monitor_server.py:main` — :8765 embed-pod dashboard over SSH.
 
 ### ingest/scripts/publish_snapshot.py
-Publishes the local write-master collection to the RunPod network volume for the scale-to-zero serverless worker.
-- Ordered subcommands `ingest/scripts/publish_snapshot.py:create` → `ingest/scripts/publish_snapshot.py:upload` (resumable, ~24GB) → `ingest/scripts/publish_snapshot.py:verify` (triggers worker restore boot) → `ingest/scripts/publish_snapshot.py:cleanup`; reads `ingest/.env` (RUNPOD_S3_*, RUNPOD_ENDPOINT_ID, never printed).
-- Manifest-last protocol: `ingest/scripts/publish_snapshot.py:_publish_manifest_object` uploads `publish/manifest.json` LAST as the atomic completeness signal, mirrored by `ingest/serverless/qdrant_boot.py:needs_restore`.
+Transports a prebuilt immutable schema-v2 generation to the RunPod network volume; it no longer snapshots an implicit live collection.
+- `ingest/scripts/publish_snapshot.py:upload` rehashes the local owner-only artifact, resumes only on remote size+SHA identity, and requires a proven conditional activator before `_publish_manifest_object` activates `publish/manifest.json` LAST.
+- `ingest/scripts/publish_snapshot.py:verify` requires an explicitly confirmed cold worker and exact generation ID/manifest SHA/point/identity parity. Upload and verify also require `--apply` plus `PUBLISH_REMOTE_APPROVED=1`; legacy create and destructive cleanup are disabled.
 
 ### ingest/scripts/daily_ingest.sh
 3-stage daily pipeline: scrape (seen.sqlite delta-only) → `python -m ingest watch --source all --once` → verify_all_embedded gate. flock self-exclusion; exits 0 without acting when a `coordination/locks` lock is held; every stage idempotent; per-stage timeouts (DAILY_INGEST_*_TIMEOUT); systemd units in `ingest/systemd/`.
@@ -125,7 +126,7 @@ Publishes the local write-master collection to the RunPod network volume for the
 ### Reporting/ops satellites
 - `ingest/scripts/build_phase_c_report.py:load_rows` — experiments.jsonl → markdown tables (`ingest/eval/phase_c_report_tables.md`, feeding `ingest/eval/phase_c_report.md`); paired A/B verdicts (Δ/CI/p/ADOPT-TIE) are NOT in the jsonl — `ingest/scripts/build_phase_c_report.py:parse_paired` regex-scrapes them from sweep stdout logs.
 - `ingest/scripts/rerank_latency_probe.py:main` — reranker-only CPU latency at depth {10,30,50,80} (no co-loaded BGE-M3/Qdrant → no OOM); writes rerank_xval.json (default `/tmp/rerank_xval.json`, argv[1] overrides; the kept copy is `ingest/eval/rerank_xval.json`) used to cross-validate GPU vs CPU scores.
-- `ingest/scripts/backfill_consolidation.py:main` — set_payload-only `is_consolidated` flag (no re-embed; user-owned per improvement.md).
+- `ingest/scripts/backfill_consolidation.py:main` — LEGACY set_payload-only `is_consolidated` flag (no re-embed; false pass opt-in since 2026-07-10; authority = `ingest/scripts/reconcile_consolidated.py:main`).
 - `ingest/scripts/verify_matsne_completeness.py:main` — three live-site audits (`ingest/scripts/verify_matsne_completeness.py:audit_advertised`, reference-closure, id-enum) → residual_missing_ids.txt for seed re-fetch.
 
 ### improvement.md (repo root) + .improvements/
@@ -146,7 +147,7 @@ The gated improvement runbook: hard rules (never pull origin/dev, RERANK_ENABLED
 - Goldset fail-loud tripwires (`reground`, `enforce_holdout`, `lint_span_coverage`): changes to snapshot hygiene, chunk config, or tokenizer make eval ERROR by design — never "fix" by editing the golden set.
 - I1 revert left fragile git state: `ingest/ingest/citations.py` and the two test files are staged-then-deleted (' D', never committed); `.improvements/i1_citation_route_full.patch` is the only copy of that work — a careless `git checkout -- .` or index reset destroys recoverability.
 - I2 is mid-flight and uncommitted (`ingest/eval/translations.py`, `ingest/eval/query_translations_v1.json`): other sessions must not revert or "clean up" these files (coordination protocol in coordination/README.md).
-- RunPod billing leaks: pods must ALWAYS be terminated (`python scripts/runpod_rerank.py down`; an orphaned billing pod has happened); the 120-min watchdog is a backstop, not the protocol.
+- RunPod billing leaks: pods must ALWAYS be terminated (`python scripts/runpod_rerank.py down`; an orphaned billing pod has happened); the 120-min watchdog is a backstop, not the protocol. Source-aware delta spend additionally requires `runpod_spend_lock` from its live account gate through confirmed cleanup, with cost measured from the provision attempt and the $2 reserve checked at each long-phase boundary and on every embed poll/completion check.
 - Delta snapshot pulls can truncate (2026-07-09: dead pod, truncated tar, $0.89 lost) — pull timeout is now 1800s; `tar -tf` any snapshot before restore; a failed pull loses the pod's vectors entirely.
 - `experiments_gpu.jsonl` latency is tunnel RTT, not CPU serving latency — never quote it; use rerank_latency_probe for CPU numbers (full rerank eval OOMs if BGE-M3 + reranker + Qdrant co-load, hence the isolated probe).
 - verify_all_embedded id-parity: ids must come from SourceSpec.id_fields join, not a raw document_id field — ecd/constcourt/tbappeal would otherwise report phantom missing docs.

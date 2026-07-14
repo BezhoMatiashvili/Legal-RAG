@@ -6,7 +6,13 @@ from .dates import (
     iso_to_year_slashed,
     parse_dotted,
 )
-from .documents import docx_to_markdown, pdf_to_markdown
+from .documents import (
+    ExtractionLimits,
+    ExtractionResult,
+    ExtractionStatus,
+    docx_to_markdown,
+    pdf_to_markdown,
+)
 from .json_api import form_post, json_post, loads_maybe_double
 from .markdown import html_to_markdown
 from .search_urls import first_qs_value, generate_start_url_batches, generate_start_urls
@@ -18,6 +24,9 @@ __all__ = [
     "docx_to_markdown",
     "dotnet_date_to_iso",
     "first_qs_value",
+    "ExtractionLimits",
+    "ExtractionResult",
+    "ExtractionStatus",
     "form_post",
     "generate_random_user_agent",
     "generate_start_url_batches",

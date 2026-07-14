@@ -306,6 +306,87 @@ becomes the constraint.
 
 ---
 
+## 3.5 Production-audit backlog (RAG-sensitive — from the 2026-07-11 72-agent audit)
+
+> These 4 are CONFIRMED defects whose FIX changes what is in / retrievable from the live
+> 2.64M-point index (embedded text/vectors, index membership, or DATETIME-filter results), so
+> each alters retrieval and MUST be handled out of band with a measured eval re-baseline — never
+> bundled into a behavior-preserving batch. (The audit's other 22 findings were behavior-
+> preserving and are being fixed directly in unclaimed files by session-prod-audit.) Do these
+> AFTER the CI gate (`.github/workflows/ci.yml`) is live so the re-baseline work is protected.
+
+### A1 — Cleaned-vs-raw writer text divergence  `[requires re-embed — HIGH]`
+**Code status (2026-07-12): FIXED; production migration still required.** All batch,
+watch, and delta writer paths now clean and assess the body before chunking, stamp the
+cleaned state, and quarantine rejected documents consistently. Do not enable scheduled
+ingest until affected live documents are migrated and a same-corpus v2 gate passes.
+
+**Defect:** the base 2.64M index was built from **cleaned** snapshot bodies (`snapshot.py`
+`clean_body = hygiene.clean_text(raw)` → `embed_job`), but the continuous writer paths
+(`pipeline.py:_build_doc_points` via `watch_drain_source`/`ingest_source`, and
+`scripts/embed_delta.py`) chunk+embed the **raw** normalized body (`sources.normalize`, no
+`clean_text`). Empirically ~71% of raw napr bodies carry NUL/control chars absent from the
+cleaned snapshot. **Consequences:** (a) a doc added/updated by watch/delta embeds a different,
+lower-quality vector than the cleaned bulk; (b) `content_hash(raw)` never equals the stored
+cleaned-body hash, so watch skip-unchanged re-embeds every re-emitted base doc once, flipping it
+cleaned→raw and defeating the O(1) skip; (c) chunk `char_start/char_end` shift into raw
+coordinate space while the frozen golden set's spans are offsets into cleaned snapshot bodies →
+qrels silently misalign (undetected by `reground`, which only checks the snapshot). Running the
+documented `daily_ingest.sh`/systemd watch path over napr from offset 0 would silently flip ~71%
+of napr into raw space. **Note:** contracts.md `content-hash-semantics` currently asserts the live
+index hashes the *raw* body — that is factually wrong for the cleaned base (built via the snapshot
+path); reconcile that section as part of this fix. **Fix (out of band):** apply
+`hygiene.clean_text` (+ `assess`/quarantine) to `doc.body_markdown` before `chunk_document` in all
+writer paths, matching the snapshot pipeline; then a coordinated re-embed of affected docs + an
+eval re-baseline; verify golden-set offsets still `reground`. **Until fixed:** do NOT enable the
+daily watch/systemd path.
+
+### A2 — Georgian text-date month parser mis-parses  `[re-derive date payload — MEDIUM]`
+**Code status (2026-07-12): FIXED; stored payload repair still required.** Month matching
+now handles nominative/genitive forms without `rstrip` character-set semantics and validates
+real calendar dates. Existing affected payloads must be re-derived before date filters are certified.
+
+**Defect:** `sources.py:_georgian_month` does `word.strip().rstrip("ის").rstrip("ი")` —
+`str.rstrip` treats its arg as a **char set**, not a suffix, so `მაისი`/`მაისის` (May) strips to
+`მა`, which `stem.startswith(w)` matches to `მარტ` (March) → returns `03`; any token that strips to
+`""` matches the first stem via `startswith("")` → January. Verified on real constcourt dates
+(`"30 მაისი 2016"` → `2016-03-30`). The genitive-syncope forms (თებერვლის/სექტემბრის/ოქტომბრის/
+ნოემბრის/დეკემბრის) currently return `None`. Wrong `doc.date` feeds the DATETIME index and
+`date_from/date_to` filters (and the v2 embed header when `embed_header_v2` is on). **Fix (out of
+band):** match a suffix, e.g. `re.sub(r"(ის|ს|ი)$", "", word.strip())`, and drop the
+`stem.startswith(w)` branch (keep only `w.startswith(stem)`); add regression tests for
+მაისი/მაისის→05 and the genitive-syncope months. Re-derive/re-ingest affected constcourt (and any
+Georgian-text-date) docs; note the date-filter behavior change. (Localised code fix is trivial and
+RAG-neutral under default `embed_header_v2=False`; it is listed here only because it changes stored
+`date` payloads / date-filter results.)
+
+### A3 — merge_delta_collection leaves stale tail chunks  `[deletes live points — HIGH]`
+**Code status (2026-07-12): FIXED for newly generated deltas; legacy repair still required.**
+New points carry a generation chunk count; merge preflights a complete contiguous generation,
+upserts it durably, and only then deletes stale tails. Incomplete/legacy deltas fail closed.
+
+**Defect:** `scripts/merge_delta_collection.py` copies delta points into main but NEVER deletes
+(contracts.md point-identity documents this). A re-chunked doc that lands via delta+merge (fewer
+chunks than before) leaves its old high-index tail chunks orphaned in the live index — queryable/
+citable as current law, and inflating coverage counts. **Fix (out of band):** after merging a
+doc's points, `delete_doc_chunks_from(client, main, source, document_id, n_new_chunks)` — but GATE
+the deletion on a per-doc completeness signal (contiguous `0..max`, or a `.complete` sentinel): a
+PARTIAL/interrupted delta must NOT delete legitimate chunks a prior full embed placed in main.
+Because it deletes from the live index it changes retrieval → re-baseline any touched golden doc.
+
+### A4 — Serverless serving image torch not pinned  `[serving numerics — MEDIUM]`
+**Defect:** `serverless/requirements.txt` floats `torch` on the cu124 index; the serverless worker
+is the live serving path (`SEARCH_BACKEND=remote`) and computes the query vector + `sigmoid(logit)`
+rerank scores on its own torch, with no numeric gate. A rebuild can resolve a newer torch and shift
+FP16 query-embedding / rerank numerics against the frozen corpus and the `rerank_min_score=0.3`
+boundary. **Fix (out of band):** pin to the EXACT cu124 wheel currently running in the deployed
+worker — capture via `pip freeze` on the live image. Do NOT pin to `uv.lock`'s `torch 2.x+cpu`:
+that crosses the CPU→GPU channel and can itself move numerics. Pinning to the already-deployed GPU
+version is byte-identical; a mechanical uv.lock pin is not. Also pin the base image digest + the
+floating utility deps.
+
+---
+
 ## 4. Explicit DO-NOT list (measured or evidence-based)
 
 - **MMR diversity** — measured **harmful** here (nDCG 0.289 → 0.074). Off, stays off.
@@ -368,6 +449,7 @@ the §1 baselines before the next gate decision. Never compare across corpus sta
 | 2026-07-10 | **I4 agentic playbook + abstention + existence-check** | 2,637,645 | docstrings only; calibration `scripts/calibrate_min_score.py` rc=50, translations on, GPU | gate = G5 only: 264 tests pass, ruff clean, fingerprint unchanged, retrieval untouched | tool descriptions verified via `mcp.list_tools()` (all markers render); CLI smoke sane | — | **KEPT** | abstention threshold **0.92** from calibration (top-1 hit p1=0.926; scores saturate — misses median 0.997, so identity check carries the contract; only 10% of misses fall below 0.92). RERANK_MIN_SCORE stays 0.3 (calibration measured top-1 only). ⚠ MCP server must be reconnected (/mcp) to serve the new docstrings |
 | 2026-07-10 | **I7 ONNX int8 reranker** | 2,637,645 | rerank@50, translations on, `RERANK_BACKEND=onnx` (CPU) vs fp32 GPU reference | **nDCG 0.320 vs 0.320 (Δ=0.000, gate ≤0.01) · rerank p50 28.2 s vs ~72 s fp32 CPU (0.39×, gate ≤0.5×)** | all slices within noise (XL nDCG −0.002, citation R@5 +0.059); probe: top-10 overlap 9–10/10, ρ≥0.97 | — | **KEPT** (knob, default torch) | 570 MB int8 via `scripts/export_onnx_reranker.py` (torch exporter; optimum refused — would downgrade transformers <5). int8 scores drift ≤0.1 → re-calibrate abstention before making onnx the serving default |
 | 2026-07-11 | **I5 golden_set_v2 (partial)** | 2,638,482 | measurement tooling — not a retrieval change | n/a (grows the yardstick, doesn't move it): v2 = 337 verified pairs vs v1 103 (natural_question 75, legal_citation 67, cross_lingual 60, keyword 55, temporal 40, paraphrase 40) | v2 hybrid slice signal @2,638,482: temporal 0.795 nDCG (easiest), paraphrase 0.105 (hardest, by design zero content-word overlap), citation 0.393, XL 0.382; v1 consistency: eval_set_hash 985e1bc3e5cbf51e frozen, recall10 0.359 reproduces | — | **LANDED; v2 is now the DEFAULT GATE (frozen @337, user sign-off 2026-07-11)** | loader invariants green (reground/lint 337/337); `--golden-set` default flipped v1→v2; v1 stays hash-neutral historical anchor (pre-switch rows comparable), v2 folds `eval_set:v2`. Slice-gate caveat: paraphrase/temporal n=40 (<80) → directional until v3. Pending ~150 pairs in `.golden_v2_pending/` land as future **v3** (frozen v2 never mutated). Commits 4eb2e0e→(this) |
+| 2026-07-13 | I1 `CITATION_ROUTE=full` corpus-derived aliases | 2,654,818 | hybrid, translations v2, no rerank; matched `ids`→`full`; 43-law/73-alias candidate SHA `e2143b46f24b8dd34f59d51495b9b15c45c8ee898a6a07d6b33a778b9323f26f` | legal-citation nDCG@10 **0.492→0.492 (Δ +0.000)** and R@10 **0.642→0.642 (Δ +0.000)**; gate requires ≥+0.03 | causal pair: all overall/slice IR metrics unchanged; known-item identity@1 0.525→0.525 and identity@10 0.713→0.713; hybrid-score confident-wrong proxy 12/122→13/122; standalone p50 477.3→477.9 ms (+0.1%) | 1.00 (paired target metrics) | **REVERTED; NO RERANK / NO DEPLOY** | only 2/337 new routes, both wrong for the decision-level gold (`q012`, `q080`); 0 correct-target firings. Matcher stress probes also exposed unsafe amendment/repeal and multi-law routing, so the candidate failed the cheap gate and was removed before the production-rerank confirmation. Paired evidence: `ingest/.state/answer_eval/citation_full_paired_hybrid_full337.json` |
 
 ---
 

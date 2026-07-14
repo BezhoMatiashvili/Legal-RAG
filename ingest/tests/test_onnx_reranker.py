@@ -40,6 +40,24 @@ def test_onnx_reranker_fails_loud_without_export():
         ONNXBGEReranker(cfg)
 
 
+def test_onnx_missing_export_is_checked_before_optional_imports(monkeypatch):
+    import builtins
+
+    cfg = _cfg(rerank_backend="onnx", onnx_rerank_path=Path("/nonexistent/model.onnx"))
+    real_import = builtins.__import__
+    imported_optional = []
+
+    def guarded_import(name, *args, **kwargs):
+        if name.split(".", 1)[0] in {"numpy", "onnxruntime", "transformers"}:
+            imported_optional.append(name)
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    with pytest.raises(FileNotFoundError, match="export_onnx_reranker"):
+        ONNXBGEReranker(cfg)
+    assert imported_optional == []
+
+
 def test_make_reranker_dispatches_on_backend():
     cfg = _cfg(rerank_backend="onnx", onnx_rerank_path=Path("/nonexistent/model.onnx"))
     with pytest.raises(FileNotFoundError):

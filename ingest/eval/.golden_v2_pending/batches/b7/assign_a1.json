@@ -1,0 +1,92 @@
+[
+ {
+  "query_type": "legal_citation",
+  "source": "constcourt",
+  "document_id": "101",
+  "stratum": "constcourt",
+  "title": "ლელა ინწკირველი და ეკატერინე ჩაჩანიძე საქართველოს პარლამენტის წინააღმდეგ.",
+  "body_char_len": 30901,
+  "qid": "q427"
+ },
+ {
+  "query_type": "natural_question",
+  "source": "constcourt",
+  "document_id": "13467",
+  "stratum": "constcourt",
+  "title": "გიორგი ლაბაძე საქართველოს პარლამენტის წინააღმდეგ",
+  "body_char_len": 68508,
+  "qid": "q426"
+ },
+ {
+  "query_type": "keyword",
+  "source": "constcourt",
+  "document_id": "18542",
+  "stratum": "constcourt",
+  "title": "ა(ა)იპ „საქართველოს ახალგაზრდა იურისტთა ასოციაცია“ და ა(ა)იპ „მედიის განვითარების ფონდი“ საქართველოს პარლამენტის წინააღმდეგ",
+  "body_char_len": 241313,
+  "qid": "q443"
+ },
+ {
+  "query_type": "paraphrase",
+  "source": "constcourt",
+  "document_id": "402",
+  "stratum": "constcourt",
+  "title": "მოსარჩელე ნელი ნებიერიძე, ზურაბ ინაშვილი და სხვები (სულ 17 მოსარჩელე) საქართველოს პარლამენტის წინაამღდეგ.",
+  "body_char_len": 13280,
+  "qid": "q446"
+ },
+ {
+  "query_type": "keyword",
+  "source": "ecd",
+  "document_id": "197723",
+  "stratum": "ecd",
+  "title": "330210017001859901 — განჩინება/გადაწყვეტილება",
+  "body_char_len": 16693,
+  "qid": "q412"
+ },
+ {
+  "query_type": "paraphrase",
+  "source": "ecd",
+  "document_id": "5086156",
+  "stratum": "ecd",
+  "title": "351210018002761410 — გადაწყვეტილება",
+  "body_char_len": 14988,
+  "qid": "q414"
+ },
+ {
+  "query_type": "paraphrase",
+  "source": "ecd",
+  "document_id": "5336598",
+  "stratum": "ecd",
+  "title": "020100118002791152 — განაჩენი",
+  "body_char_len": 31989,
+  "qid": "q452"
+ },
+ {
+  "query_type": "legal_citation",
+  "source": "ecd",
+  "document_id": "5532195",
+  "stratum": "ecd",
+  "title": "190100119003038760 — განაჩენი",
+  "body_char_len": 26638,
+  "qid": "q436"
+ },
+ {
+  "query_type": "temporal",
+  "source": "matsne",
+  "document_id": "1001911",
+  "stratum": "matsne/საქართველოს მინისტრის ბრძანება",
+  "title": "ზოგიერთი პროფესიული სწავლების ცენტრის ლიკვიდაციის შესახებ",
+  "body_char_len": 13218,
+  "qid": "q424"
+ },
+ {
+  "query_type": "cross_lingual",
+  "source": "matsne",
+  "document_id": "109090",
+  "stratum": "matsne/consolidated",
+  "title": "თავისუფლების აღკვეთით მსჯავრდებულ პირთა სასჯელის მოსახდელად იმ სახელმწიფოსათვის გადაცემის შესახებ, რომლის მოქალაქენი ისინი არიან",
+  "body_char_len": 1969,
+  "qid": "q418"
+ }
+]

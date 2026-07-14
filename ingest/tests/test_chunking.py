@@ -1,4 +1,4 @@
-from ingest.chunking import build_embed_text, chunk_document
+from ingest.chunking import _pack, _split_oversized_run, build_embed_text, chunk_document
 
 
 def test_empty_document_yields_no_chunks():
@@ -51,6 +51,81 @@ def test_packing_respects_budget_and_overlaps():
 
     # chunk indices are contiguous from 0.
     assert [c.chunk_index for c in chunks] == list(range(len(chunks)))
+
+
+def test_overlap_seed_never_pushes_full_atom_over_budget():
+    text = "one two. " + " ".join(f"word{i}" for i in range(10)) + "."
+    chunks = chunk_document(text, max_tokens=10, overlap=2, min_tokens=1)
+
+    assert [chunk.token_count for chunk in chunks] == [2, 10]
+    assert all(chunk.token_count <= 10 for chunk in chunks)
+
+
+def test_small_tail_is_not_folded_when_combined_chunk_would_overflow():
+    first = " ".join(f"first{i}" for i in range(9)) + "."
+    text = first + " tail1 tail2."
+    chunks = chunk_document(text, max_tokens=10, overlap=0, min_tokens=4)
+
+    assert [chunk.token_count for chunk in chunks] == [9, 2]
+    assert all(chunk.token_count <= 10 for chunk in chunks)
+
+
+def _subword_count(s: str) -> int:
+    """Simulates a real subword tokenizer: ~1 token per 4 chars, never zero for non-empty."""
+    return max(1, -(-len(s) // 4)) if s else 0
+
+
+def test_unsplittable_run_over_budget_is_hard_split_not_raised():
+    # A single whitespace-free run (e.g. an inline base64 data URI) long enough that even
+    # one "word" blows the token budget under a real tokenizer. Must not raise or crash —
+    # a data-quality edge case in one document must never kill ingestion of that document.
+    blob = "data:image/jpeg;base64," + "A" * 2000
+    text = f"preamble sentence here. {blob} trailing sentence after."
+    chunks = chunk_document(text, max_tokens=50, overlap=0, min_tokens=1, count_tokens=_subword_count)
+
+    assert chunks  # did not raise, produced real output
+    assert all(c.token_count <= 50 for c in chunks)
+    # The blob survives whole across its split pieces — nothing was silently dropped.
+    reconstructed = "".join(
+        c.text.replace("preamble sentence here.", "")
+        .replace("trailing sentence after.", "")
+        .strip()
+        for c in chunks
+    )
+    assert blob in reconstructed or blob == reconstructed
+
+
+def test_split_oversized_run_preserves_text_and_offsets():
+    blob = "B" * 777
+    pieces = _split_oversized_run(blob, start=100, max_tokens=50, count=_subword_count)
+
+    assert all(tok <= 50 for _, tok, _, _ in pieces)
+    # Offsets are contiguous and reconstruct the original blob exactly.
+    assert "".join(p[0] for p in pieces) == blob
+    assert pieces[0][2] == 100
+    assert pieces[-1][3] == 100 + len(blob)
+    for (_, _, _, end), (_, _, next_start, _) in zip(pieces, pieces[1:]):
+        assert end == next_start
+
+
+def test_split_oversized_run_bottoms_out_at_one_char():
+    # A pathological counter that reports every non-empty string as over budget must not
+    # infinite-loop — recursion bottoms out at a single character and returns it as-is.
+    pieces = _split_oversized_run("xyz", start=0, max_tokens=0, count=lambda s: len(s) + 1)
+    assert [p[0] for p in pieces] == ["x", "y", "z"]
+
+
+def test_adversarial_overlap_and_tail_pack_never_exceeds_budget():
+    atoms = [
+        ("a0.", 1, 0, 3),
+        ("b0.", 1, 5, 8),
+        ("c0 c1 c2 c3 c4 c5 c6 c7 c8.", 9, 10, 37),
+    ]
+
+    packed = _pack(atoms, max_tokens=10, overlap=3, min_tokens=3)
+
+    assert [piece[1] for piece in packed] == [2, 10]
+    assert all(piece[1] <= 10 for piece in packed)
 
 
 def test_article_markers_start_new_sections_and_stay_in_body():

@@ -14,16 +14,74 @@ serverless GraphQL mutations are under-documented and Cloudflare-fronted.
 
 1. **Network volume** — Storage → New network volume:
    - Datacenter: **EU-CZ-1** (has the S3-compatible gateway and is close; fallback: US-KS-2).
-   - Size: **70 GB** (35 GB restored storage + ~24 GB snapshot + ~5 GB HF model cache
-     + headroom) ≈ **$4.90/mo** at $0.07/GB/mo. Volumes can grow but not shrink.
+   - Size: **70 GB** (~24 GB current snapshot + ~5 GB HF model cache + room for at least
+     one previous immutable snapshot and headroom) ≈ **$4.90/mo** at $0.07/GB/mo.
+     Restored Qdrant storage is on container disk, not this volume. Volumes can grow but not shrink.
    - Note the volume ID — it is also the S3 **bucket name**.
 2. **S3 API key** — Settings → S3 API Keys → create. Record access + secret key.
-3. **Build & push the image** (Docker Hub free account):
+3. **Build & push the image** (Docker Hub free account). This remains a release hold until
+   the read-only known-good worker handoff provides all of the values below. Do not infer a
+   base digest, CUDA build, torch wheel, Qdrant checksum, or dependency hash. The committed
+   `serverless/requirements.txt` and `runtime-identity.unconfigured.json` are deliberately
+   rejected by the production Dockerfile.
+
+   Place the separately acquired Qdrant archive, the official version-matched checksum
+   asset, complete pip `--require-hashes` lock, and validated runtime identity JSON inside
+   the `ingest/` build context. The identity must include the checksum asset's SHA-256.
+   Preflight them before invoking Docker; this performs only local reads and hashing:
+
    ```bash
    cd ingest
-   docker build -f serverless/Dockerfile -t <user>/legal-search-worker:v1 .
-   docker push <user>/legal-search-worker:v1
+   python scripts/supply_chain.py validate-build-inputs \
+     --base-image "$PYTHON_BASE_IMAGE" \
+     --qdrant-version "$QDRANT_VER" \
+     --qdrant-archive-url "$QDRANT_ARCHIVE_URL" \
+     --qdrant-archive-sha256 "$QDRANT_ARCHIVE_SHA256" \
+     --qdrant-checksum-source-url "$QDRANT_CHECKSUM_SOURCE_URL" \
+     --qdrant-checksum-evidence "$QDRANT_CHECKSUM_EVIDENCE" \
+     --qdrant-archive "$QDRANT_ARCHIVE" \
+     --requirements-lock "$SERVERLESS_REQUIREMENTS_LOCK" \
+     --runtime-identity "$SERVERLESS_RUNTIME_IDENTITY" \
+     --known-good-worker-artifact "$KNOWN_GOOD_WORKER_ARTIFACT"
+
+   docker build --platform linux/amd64 -f serverless/Dockerfile \
+     --build-arg PYTHON_BASE_IMAGE \
+     --build-arg QDRANT_VER \
+     --build-arg QDRANT_ARCHIVE_URL \
+     --build-arg QDRANT_ARCHIVE_SHA256 \
+     --build-arg QDRANT_CHECKSUM_SOURCE_URL \
+     --build-arg QDRANT_ARCHIVE \
+     --build-arg QDRANT_CHECKSUM_EVIDENCE \
+     --build-arg SERVERLESS_REQUIREMENTS_LOCK \
+     --build-arg SERVERLESS_RUNTIME_IDENTITY \
+     --build-arg KNOWN_GOOD_WORKER_ARTIFACT \
+     -t "$CANDIDATE_IMAGE_TAG" .
    ```
+
+   The runtime identity must bind the digest-pinned Python base, exact Python and
+   `torch+cuNNN` versions, CUDA runtime, validated torch wheel SHA-256, complete lock-file
+   SHA-256, the captured official version-specific Qdrant checksum asset and its digest,
+   target
+   `linux/amd64`, and the SHA-256 of the known-good worker evidence artifact. The build
+   uses the locally supplied Qdrant archive and performs no archive download. It verifies
+   the checksum before extraction, installs only hash-locked wheels, runs `pip check`, and
+   compares installed Python/torch/CUDA identities to the evidence.
+
+   Pushing, scanning, and deployment require separate approval. Once the exact immutable
+   candidate image is already present in the local Docker daemon and Syft plus a cached
+   Grype database are installed, emit owner-only evidence without pulls or database updates:
+
+   ```bash
+   python scripts/supply_chain.py emit-release-audit \
+     --image "$CANDIDATE_IMAGE_DIGEST_REF" \
+     --output-dir "$RELEASE_EVIDENCE_DIR"
+   ```
+
+   This writes `sbom.cdx.json`, `vulnerabilities.json`, and a checksum-bearing
+   `provenance.json` into a new `0700` directory with `0600` files. It fails if the image
+   digest is not already local, the scanner database is unavailable, or the destination
+   exists. Review the vulnerability report as a release gate; the script does not suppress
+   findings or choose a severity exception policy.
 4. **Serverless endpoint** — Serverless → New Endpoint:
    - Image: `<user>/legal-search-worker:v1`.
    - GPUs: 16 GB tier (A4000 / RTX 4000 Ada / RTX 2000 Ada, $0.58/hr) with the 24 GB tier
@@ -34,18 +92,23 @@ serverless GraphQL mutations are under-documented and Cloudflare-fronted.
    - **Execution timeout: 1800 s** (the first boot after a publish sha-checks + restores
      ~24 GB — 10–20 min). Idle timeout: 60 s. FlashBoot: on.
    - Attach the network volume (mounts at `/runpod-volume`).
-   - Container disk: ≥ 20 GB (the image is ~8 GB unpacked).
+   - **Container disk: ≥ 80 GB** (hard requirement: ~8 GB image + ~35 GB restored Qdrant
+     + recovery temp/headroom). The worker refuses to boot below 64 GB by default; keep the
+     80 GB allocation until peak restore usage has been measured in the selected GPU tier.
    - Env vars (no secrets needed — Qdrant is loopback-only inside the worker, and the
      queue API is authenticated by RunPod itself):
      ```
-     COLLECTION_NAME=georgian_legal
      EMBED_DEVICE=cuda          EMBED_USE_FP16=true    EMBED_BATCH_SIZE=16
      RERANK_ENABLED=true        RERANK_DEVICE=cuda     RERANK_USE_FP16=true
      RERANK_CANDIDATES=80       RERANK_MIN_SCORE=0.3
      QUERY_LOG_ENABLED=false    HF_HOME=/runpod-volume/hf
      ```
-     Keep `RERANK_CANDIDATES`/`RERANK_MIN_SCORE` in lockstep with ingest/.env — a drift
-     silently changes scores (compare via `legal_collection_info`, which reports them).
+     Do not set `COLLECTION_NAME`, `GENERATION_ID`, or model/revision identity on the
+     endpoint: the worker derives and hard-binds those values from the verified publish.
+     Keep retrieval-policy and chunking knobs such as `RERANK_CANDIDATES`,
+     `RERANK_MIN_SCORE`, `RERANK_BACKEND`, `CITATION_ROUTE`, and `CHUNK_*` exactly aligned
+     with the generation. Drift is detected against the generation fingerprint and boot
+     fails closed before any model import.
 5. **ingest/.env additions** (names only — values stay out of git):
    ```
    RUNPOD_ENDPOINT_ID=...      # from the endpoint page
@@ -80,29 +143,48 @@ false (no collection yet) — expected.
 
 ## 3. Seeding / publishing data
 
-```bash
-cd ingest
-uv run --group publish python scripts/publish_snapshot.py --create   # ~5–20 min, 24 GB local
-uv run --group publish python scripts/publish_snapshot.py --upload   # hours; resumable — rerun anytime
-uv run --group publish python scripts/publish_snapshot.py --verify   # wakes worker; restore 10–20 min
-uv run --group publish python scripts/publish_snapshot.py --cleanup  # reclaim local disk
-```
+Remote publishing is intentionally blocked until an immutable full-corpus generation and its
+Qdrant snapshot have passed exact verification, a known-good runtime identity is recorded, and
+the remote store's conditional compare-and-swap behavior has been proven. The old
+`publish_snapshot.py --create` path is permanently disabled: it must never snapshot the implicit
+live/legacy collection.
+
+Prepare the local generation with `scripts/create_generation.py`, verify it with
+`scripts/verify_generation.py`, and persist a `scripts/promote_generation.py plan`. Snapshot
+creation and remote activation then require a separately approved generation-specific backend.
+The stock publisher deliberately has no default manifest activator and therefore refuses before
+S3 access. When a proven activator is supplied by deployment integration, upload and verification
+still require all of `--apply`, `PUBLISH_REMOTE_APPROVED=1`, and the explicit cold-restore safety
+confirmation. `--cleanup` is a plan only; deletion additionally requires `--apply` and
+`ARTIFACT_PRUNE_APPROVED=1`.
 
 - The upload prints observed Mbps after the first parts — abort early if the projection is
   unacceptable and rerun overnight (it resumes from the last completed 256 MB part).
 - `manifest.json` is uploaded **last**: it is the atomic publish signal the worker's
   restore keys on. Never place a manifest for a snapshot that isn't fully uploaded.
-- `--verify` uses the worker's `refresh` op, so it *applies* the publish even on a warm
-  worker (which never re-runs its boot-time restore check), then asserts restore status +
-  point parity. Its budget is `PUBLISH_VERIFY_TIMEOUT` (default 1800 s) — deliberately not
-  the day-to-day `RUNPOD_API_TIMEOUT`.
-- Belt and braces: the worker also re-checks the manifest cheaply before *every* job, so a
-  publish is picked up even if `--verify` is never run.
-- A failed restore does not take the worker down — it keeps serving the previous data but
-  prepends a loud `WARNING: worker data may be STALE` line to every response, and a failed
-  *boot* makes every op return an error instead of crash-looping (retry with the `refresh`
-  op after fixing the cause).
-- Republishing later: same commands.
+- `--verify` uses the worker's `refresh` op and has a `PUBLISH_VERIFY_TIMEOUT` budget
+  (default 1800 s), deliberately separate from the day-to-day `RUNPOD_API_TIMEOUT`. A
+  process that imported search for generation A never rebinds itself to generation B: a
+  refresh may stage B as its independent physical collection, but that process immediately
+  abstains with `cold restart required`. Start a fresh worker, then verify its health.
+- On cold boot the handler validates `manifest.json` and `ACTIVE`, the exact physical
+  collection/count/schema/payload identity, and the model/vector/chunk/retrieval
+  fingerprints. It hard-binds the physical collection plus immutable model revisions before
+  importing the MCP search module. Ambient `COLLECTION_NAME`, model, revision, or generation
+  values cannot redirect the worker.
+- Before every operation the worker rechecks the current publish/ACTIVE identity and the
+  live Qdrant generation. A stale result, changed publication, non-green collection, count
+  drift, or payload-identity drift makes health false and every retrieval operation abstain.
+  The previous generation is not silently served after publication advances.
+- **Warm search-runtime replacement is deliberately refused.** For a publish today,
+  temporarily disable FlashBoot, drain active work, and start a fresh worker so binding
+  occurs before MCP import. Do not treat this as high-availability promotion: production
+  updates still require blue/green collections, full logical verification, and an alias
+  swap before switching `SEARCH_BACKEND=remote`.
+- A failed cold restore makes every op return an error instead of crash-looping; fix the cause and
+  retry on empty ephemeral storage.
+- Republishing later means creating and verifying a new generation; immutable snapshot keys are
+  never reused or overwritten.
 - Steady state should move to small delta publishes (the 2.4 GB delta collection) instead
   of 24 GB fulls — not implemented yet; see plan notes.
 
@@ -134,8 +216,9 @@ Serverless has no orphaned-pod risk (nothing bills at idle). Three levels:
 1. **Pause**: endpoint → max workers 0. $0 compute, config preserved.
 2. **Delete endpoint**: console → endpoint → delete. Remote mode starts returning the
    actionable error; flip `SEARCH_BACKEND=local` to keep working.
-3. **Delete the volume**: console → Storage. Stops the $4.90/mo. Safe: the local Qdrant is
-   authoritative and `publish_snapshot.py --create` reproduces the snapshot.
+3. **Delete the volume**: console → Storage. Stops the $4.90/mo. Do this only when the immutable
+   generation snapshot, manifest, checksums, runtime identity, and rollback target are retained
+   and independently verified; the mutable local Qdrant is not a reproducible backup.
 
 Key rotation: revoke the S3 key (Settings → S3 API Keys) and/or the restricted
 `RUNPOD_API_KEY`; update ingest/.env.

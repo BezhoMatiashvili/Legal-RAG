@@ -70,7 +70,22 @@ def parse_args(argv=None) -> argparse.Namespace:
         action="store_true",
         help="Disable the live progress display.",
     )
+    parser.add_argument(
+        "--max-runtime-seconds",
+        type=_positive_int,
+        help=(
+            "gracefully close after this many seconds (Scrapy CLOSESPIDER_TIMEOUT); "
+            "in-flight requests/items are drained before final artifacts are written"
+        ),
+    )
     return parser.parse_args(argv)
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
 
 
 def select_spiders(available, requested) -> list[str]:
@@ -92,6 +107,33 @@ def select_spiders(available, requested) -> list[str]:
     return ordered
 
 
+def crawl_quality_issues(crawlers) -> list[str]:
+    """Return actionable reasons a combined run must not be treated as complete."""
+    issues: list[str] = []
+    for crawler in crawlers:
+        stats = crawler.stats.get_stats()
+        name = getattr(crawler.spider, "name", crawler.spidercls.name)
+        reason = stats.get("finish_reason")
+        failures = int(stats.get("quality/failures", 0))
+        spider_exceptions = sum(
+            int(value)
+            for key, value in stats.items()
+            if key.startswith("spider_exceptions/")
+        )
+        intentional_partial = reason == "closespider_timeout" and bool(
+            getattr(crawler.spider, "partial_by_design", False)
+        )
+        if reason != "finished" and not intentional_partial:
+            issues.append(f"{name}: finish_reason={reason!r}")
+        if failures:
+            issues.append(
+                f"{name}: {failures} completeness-affecting request/response failure(s)"
+            )
+        if spider_exceptions:
+            issues.append(f"{name}: {spider_exceptions} callback exception(s)")
+    return issues
+
+
 def main(argv=None) -> None:
     args = parse_args(argv)
     _bootstrap_project_dir()
@@ -106,6 +148,12 @@ def main(argv=None) -> None:
         settings.set("DEDUP_ENABLED", False, priority="cmdline")
     if args.no_progress:
         settings.set("PROGRESS_DISPLAY_ENABLED", False, priority="cmdline")
+    if args.max_runtime_seconds:
+        # CloseSpider asks the engine to close; Scrapy still drains the active request and
+        # item pipeline before ``spider.closed`` atomically finalizes the partial artifact.
+        settings.set(
+            "CLOSESPIDER_TIMEOUT", args.max_runtime_seconds, priority="cmdline"
+        )
 
     process = CrawlerProcess(settings)
     spiders = select_spiders(process.spider_loader.list(), args.only)
@@ -119,13 +167,24 @@ def main(argv=None) -> None:
         spider_kwargs["end_date"] = args.end_date
 
     declare_spiders(spiders)
+    crawlers = []
     for name in spiders:
-        process.crawl(name, **spider_kwargs)
+        crawler = process.create_crawler(name)
+        crawlers.append(crawler)
+        process.crawl(crawler, **spider_kwargs)
 
     try:
         process.start()  # blocks until all crawls finish
     finally:
         finish_dashboard()
+    issues = crawl_quality_issues(crawlers)
+    if issues:
+        print(
+            "crawl did not satisfy the production completeness gate:", file=sys.stderr
+        )
+        for issue in issues:
+            print(f"  - {issue}", file=sys.stderr)
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

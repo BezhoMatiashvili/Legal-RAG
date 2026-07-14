@@ -7,6 +7,8 @@ regression entry. The trustworthy full-corpus numbers come in Part 3.
 
 import json
 
+import pytest
+
 from ingest.chunking import default_token_counter
 from eval import explog, goldset
 from eval.backend import MODES, ChunkRecord, FakeBackend
@@ -47,6 +49,7 @@ def test_explog_roundtrip_and_stable_hash(tmp_path):
     assert rows[0]["config_hash"] == h1
 
 
+@pytest.mark.snapshot
 def test_full_pipeline_over_snapshot_logs_a_run(tmp_path):
     gold = goldset.load_golden_set()
     bodies = goldset.SnapshotBodies(needed=goldset.gold_docs(gold))

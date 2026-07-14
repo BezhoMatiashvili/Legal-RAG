@@ -37,9 +37,16 @@ from pathlib import Path
 # --- paths / constants --------------------------------------------------------
 INGEST = Path(__file__).resolve().parents[1]                 # .../Georgia-Legal-Search/ingest
 REPO = INGEST.parent
-WORKDIR = Path.home() / "gpu_embed_work"                     # under /home (not tmpfs): holds keys, enc payload, OUT snapshot
+_workdir_value = os.environ.get("GPU_WORKDIR")
+WORKDIR = (
+    (INGEST / _workdir_value if not Path(_workdir_value).is_absolute() else Path(_workdir_value))
+    if _workdir_value
+    else INGEST / ".state" / "gpu-work"
+)
 CPU_REF = INGEST / "snapshots" / "v1" / "checksum_cpu.json"
 sys.path.insert(0, str(INGEST))                              # import the local `ingest` package
+
+from ingest.operational import refuse_legacy_operation  # noqa: E402
 
 UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
       "Chrome/125.0.0.0 Safari/537.36")
@@ -77,9 +84,11 @@ def log(msg: str) -> None:
 
 def _api_key() -> str:
     from dotenv import dotenv_values
-    key = dotenv_values(INGEST / ".env").get("RUNPOD_API_KEY") or os.environ.get("RUNPOD_API_KEY")
+    key = os.environ.get("RUNPOD_API_KEY") or dotenv_values(INGEST / ".env").get(
+        "RUNPOD_API_KEY"
+    )
     if not key:
-        sys.exit("RUNPOD_API_KEY not found in ingest/.env")
+        sys.exit("RUNPOD_API_KEY is required")
     return key
 
 
@@ -91,9 +100,13 @@ def gql(query: str, variables: dict | None = None) -> dict:
     if _KEY is None:
         _KEY = _api_key()
     body = json.dumps({"query": query, "variables": variables or {}}).encode()
+    # Auth via `Authorization: Bearer` rather than a `?api_key=` query string: a secret in the
+    # URL is captured verbatim by CDN/proxy/server access logs, while a header is not. RunPod's
+    # GraphQL API accepts the Bearer header (same scheme remote_search / session_monitor use).
     req = urllib.request.Request(
-        f"https://api.runpod.io/graphql?api_key={_KEY}", data=body,
-        headers={"Content-Type": "application/json", "User-Agent": UA}, method="POST")
+        "https://api.runpod.io/graphql", data=body,
+        headers={"Content-Type": "application/json", "User-Agent": UA,
+                 "Authorization": f"Bearer {_KEY}"}, method="POST")
     with urllib.request.urlopen(req, timeout=60) as resp:
         out = json.loads(resp.read().decode())
     if out.get("errors"):
@@ -206,9 +219,9 @@ def pull_file(remote_path: str, local: Path, ip: str, port: int, timeout: int = 
 # --- steps --------------------------------------------------------------------
 def step_checksum_ref() -> None:
     if not CPU_REF.exists():
-        log("CPU checksum reference missing — generating (CPU embed of the pin sentence)...")
-        run([str(INGEST / ".venv/bin/python"), "-m", "ingest", "embed", "--checksum"],
-            timeout=1200)
+        raise RuntimeError(
+            f"immutable CPU checksum reference missing at {CPU_REF}; refusing to regenerate it"
+        )
     ref = json.loads(CPU_REF.read_text())
     assert len(ref["dense"]) == 1024, "checksum_cpu.json dense dim != 1024"
     log(f"CPU checksum ref ok: sha={ref['sha']} dims={len(ref['dense'])}")
@@ -279,7 +292,11 @@ def step_provision(pubkey: str) -> tuple[str, str, float]:
             }}
             try:
                 data = gql(mutation, variables)
-            except RuntimeError as e:
+            except Exception as e:  # noqa: BLE001 - transport faults (HTTPError/URLError/
+                # TimeoutError) are NOT RuntimeError; catching only RuntimeError let them escape
+                # step_provision uncaught, so a lost response after RunPod created the pod left it
+                # billing with its id recorded nowhere. Catch broadly so the loop retries; the
+                # `terminate` subcommand's name-reconciliation reaps any pod a lost response made.
                 log(f"  deploy attempt {attempt} error: {e}")
                 time.sleep(20)
                 continue
@@ -355,6 +372,12 @@ def step_launch(ip: str, port: int, passphrase: str) -> None:
 
 def step_poll(ip: str, port: int) -> int:
     deadline = time.time() + EMBED_DEADLINE_S
+    # A single ssh_ok()==False is ambiguous: the embed may be dead, OR the SSH round-trip
+    # just blipped (ConnectTimeout, transient network, a busy sshd). Declaring death on one
+    # blip terminates the pod and throws away the multi-hour, most-expensive embed. Require
+    # several CONSECUTIVE not-alive readings (DONE re-checked each time) before giving up.
+    _DEAD_CONFIRM = 3
+    dead_polls = 0
     while time.time() < deadline:
         if ssh_ok(ip, port, "test -f /workspace/out/DONE"):
             pts = ssh_capture(ip, port, "cat /workspace/out/DONE").strip()
@@ -369,9 +392,18 @@ def step_poll(ip: str, port: int) -> int:
         if not alive:
             if ssh_ok(ip, port, "test -f /workspace/out/DONE"):
                 continue
-            full = ssh_capture(
-                ip, port, "tail -n 40 /workspace/out/launch.out /workspace/out/embed.log 2>/dev/null")
-            raise RuntimeError("embed process ended without DONE:\n" + full)
+            dead_polls += 1
+            if dead_polls >= _DEAD_CONFIRM:
+                full = ssh_capture(
+                    ip, port,
+                    "tail -n 40 /workspace/out/launch.out /workspace/out/embed.log 2>/dev/null")
+                raise RuntimeError(
+                    f"embed process not running for {dead_polls} consecutive polls without a "
+                    f"DONE marker:\n" + full)
+            log(f"  aliveness check failed ({dead_polls}/{_DEAD_CONFIRM}) — transient SSH blip? "
+                "re-checking next poll")
+        else:
+            dead_polls = 0
         time.sleep(POLL_S)
     raise TimeoutError("embed exceeded EMBED_DEADLINE")
 
@@ -404,17 +436,68 @@ def step_verify_g2() -> float:
     return cos
 
 
+def _list_pods() -> list[dict]:
+    """Every pod on the account (id, name, desiredStatus, costPerHr). Best-effort — returns
+    [] on any API failure so reconciliation never masks the real error."""
+    try:
+        data = gql("query{ myself{ pods{ id name desiredStatus costPerHr } } }")
+    except Exception as e:  # noqa: BLE001
+        log(f"could not list account pods: {e}")
+        return []
+    return ((data.get("myself") or {}).get("pods")) or []
+
+
+def _reap_by_name(name: str = "georgian-legal-embed") -> int:
+    """Terminate every non-terminated pod carrying this job's name and return the count.
+
+    Reconciles two orphan classes the on-disk ``pod.id`` cannot: a pod created by a deploy
+    call whose HTTP response was lost (its id is recorded nowhere), and a ``pod.id`` clobbered
+    by a concurrent orchestrator (the shared file holds only the last writer's id). Invoked
+    ONLY by the operator via the ``terminate`` subcommand — never during a normal run — so it
+    cannot race a concurrent same-name provision mid-flight.
+    """
+    n = 0
+    for p in _list_pods():
+        if p.get("name") == name and (p.get("desiredStatus") or "").upper() != "TERMINATED":
+            log(f"reaping pod {p.get('id')} (name={name}, status={p.get('desiredStatus')}, "
+                f"${p.get('costPerHr')}/hr)")
+            try:
+                gql("mutation($id:String!){ podTerminate(input:{podId:$id}) }", {"id": p["id"]})
+                n += 1
+            except Exception as e:  # noqa: BLE001
+                log(f"  reap terminate failed for {p.get('id')}: {e}")
+    return n
+
+
 def terminate(pod_id: str | None) -> None:
+    """Terminate the pod, retrying transient API failures.
+
+    Sets the ``_terminated`` backstop flag ONLY after ``podTerminate`` actually succeeds. The
+    old code set it *before* the call, so a single transient Cloudflare 403 / network blip
+    permanently short-circuited both the ``finally`` block and the ``atexit`` cleanup (both
+    gate on ``_terminated``) — the run then printed COMPLETE and exited 0 while the GPU pod
+    kept billing (the realized orphaned-pod incident class). Leaving the flag False on failure
+    lets those backstops retry. ``pod.id`` is unlinked only on success so the emergency
+    ``terminate`` subcommand can still find the pod after a failed cleanup.
+    """
     global _terminated
     if not pod_id or _terminated:
         return
-    _terminated = True
-    try:
-        gql("mutation($id:String!){ podTerminate(input:{podId:$id}) }", {"id": pod_id})
-        log(f"pod {pod_id} terminated")
-        (WORKDIR / "pod.id").unlink(missing_ok=True)
-    except Exception as e:  # noqa: BLE001 - never let cleanup failure mask the real error
-        log(f"WARNING: podTerminate failed for {pod_id}: {e}  (terminate manually!)")
+    last_err: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            gql("mutation($id:String!){ podTerminate(input:{podId:$id}) }", {"id": pod_id})
+            _terminated = True
+            log(f"pod {pod_id} terminated")
+            (WORKDIR / "pod.id").unlink(missing_ok=True)
+            return
+        except Exception as e:  # noqa: BLE001 - never let cleanup failure mask the real error
+            last_err = e
+            log(f"WARNING: podTerminate attempt {attempt}/3 failed for {pod_id}: {e}")
+            time.sleep(min(5 * attempt, 15))
+    log(f"WARNING: podTerminate FAILED for {pod_id} after 3 attempts: {last_err}  — the pod may "
+        f"still be BILLING. Run `python scripts/runpod_orchestrate.py terminate` or kill it in "
+        f"the RunPod console. (_terminated left False so finally/atexit will retry.)")
 
 
 def _cleanup() -> None:
@@ -430,6 +513,7 @@ def _sig(signum, frame):  # noqa: ANN001
 
 
 def step_restore(expected_points: int) -> None:
+    refuse_legacy_operation("direct snapshot restore into georgian_legal")
     snap = WORKDIR / "out" / f"{COLLECTION}.snapshot"
     log(f"restoring snapshot into LOCAL Qdrant as `{COLLECTION}` (may take minutes)...")
     run(["curl", "-sf", "-X", "POST",
@@ -444,6 +528,7 @@ def step_restore(expected_points: int) -> None:
 
 
 def main() -> None:
+    refuse_legacy_operation("full-corpus v1 embed and direct restore")
     global _pod_id, _provisioned_at, _price, _ip, _port
     atexit.register(_cleanup)
     signal.signal(signal.SIGINT, _sig)
@@ -489,6 +574,10 @@ if __name__ == "__main__":
         if pid:
             terminate(pid)
         else:
-            log("no pod.id to terminate")
+            log("no pod.id on disk")
+        # Reconcile by job name too: catches an orphan from a lost deploy response and any pod
+        # whose id was clobbered in the shared pod.id by a concurrent orchestrator.
+        reaped = _reap_by_name()
+        log(f"name-reconciliation terminated {reaped} additional pod(s)")
         sys.exit(0)
     main()

@@ -1,12 +1,12 @@
-"""L2 answer-faithfulness layer — verdict schema + aggregation (the Claude-judge scorer).
+"""L2 answer-faithfulness layer — verdict schema and reviewer aggregation.
 
 The deterministic layer (``answer_eval.py``) measures retrieval-derived answer signals with
 NO judge and hard-gates. This layer measures the faithfulness + correctness of a *composed*
 answer, which needs an LLM judge. Per the approved plan §2b (user 2026-07-12: build the full
-answer-quality eval, PII **UNMASKED**), the judge is **Claude**: ``dump_judge_batch.py``
-produces a batch of ``(query, retrieved context, gold answer)`` triples, Claude reads it and
-emits one verdict per item, and this module aggregates. Retrieved corpus text (incl. PII) is
-passed to the judge unmasked — the same exposure already accepted at answer time.
+answer-quality eval, PII **UNMASKED**), ``dump_judge_batch.py`` produces a batch of
+``(query, retrieved context, gold answer)`` triples, an approved reviewer emits one verdict
+per item, and this module aggregates. Retrieved corpus text (incl. PII) is passed to the
+reviewer unmasked — the same exposure already accepted at answer time.
 
 2026 RAG-eval best practice applied here:
   * the deterministic floor (``answer_eval.py``) stays the hard gate; this judge is a logged,
@@ -44,7 +44,7 @@ class JudgeVerdict:
     abstained: bool = False
     query_type: str = ""
     language: str = ""
-    judge: str = "claude"
+    judge: str = "unspecified"
     note: str = ""
 
 
@@ -64,7 +64,7 @@ def verdict_from_dict(d: dict) -> JudgeVerdict:
         abstained=_b(d.get("abstained")),
         query_type=str(d.get("query_type", "")),
         language=str(d.get("language", "")),
-        judge=str(d.get("judge", "claude")),
+        judge=str(d.get("judge", "unspecified")),
         note=str(d.get("note", "")),
     )
 

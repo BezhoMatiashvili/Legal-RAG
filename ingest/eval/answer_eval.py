@@ -5,7 +5,7 @@ These metrics score properties of the *answer a user would actually receive*, co
 deterministically from the retrieved+reranked results and the golden set — **no answer
 generation and no LLM judge** — so they log and gate exactly like the retrieval metrics
 (``experiments.jsonl`` / ``config_hash`` / gates G1–G5). They are the deterministic floor
-beneath the (approved, Claude-in-session) faithfulness layer, per the quality plan §2a.
+beneath the approved manual faithfulness-review layer, per the quality plan §2a.
 
 Three families, all pure functions over already-computed inputs (ranked ``Hit``s and the
 ``{key: grade}`` relevance dict the retrieval harness already builds), so they unit-test

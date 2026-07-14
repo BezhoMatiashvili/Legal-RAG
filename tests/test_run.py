@@ -1,12 +1,13 @@
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SCRAPY_PROJECT_ROOT = PROJECT_ROOT / "scraper"
 sys.path.insert(0, str(SCRAPY_PROJECT_ROOT))
 
-from legal_scrapers.run import parse_args, select_spiders  # noqa: E402
+from legal_scrapers.run import crawl_quality_issues, parse_args, select_spiders  # noqa: E402
 
 ALL = ["matsne", "ecd", "constcourt", "napr", "supremecourt", "tas", "tbappeal"]
 
@@ -44,6 +45,32 @@ class ParseArgsTests(unittest.TestCase):
     def test_only_list(self):
         args = parse_args(["--only", "ecd", "tbappeal"])
         self.assertEqual(args.only, ["ecd", "tbappeal"])
+
+
+class CrawlQualityGateTests(unittest.TestCase):
+    @staticmethod
+    def _crawler(name, **stats):
+        return SimpleNamespace(
+            spider=SimpleNamespace(name=name),
+            spidercls=SimpleNamespace(name=name),
+            stats=SimpleNamespace(get_stats=lambda: stats),
+        )
+
+    def test_clean_finished_crawl_has_no_issues(self):
+        self.assertEqual(crawl_quality_issues([
+            self._crawler("ecd", finish_reason="finished", item_scraped_count=3)
+        ]), [])
+
+    def test_quality_failures_and_callback_errors_fail_gate(self):
+        issues = crawl_quality_issues([
+            self._crawler(
+                "ecd",
+                finish_reason="finished",
+                **{"quality/failures": 2, "spider_exceptions/ValueError": 1},
+            )
+        ])
+        self.assertTrue(any("2 completeness" in issue for issue in issues))
+        self.assertTrue(any("1 callback" in issue for issue in issues))
 
 
 if __name__ == "__main__":

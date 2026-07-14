@@ -1,0 +1,20 @@
+# Georgian Legal RAG — session monitor dashboard on http://localhost:8770
+# (Qdrant status, embed coverage, pipeline step tracker, query-log latencies).
+# Optional. Install:
+#   cp ingest/systemd/legal-monitor.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now legal-monitor
+# NOTE: restart this service after editing session_monitor.py (long-running process;
+# only the HTML reloads per request).
+
+[Unit]
+Description=Georgian Legal RAG session monitor (localhost:8770)
+
+[Service]
+EnvironmentFile=-%h/.config/georgia-legal-search.env
+# Resolve the checkout only after requiring an operator-supplied repository root.
+ExecStart=/usr/bin/bash -lc ': "${LEGAL_SEARCH_REPO:?set LEGAL_SEARCH_REPO in ~/.config/georgia-legal-search.env}"; cd "$LEGAL_SEARCH_REPO/ingest"; exec .venv/bin/python scripts/session_monitor.py 8770'
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

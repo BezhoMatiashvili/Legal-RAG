@@ -1,14 +1,14 @@
 """Produce a judging batch for the L2 faithfulness layer (see ``eval/judge_eval.py``).
 
 Retrieves the top-k context for a (stratified, seeded) SAMPLE of golden queries and writes a
-JSONL batch of ``(query, retrieved context chunk texts, gold answer)`` triples. A judge —
-**Claude**, per the approved plan §2b (PII UNMASKED) — then reads the batch and emits one
-verdict per row (faithful / correct / complete / abstained); ``judge_eval.py`` aggregates.
+JSONL batch of ``(query, retrieved context chunk texts, gold answer)`` triples. An approved
+manual or automated reviewer then reads the batch and emits one verdict per row (faithful /
+correct / complete / abstained); ``judge_eval.py`` aggregates.
 
 The retrieved chunk **texts are included in full and unmasked** (incl. PII) — the exact
 context an answer would be composed from, matching answer-time exposure. This script is the
-fork-agnostic producer: who judges the batch (Claude-in-session vs an automated Claude-API
-run) is a separate choice and does not change this output.
+reviewer-agnostic producer: who judges the batch is a separate choice and does not change
+this output.
 
     # sample 30 queries, dump their reranked context (production-faithful):
     RERANK_ENABLED=true python -m eval.dump_judge_batch --mode rerank --sample 30 \
@@ -30,14 +30,14 @@ from . import goldset
 from .evaluate import make_backend
 
 
-def _token_counter(kind: str, embed_model: str):
+def _token_counter(kind: str, tokenizer_model: str, tokenizer_revision: str | None = None):
     if kind == "word":
         from ingest.chunking import default_token_counter
 
         return default_token_counter
     from ingest.embedding import make_token_counter
 
-    return make_token_counter(embed_model)
+    return make_token_counter(tokenizer_model, tokenizer_revision)
 
 
 def _stratified_sample(gold, n, seed):
@@ -74,7 +74,9 @@ def main() -> None:
     cfg = load_config()
     chunk_cfg = {"max_tokens": cfg.chunk_tokens, "overlap": cfg.chunk_overlap,
                  "min_tokens": cfg.chunk_min_tokens}
-    count_tokens = _token_counter(args.tokenizer, cfg.embed_model)
+    count_tokens = _token_counter(
+        args.tokenizer, cfg.tokenizer_model, cfg.tokenizer_revision
+    )
 
     spec = goldset.EVAL_SETS[args.golden_set]
     gold = goldset.load_golden_set(spec.gold)

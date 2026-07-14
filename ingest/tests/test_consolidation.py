@@ -1,8 +1,11 @@
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 from ingest.chunking import Chunk
+from ingest.embed_job import snapshot_doc_to_canonical
 from ingest.qdrant_store import BOOL_FIELDS, INTEGER_FIELDS, build_payload
+from ingest.snapshot import _snapshot_record
 from ingest.sources import CanonicalDoc, normalize
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
@@ -63,6 +66,25 @@ def test_build_payload_carries_consolidation():
     p = build_payload(doc, Chunk(text="t", chunk_index=0, heading_path=[], token_count=1))
     assert p["is_consolidated"] is True
     assert p["consolidated_count"] == 3
+
+
+def test_snapshot_roundtrip_preserves_consolidation_fields():
+    doc = _doc(is_consolidated=True, consolidated_count=3)
+    structure = SimpleNamespace(
+        primary_kind="flat",
+        has_article=False,
+        has_heading=False,
+        has_num_clause=False,
+        article_count=0,
+    )
+
+    record = _snapshot_record("matsne", doc, doc.body_markdown, "hash", structure, "run")
+    restored = snapshot_doc_to_canonical(record)
+
+    assert record["is_consolidated"] is True
+    assert record["consolidated_count"] == 3
+    assert restored.is_consolidated is True
+    assert restored.consolidated_count == 3
 
 
 def test_consolidation_fields_are_indexed():

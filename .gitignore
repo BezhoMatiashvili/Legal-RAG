@@ -27,3 +27,6 @@ ingest/eval/.bm25_full/
 # Large generated data blobs (must never be committed)
 /artifacts_without_supremecourt.gz
 /ingest/snapshots/
+
+# Multi-session coordination scratch (see coordination/README.md)
+/coordination/

@@ -26,7 +26,8 @@ class FakeClient:
     def upsert(self, collection_name, points, wait=False):
         self.upserts.append((list(points), wait))
 
-    def delete(self, collection_name, points_selector):
+    def delete(self, collection_name, points_selector, wait=False):
+        assert wait is True
         self.deletes.append(points_selector)
 
 
@@ -44,10 +45,11 @@ def _make_cfg(tmp_path):
         chunk_tokens=40,
         chunk_overlap=5,
         chunk_min_tokens=1,
+        dense_dim=4,
     )
 
 
-def _ecd_item(doc_id, body="body text here for chunking"):
+def _ecd_item(doc_id, body="body text here for chunking with enough meaningful legal content"):
     return {
         "decision_document_id": doc_id, "case_no": f"case-{doc_id}",
         "decision_type_name": "x", "court_name": "court",

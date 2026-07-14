@@ -10,26 +10,28 @@ rest of the pipeline is source-agnostic.
 
 import re
 from dataclasses import dataclass, field
+from datetime import date as _date
 
 _DATE_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})")
 _DMY_RE = re.compile(r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{4})\b")
 # Georgian text dates like "26 მარტი 2026" or "26 მარტის 2026 17:55".
 _GEO_DATE_RE = re.compile(r"(\d{1,2})\s+([ა-ჿ]+)\s+(\d{4})")
 
-# Nominative month names; we look up by a stem so the genitive ("მარტის") also resolves.
+# Morphology-stable prefixes shared by Georgian nominative and genitive month names
+# (for example ``თებერვალი`` / ``თებერვლის`` and ``სექტემბერი`` / ``სექტემბრის``).
 GEORGIAN_MONTHS = {
-    "იანვარ": "01",
-    "თებერვალ": "02",
+    "იანვ": "01",
+    "თებერვ": "02",
     "მარტ": "03",
     "აპრილ": "04",
     "მაის": "05",
     "ივნის": "06",
     "ივლის": "07",
     "აგვისტ": "08",
-    "სექტემბერ": "09",
-    "ოქტომბერ": "10",
-    "ნოემბერ": "11",
-    "დეკემბერ": "12",
+    "სექტემბ": "09",
+    "ოქტომბ": "10",
+    "ნოემბ": "11",
+    "დეკემბ": "12",
 }
 
 
@@ -61,22 +63,20 @@ def normalize_status(value) -> str | None:
 
 def _georgian_month(word: str) -> str | None:
     """Resolve a Georgian month word (nominative or genitive) to a ``MM`` string."""
-    w = word.strip().rstrip("ის").rstrip("ი")  # strip genitive -ის / nominative -ი tail
+    w = word.strip()
     for stem, mm in GEORGIAN_MONTHS.items():
-        if w.startswith(stem) or stem.startswith(w):
+        if w.startswith(stem):
             return mm
     return None
 
 
 def _valid_iso(year: str, month: str, day: str) -> str | None:
-    """Return ``YYYY-MM-DD`` if the parts form a calendar-plausible date, else None."""
+    """Return ``YYYY-MM-DD`` if the parts form a real calendar date, else None."""
     try:
         y, m, d = int(year), int(month), int(day)
-    except ValueError:
+        return _date(y, m, d).isoformat()
+    except (ValueError, OverflowError):
         return None
-    if not (1 <= m <= 12 and 1 <= d <= 31):
-        return None
-    return f"{y:04d}-{m:02d}-{d:02d}"
 
 
 def _parse_date(value):
@@ -135,11 +135,21 @@ class CanonicalDoc:
     # by design — the index is local and confidential (see prompt.md:40). Empty for sources
     # with no promoted fields.
     promoted: dict = field(default_factory=dict)
-    # Consolidation (matsne): whether the act has ≥2 consolidated versions (i.e. it has been
-    # amended/re-published), and how many versions the publication switcher lists. None for
-    # sources/documents without this concept.
+    # Consolidation (matsne): is_consolidated = the act is a matsne "main (consolidated)"
+    # document (site filter type=main — the base act carrying current consolidated text,
+    # vs amendment/informational acts); consolidated_count = how many consolidated
+    # versions the publication switcher lists (0 = never amended). Spider-derived from
+    # switcher presence (lower bound) or type=main crawl provenance; reconciled in Qdrant
+    # by scripts/reconcile_consolidated.py. None for sources/documents without the concept.
     is_consolidated: bool | None = None
     consolidated_count: int | None = None
+    # Source completeness lineage. New binary-backed items set these explicitly;
+    # unlabeled legacy Tbilisi articles fail closed because they are known summaries.
+    content_kind: str = "full_text"
+    content_complete: bool = True
+    extraction_status: str = "full_text"
+    source_binary_url: str | None = None
+    article_summary: str | None = None
 
 
 @dataclass(frozen=True)
@@ -167,7 +177,16 @@ class SourceSpec:
 
     def declared_keys(self) -> set[str]:
         """Every raw item key this spec reads — the schema-drift baseline of handled fields."""
-        keys: set[str] = {"body_markdown"}
+        keys: set[str] = {
+            "body_markdown",
+            "content_kind",
+            "content_complete",
+            "extraction_status",
+            "source_binary_url",
+            "article_summary",
+            "pdf_url",
+            "docx_url",
+        }
         for group in (self.id_fields, self.date_fields, self.title_fields, self.number_fields,
                       self.registration_fields, self.parties_fields, self.in_force_fields,
                       self.expiry_fields, self.url_fields, self.promote_fields):
@@ -238,6 +257,33 @@ class SourceSpec:
                 except (TypeError, ValueError):
                     consolidated_count = None
 
+        body_markdown = item.get("body_markdown") or ""
+        raw_complete = item.get("content_complete")
+        if isinstance(raw_complete, bool):
+            content_complete = raw_complete
+        elif isinstance(raw_complete, (int, float)):
+            content_complete = bool(raw_complete)
+        elif isinstance(raw_complete, str):
+            content_complete = raw_complete.strip().lower() in {"1", "true", "yes"}
+        elif self.source in {"tas", "tbappeal"}:
+            # Pre-hardening TB Appeals records contain only article text. Pre-hardening
+            # TAS records do not distinguish a full decision response from list/detail
+            # metadata. Neither can be promoted as complete without an explicit recrawl.
+            content_complete = False
+        else:
+            content_complete = bool(body_markdown.strip())
+        if self.source == "tbappeal" and raw_complete is None:
+            default_kind = "article_summary"
+        elif self.source == "tas" and raw_complete is None:
+            default_kind = "legacy_unlabeled"
+        else:
+            default_kind = "full_text" if content_complete else "metadata_only"
+        content_kind = str(item.get("content_kind") or default_kind).strip()
+        extraction_status = str(
+            item.get("extraction_status")
+            or ("full_text" if content_complete else "malformed")
+        ).strip()
+
         return CanonicalDoc(
             source=self.source,
             document_id=document_id,
@@ -255,11 +301,22 @@ class SourceSpec:
             status_raw=status_raw,
             in_force_date=_parse_date(self._first(item, self.in_force_fields)),
             expiry_date=_parse_date(self._first(item, self.expiry_fields)),
-            body_markdown=item.get("body_markdown") or "",
+            body_markdown=body_markdown,
             extra=item,
             promoted=promoted,
             is_consolidated=is_consolidated,
             consolidated_count=consolidated_count,
+            content_kind=content_kind,
+            content_complete=content_complete,
+            extraction_status=extraction_status,
+            source_binary_url=self._first(
+                item, ("source_binary_url", "pdf_url", "docx_url")
+            ),
+            article_summary=(
+                str(item["article_summary"])
+                if item.get("article_summary") not in (None, "")
+                else None
+            ),
         )
 
 

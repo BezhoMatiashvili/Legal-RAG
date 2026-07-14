@@ -1,0 +1,62 @@
+[
+ {
+  "qid": "q242",
+  "verdict": "reject",
+  "checks": {"answers": true, "no_hindsight": false, "labels": true, "faithful_answer": true, "coherent": true},
+  "reasons": "Not discriminative: the corpus contains the same case's appellate verdict (ecd 506509, identical case number 330100119002823041, also a 'განაჩენი' with the 178-acquittal and perfume-store facts), which answers the keyword query equally well as the single gold."
+ },
+ {
+  "qid": "q228",
+  "verdict": "accept",
+  "checks": {"answers": true, "no_hindsight": true, "labels": true, "faithful_answer": true, "coherent": true},
+  "reasons": "Span states conviction under CC 179(1) with 5 years imprisonment; body confirms Batumi, knife to a minor's neck, mobile phone; the only decision in-corpus for case 010100118002731362."
+ },
+ {
+  "qid": "q208",
+  "verdict": "accept",
+  "checks": {"answers": true, "no_hindsight": true, "labels": true, "faithful_answer": true, "coherent": true},
+  "reasons": "Citation number matches meta document_number exactly, the doc is the cited Akhaltsikhe decision (unique in corpus for case 3025844), and body confirms the Rustaveli st. 54 registry-refusal annulment dispute stated in the answer."
+ },
+ {
+  "qid": "q209",
+  "verdict": "accept",
+  "checks": {"answers": true, "no_hindsight": true, "labels": true, "faithful_answer": true, "coherent": true},
+  "reasons": "Span gives the reasons bail was deemed insufficient (flight, witness tampering, evidence destruction), query has zero content-word overlap with the span, doc confirms the 5000-lari bail, and the only other tbappeal bail/weapons summary has the opposite outcome."
+ },
+ {
+  "qid": "q252",
+  "verdict": "reject",
+  "checks": {"answers": true, "no_hindsight": false, "labels": true, "faithful_answer": true, "coherent": true},
+  "reasons": "Boilerplate-answerable: at least two other napr decisions (15282, 89628) are near-identical template refusals of superficies (აღნაგობა) registration on agricultural land because the acquirer was a foreign citizen, and the anchor-free keyword query cannot discriminate the gold."
+ },
+ {
+  "qid": "q245",
+  "verdict": "reject",
+  "checks": {"answers": true, "no_hindsight": false, "labels": true, "faithful_answer": true, "coherent": true},
+  "reasons": "Non-discriminative and misleading gold: three consolidated 'საქართველოს პარლამენტის რეგლამენტი' docs (e.g. matsne 6494611, Art. 35) directly answer the present-tense question — and differently (open ballot, 3 deputies) — while the gold is a repealed 2000 amendment (secret ballot), so the query neither selects this doc nor yields a currently-correct answer."
+ },
+ {
+  "qid": "q237",
+  "verdict": "accept",
+  "checks": {"answers": true, "no_hindsight": true, "labels": true, "faithful_answer": true, "coherent": true},
+  "reasons": "Span evidences the approval date (order №01-05/4, 24 April 2024, Batumi), meta confirms in_force status supporting 'მოქმედი', and the order number plus ministry make the query uniquely discriminative."
+ },
+ {
+  "qid": "q250",
+  "verdict": "accept",
+  "checks": {"answers": true, "no_hindsight": true, "labels": true, "faithful_answer": true, "coherent": true},
+  "reasons": "Span supplies the five-year validity answer, query shares no content words with the span, and 'Kojori cemetery' anchors are unique — only this tas doc in the corpus mentions both."
+ },
+ {
+  "qid": "q229",
+  "verdict": "accept",
+  "checks": {"answers": true, "no_hindsight": true, "labels": true, "faithful_answer": true, "coherent": true},
+  "reasons": "Query cites the doc's own number №3/361 exactly as in meta, the doc is that order amending the Akhalgori music school charter, and the body confirms the director/deputy appointment-requirement changes stated in the answer."
+ },
+ {
+  "qid": "q238",
+  "verdict": "reject",
+  "checks": {"answers": true, "no_hindsight": false, "labels": true, "faithful_answer": true, "coherent": true},
+  "reasons": "Not discriminative: the query asks about the law's rule with no case-specific anchor, and the 75%-of-market-value provision appears verbatim in ~24 corpus docs (8 constcourt cases incl. Okudzhava/Kurdiani/Sharadze, 2 matsne, 14 ecd), any of which answers it as well as the gold admissibility ruling."
+ }
+]

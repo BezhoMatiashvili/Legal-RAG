@@ -30,7 +30,16 @@ ADDITIONAL_STATUSES = [
 
 # TODO What if topic or status is None
 
-START_TEMPLATE = "https://matsne.gov.ge/ka/document/search?publishing_date_fr%5Bdate%5D={}&publishing_date_to%5Bdate%5D={}&type=all&page=1&limit=100&label={}&additional_status={}"
+# ``type`` selects matsne's document-class filter: "all" = every document (base acts,
+# amendment acts, informational), "main" = only ძირითადი (კონსოლიდირებული) documents —
+# the base normative acts that carry the current consolidated text (~52k of ~208k).
+DOC_TYPES = ("all", "main")
+
+START_TEMPLATE = (
+    "https://matsne.gov.ge/ka/document/search"
+    "?publishing_date_fr%5Bdate%5D={fr}&publishing_date_to%5Bdate%5D={to}"
+    "&type={doc_type}&page=1&limit=100&label={label}&additional_status={status}"
+)
 DATE_FORMAT = "%d-%m-%Y"
 
 
@@ -64,14 +73,24 @@ def sub_windows(start: date, end: date, granularity: str) -> list[tuple[date, da
     return windows
 
 
-def build_search_url(start: date, end: date, topic: str, additional_status: str) -> str:
+def build_search_url(
+    start: date, end: date, topic: str, additional_status: str, doc_type: str = "all"
+) -> str:
     """One ``document/search`` listing URL (page 1) for a (window × topic × status) cell."""
+    if doc_type not in DOC_TYPES:
+        raise ValueError(f"doc_type must be one of {DOC_TYPES}, got {doc_type!r}")
     return START_TEMPLATE.format(
-        start.strftime(DATE_FORMAT), end.strftime(DATE_FORMAT), topic, additional_status
+        fr=start.strftime(DATE_FORMAT),
+        to=end.strftime(DATE_FORMAT),
+        doc_type=doc_type,
+        label=topic,
+        status=additional_status,
     )
 
 
-def generate_start_url_batches(start_date: date, end_date: date) -> tuple[list[str], list[str]]:
+def generate_start_url_batches(
+    start_date: date, end_date: date, doc_type: str = "all"
+) -> tuple[list[str], list[str]]:
     """Search-listing seed URLs, split into yearly windows for shallow, robust pagination.
 
     Returns ``(first_batch, deferred_batch)``: the deferred (catch-all) batch is every cell
@@ -85,7 +104,7 @@ def generate_start_url_batches(start_date: date, end_date: date) -> tuple[list[s
     for topic in TOPICS:
         for additional_status in ADDITIONAL_STATUSES:
             for win_start, win_end in sub_windows(start_date, end_date, "yearly"):
-                url = build_search_url(win_start, win_end, topic, additional_status)
+                url = build_search_url(win_start, win_end, topic, additional_status, doc_type)
                 if topic == "" or additional_status == "":
                     deferred_batch.append(url)
                 else:
@@ -94,6 +113,6 @@ def generate_start_url_batches(start_date: date, end_date: date) -> tuple[list[s
     return first_batch, deferred_batch
 
 
-def generate_start_urls(start_date: date, end_date: date) -> list[str]:
-    first_batch, deferred_batch = generate_start_url_batches(start_date, end_date)
+def generate_start_urls(start_date: date, end_date: date, doc_type: str = "all") -> list[str]:
+    first_batch, deferred_batch = generate_start_url_batches(start_date, end_date, doc_type)
     return [*first_batch, *deferred_batch]

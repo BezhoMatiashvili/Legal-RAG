@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Prove every scraped document across ALL sources is embedded in the main collection.
+"""Check document-ID coverage across every source in the main collection.
 
 Universe = every unique ``document_id`` per source found in
 ``artifacts/<source>/{latest,runs/*}/items.jsonl``. Embedded set = one full scroll of the
@@ -9,11 +9,14 @@ queries — one scroll covers the whole corpus in minutes). The diff is written 
     ingest/.state/embed_coverage.json   — per-source summary (rendered by session_monitor)
     ingest/.state/embed_missing.txt     — "<source>\t<document_id>" per missing doc
 
-Exit 0 = every scraped doc has at least one chunk in the collection; exit 1 otherwise.
+Exit 0 = every scraped doc has at least one point in the collection; exit 1 otherwise.
+This is intentionally a coverage check, not an index-integrity proof: it does not validate
+the current cleaned document-state hash, a complete contiguous chunk generation, payload
+schema, or vector identity/dimensions. Do not use it alone as a production promotion gate.
 
 Usage (from ingest/):
-    .venv/bin/python scripts/verify_all_embedded.py
-    .venv/bin/python scripts/verify_all_embedded.py --collection georgian_legal --sources matsne,ecd
+    .venv/bin/python scripts/verify_all_embedded.py --coverage-only
+    .venv/bin/python scripts/verify_all_embedded.py --coverage-only --collection georgian_legal --sources matsne,ecd
 """
 from __future__ import annotations
 
@@ -177,7 +180,14 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--collection", default=None)
     ap.add_argument("--sources", default=None, help="comma list; default = every artifacts subdir")
+    ap.add_argument(
+        "--coverage-only",
+        action="store_true",
+        help="explicitly acknowledge this does not verify generation integrity",
+    )
     args = ap.parse_args()
+    if not args.coverage_only:
+        ap.error("ID coverage only; pass --coverage-only, or use scripts/verify_generation.py")
 
     cfg = load_config()
     collection = args.collection or cfg.collection_name
@@ -265,7 +275,8 @@ def main() -> None:
     if total_missing:
         raise SystemExit(1)
     scope = f"sources {sorted(only)}" if only else "every source"
-    print(f"✅ every embeddable scraped document in {scope} is embedded and queryable.")
+    print(f"✅ every embeddable scraped document in {scope} has at least one index point "
+          "(ID coverage only; integrity was not verified).")
 
 
 if __name__ == "__main__":

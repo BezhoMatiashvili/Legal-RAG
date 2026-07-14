@@ -26,6 +26,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import runpod_orchestrate as O  # noqa: E402 — reuse gql/ssh/provision/terminate helpers
+from ingest.operational import refuse_legacy_operation  # noqa: E402
 
 DELTA_COLLECTION = "georgian_legal_delta"
 STAGE_SRC = O.INGEST / ".state" / "delta_stage"
@@ -138,6 +139,7 @@ def step_pull(ip: str, port: int) -> Path:
 
 
 def step_restore_and_merge(expected: int) -> None:
+    refuse_legacy_operation("delta restore followed by an in-place live merge")
     from dotenv import dotenv_values
     key = dotenv_values(O.INGEST / ".env").get("QDRANT_API_KEY") or ""
     snap = OUT / f"{DELTA_COLLECTION}.snapshot"
@@ -159,6 +161,7 @@ def step_restore_and_merge(expected: int) -> None:
 
 
 def main() -> None:
+    refuse_legacy_operation("multi-source delta embed and in-place live merge")
     atexit.register(O._cleanup)
     signal.signal(signal.SIGINT, O._sig)
     signal.signal(signal.SIGTERM, O._sig)

@@ -11,7 +11,8 @@
 # Notes: bm25 uses the prebuilt full-corpus index (eval/.bm25_full/). rerank@80 == plain
 # rerank (default rerank_candidates=80), so the depth ablation only adds 10/30/50.
 set -uo pipefail
-cd /home/bezhomatiashvili/Desktop/Projects/Georgia-Legal-Search/ingest
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+cd "$(dirname "$SCRIPT_DIR")" || exit 1
 PY=.venv/bin/python
 NOISE='Fetching|Loading checkpoint|it/s|it\]|httpx|resolve|colbert|DeprecationWarning|Swig|^[[:space:]]*$'
 

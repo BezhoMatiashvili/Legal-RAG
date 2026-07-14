@@ -1,0 +1,92 @@
+[
+ {
+  "query_type": "legal_citation",
+  "source": "constcourt",
+  "document_id": "1291",
+  "stratum": "constcourt",
+  "title": "ა.ა.ი.პ. „საქართველოს განვითარების კვლევითი ინსტიტუტი“ საქართველოს პარლამენტის წინააღმდეგ",
+  "body_char_len": 30319,
+  "qid": "q457"
+ },
+ {
+  "query_type": "cross_lingual",
+  "source": "constcourt",
+  "document_id": "1694",
+  "stratum": "constcourt",
+  "title": "შპს  „ბლექსი ტელეკომი“ საქართველოს პარლამენტის წინააღმდეგ",
+  "body_char_len": 34074,
+  "qid": "q484"
+ },
+ {
+  "query_type": "legal_citation",
+  "source": "constcourt",
+  "document_id": "17718",
+  "stratum": "constcourt",
+  "title": "საქართველოს პარლამენტის წევრთა ჯგუფი (ანა ნაცვლიშვილი, ანა ბუჩუკური, მიხეილ დაუშვილი და სხვები (სულ 42 დეპუტატი)) საქართველოს პარლამენტის წინააღმდეგ",
+  "body_char_len": 90904,
+  "qid": "q483"
+ },
+ {
+  "query_type": "keyword",
+  "source": "constcourt",
+  "document_id": "18447",
+  "stratum": "constcourt",
+  "title": "საქართველოს სახალხო დამცველი საქართველოს პარლამენტის წინააღმდეგ",
+  "body_char_len": 46994,
+  "qid": "q468"
+ },
+ {
+  "query_type": "keyword",
+  "source": "constcourt",
+  "document_id": "33",
+  "stratum": "constcourt",
+  "title": "მოქალაქე ნოდარ ახალკაცი და მოქალაქე დავით კვინიკაძე საქართველოს პარლამენტის წინააღმდეგ.",
+  "body_char_len": 5992,
+  "qid": "q463"
+ },
+ {
+  "query_type": "keyword",
+  "source": "ecd",
+  "document_id": "348652",
+  "stratum": "ecd",
+  "title": "080210016001613653 — განჩინება/გადაწყვეტილება",
+  "body_char_len": 17567,
+  "qid": "q478"
+ },
+ {
+  "query_type": "cross_lingual",
+  "source": "ecd",
+  "document_id": "466489",
+  "stratum": "ecd",
+  "title": "190100118002652913 — განაჩენი",
+  "body_char_len": 12997,
+  "qid": "q479"
+ },
+ {
+  "query_type": "natural_question",
+  "source": "ecd",
+  "document_id": "5075180",
+  "stratum": "ecd",
+  "title": "330310119002888218 — გადაწყვეტილება",
+  "body_char_len": 30916,
+  "qid": "q490"
+ },
+ {
+  "query_type": "cross_lingual",
+  "source": "ecd",
+  "document_id": "5433475",
+  "stratum": "ecd",
+  "title": "330210019003047159 — გადაწყვეტილება",
+  "body_char_len": 26533,
+  "qid": "q474"
+ },
+ {
+  "query_type": "legal_citation",
+  "source": "ecd",
+  "document_id": "5497294",
+  "stratum": "ecd",
+  "title": "010100119003177752 — განაჩენი",
+  "body_char_len": 22931,
+  "qid": "q466"
+ }
+]

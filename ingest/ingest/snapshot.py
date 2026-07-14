@@ -126,6 +126,7 @@ def _snapshot_record(source, doc, clean_body, chash, sinfo, run_label) -> dict:
         "document_type": doc.document_type,
         "court": doc.court,
         "source_url": doc.source_url,
+        "source_binary_url": doc.source_binary_url,
         "document_number": doc.document_number,
         "registration_code": doc.registration_code,
         "parties": doc.parties,
@@ -133,6 +134,12 @@ def _snapshot_record(source, doc, clean_body, chash, sinfo, run_label) -> dict:
         "status_raw": doc.status_raw,
         "in_force_date": doc.in_force_date,
         "expiry_date": doc.expiry_date,
+        "is_consolidated": doc.is_consolidated,
+        "consolidated_count": doc.consolidated_count,
+        "content_kind": doc.content_kind,
+        "content_complete": doc.content_complete,
+        "extraction_status": doc.extraction_status,
+        "article_summary": doc.article_summary,
         "promoted": doc.promoted,
         "structure": {
             "primary_kind": sinfo.primary_kind,
@@ -203,12 +210,26 @@ def build_snapshot(
                     st.pii_fields[k] += 1
                 doc_id = f"{source}:{doc.document_id}"
 
-                if not report.is_usable:
-                    st.quarantined[report.quarantine_reason] += 1
+                incomplete_reason = None
+                if not doc.content_complete:
+                    incomplete_reason = (
+                        f"incomplete_content:{doc.content_kind}:{doc.extraction_status}"
+                    )
+                if incomplete_reason or not report.is_usable:
+                    quarantine_reason = (
+                        report.quarantine_reason
+                        if not report.is_usable
+                        else incomplete_reason
+                    )
+                    st.quarantined[quarantine_reason] += 1
                     quarantine_fp.write(json.dumps({
                         "doc_id": doc_id, "source": source, "document_id": doc.document_id,
-                        "reason": report.quarantine_reason, "title": doc.title,
+                        "reason": quarantine_reason, "title": doc.title,
                         "source_run": run_label,
+                        "content_kind": doc.content_kind,
+                        "content_complete": doc.content_complete,
+                        "extraction_status": doc.extraction_status,
+                        "source_binary_url": doc.source_binary_url,
                         "damage": {"length": report.length, "meaningful": report.meaningful_chars,
                                    "nul": report.nul_chars, "control": report.control_chars,
                                    "replacement": report.replacement_chars},
@@ -253,7 +274,7 @@ def build_snapshot(
 def _maybe_token_counter(cfg: Config):
     try:
         from .embedding import make_token_counter
-        return make_token_counter(cfg.embed_model)
+        return make_token_counter(cfg.tokenizer_model, cfg.tokenizer_revision)
     except Exception:  # noqa: BLE001 — tokenizer/ML stack optional for the profile
         return None
 

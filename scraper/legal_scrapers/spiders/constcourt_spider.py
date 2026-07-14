@@ -21,7 +21,7 @@ from scrapy.loader import ItemLoader
 
 from ..items import ConstcourtItem
 from ..utils.dates import iso_to_dotted
-from ..utils.documents import docx_to_markdown
+from ..utils.documents import ExtractionStatus, docx_to_markdown
 from ..utils.markdown import safe_html_to_markdown
 from .base import BaseLegalSpider
 
@@ -53,7 +53,7 @@ class ConstcourtSpider(BaseLegalSpider):
     async def start(self):
         yield self.request_page(1)
 
-    def request_page(self, page):
+    def request_page(self, page, empty_retry=False):
         query = {
             "quantity": self.PAGE_SIZE,
             "page": page,
@@ -64,7 +64,15 @@ class ConstcourtSpider(BaseLegalSpider):
             f"{LIST_URL}?{urlencode(query)}",
             callback=self.parse_list,
             errback=self.request_failed,
-            meta={"page": page},
+            # The one-shot empty-page recheck must reach the network: otherwise Scrapy's
+            # duplicate filter drops the identical URL and HTTP cache may replay the same
+            # cached 200 WAF/empty response.
+            dont_filter=empty_retry,
+            meta={
+                "page": page,
+                "empty_retry": empty_retry,
+                "dont_cache": empty_retry,
+            },
         )
 
     def parse_list(self, response):
@@ -73,6 +81,19 @@ class ConstcourtSpider(BaseLegalSpider):
             self.logger.warning("constcourt: page %s returned HTTP %s; stopping", page, response.status)
             return
         items = response.css("div.legal-act-info")
+
+        if not items:
+            # An empty page normally signals end-of-results, but a transient WAF 200-block also
+            # returns 200-with-no-items — indistinguishable here. Re-check the SAME page once
+            # before concluding, so a blip doesn't silently truncate coverage; a genuinely empty
+            # end page just costs one extra fetch.
+            if response.meta.get("empty_retry"):
+                self.logger.info("constcourt: page %s still empty on retry — end of results", page)
+            else:
+                self.logger.info("constcourt: page %s empty — re-checking once (guards a transient "
+                                 "200 block) before stopping", page)
+                yield self.request_page(page, empty_retry=True)
+            return
 
         for block in items:
             href = block.css("h5.legal-act-title a::attr(href)").get()
@@ -90,11 +111,11 @@ class ConstcourtSpider(BaseLegalSpider):
                 meta={"legal_id": legal_id, "title": title, "source_url": response.urljoin(href)},
             )
 
-        # Paginate until a page comes back empty (the page after the last full one
-        # returns no acts), with a hard cap as a runaway guard.
-        if items and page < MAX_PAGES:
+        # Paginate until a page comes back empty (handled above, with a one-shot re-check),
+        # with a hard cap as a runaway guard.
+        if page < MAX_PAGES:
             yield self.request_page(page + 1)
-        elif items:
+        else:
             self.logger.warning("constcourt: hit MAX_PAGES=%s cap; stopping pagination", MAX_PAGES)
 
     def parse_detail(self, response):
@@ -127,14 +148,44 @@ class ConstcourtSpider(BaseLegalSpider):
                 meta={"data": data},
             )
         else:
+            data.update(
+                {
+                    "content_kind": "full_text",
+                    "content_complete": True,
+                    "extraction_status": ExtractionStatus.FULL_TEXT.value,
+                }
+            )
             yield self.load_item(data)
 
     def parse_docx_body(self, response):
         data = response.meta["data"]
         try:
-            data["body_markdown"] = docx_to_markdown(response.body) or data["body_markdown"]
-        except Exception as exc:  # keep the HTML teaser body if DOCX parsing fails
+            result = docx_to_markdown(
+                response.body,
+                declared_mime=response.headers.get(b"Content-Type"),
+            )
+        except Exception as exc:
             self.logger.warning("DOCX parse failed for %s: %s", response.url, exc)
+            self.record_quality_failure(
+                "document_parse_failed",
+                response.url,
+                detail=str(exc),
+                context={"legal_id": data.get("legal_id")},
+            )
+            return
+        if result.status is not ExtractionStatus.FULL_TEXT:
+            self.record_quality_failure(
+                f"document_{result.status.value}",
+                response.url,
+                detail=result.detail,
+                context={"legal_id": data.get("legal_id")},
+            )
+            return
+        data["body_markdown"] = result.text
+        data["content_kind"] = result.content_kind
+        data["content_complete"] = result.content_complete
+        data["extraction_status"] = result.status.value
+        data["source_binary_url"] = response.url
         yield self.load_item(data)
 
     @staticmethod

@@ -72,4 +72,4 @@ curl -X DELETE http://localhost:6333/collections/georgian_legal_delta
 - **Simpler alternative** (no pod Qdrant): extend `embed_delta.py` to dump PointStructs to a JSONL
   file instead of upserting, download that, and upsert locally. The merge is then unnecessary. The
   snapshot path above is used here because it reuses the Part-3 machinery verbatim.
-- **Cost**: full corpus was ~$4 on 8×4090/45 min; the delta is ~13% of that on one GPU → well under $1.
+- **Cost**: full corpus was ~$4 on 4×4090/45 min (`runpod_orchestrate_multi.py` provisions 4 GPUs); the delta is ~13% of that on one GPU → well under $1.

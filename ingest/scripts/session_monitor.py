@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import calendar
 import json
+import os
 import re
 import subprocess
 import sys
@@ -31,13 +32,22 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 # --- Locations (this project) -------------------------------------------------
-REPO = Path("/home/bezhomatiashvili/Desktop/Projects/Georgia-Legal-Search")
-_ESCAPED = str(REPO).replace("/", "-")          # ~/.claude/projects/<escaped-cwd>/
-PROJECT_DIR = Path.home() / ".claude" / "projects" / _ESCAPED
+REPO = Path(__file__).resolve().parents[2]
+_session_dir = os.environ.get("SESSION_TRANSCRIPTS_DIR")
+PROJECT_DIR = (
+    (REPO / _session_dir if not Path(_session_dir).is_absolute() else Path(_session_dir))
+    if _session_dir
+    else REPO / ".state" / "session-transcripts"
+)
 QUERY_LOG = REPO / "ingest" / ".state" / "queries.jsonl"
-POD_HEALTH_URL = "http://localhost:8900/health"
+POD_HEALTH_URL = os.environ.get("POD_HEALTH_URL", "http://localhost:8900/health")
 HTML_FILE = Path(__file__).resolve().parent / "session_monitor.html"
-GPU_WORKDIR = Path.home() / "gpu_embed_work"    # delta_orch*.log + ssh key live here
+_gpu_workdir = os.environ.get("GPU_WORKDIR")
+GPU_WORKDIR = (
+    (REPO / _gpu_workdir if not Path(_gpu_workdir).is_absolute() else Path(_gpu_workdir))
+    if _gpu_workdir
+    else REPO / "ingest" / ".state" / "gpu-work"
+)
 ENV_FILE = REPO / "ingest" / ".env"
 RUNPOD_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
              "Chrome/125.0.0.0 Safari/537.36")
@@ -860,9 +870,26 @@ def build_state() -> dict:
     }
 
 
+_ALLOWED_HOSTS = {"127.0.0.1", "localhost", "[::1]"}
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):  # silence per-request logging
         pass
+
+    def _host_allowed(self) -> bool:
+        """Reject requests whose Host header isn't loopback. Binding to 127.0.0.1 stops direct
+        remote access, but NOT DNS rebinding: a malicious page can resolve its own domain to
+        127.0.0.1 and read /api/state (RunPod balance, pod cost, recent query strings, session
+        transcript excerpts) cross-origin — the "same-origin, no CORS" reasoning in _send does
+        not cover that. A loopback Host allowlist closes it; real local browser access is
+        unaffected (browsers send Host: localhost:PORT / 127.0.0.1:PORT)."""
+        host = (self.headers.get("Host") or "").strip().lower()
+        if host.startswith("["):  # IPv6 literal, e.g. [::1]:8770
+            hostname = host[: host.find("]") + 1] if "]" in host else host
+        else:
+            hostname = host.rsplit(":", 1)[0] if ":" in host else host
+        return hostname in _ALLOWED_HOSTS
 
     def _send(self, body: bytes, ctype: str):
         self.send_response(200)
@@ -876,6 +903,11 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        if not self._host_allowed():
+            self.send_response(403)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         if self.path.startswith("/api/state"):
             try:
                 body = json.dumps(build_state()).encode()

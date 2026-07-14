@@ -27,6 +27,38 @@ INGEST_DIR = REPO_ROOT / "ingest"
 SCRAPER_DIR = REPO_ROOT / "scraper"
 
 _print_lock = threading.Lock()
+CORPUS_SOURCES = ("matsne", "ecd", "constcourt", "napr", "tas", "tbappeal")
+SCRAPER_SOURCES = (*CORPUS_SOURCES[:4], "supremecourt", *CORPUS_SOURCES[4:])
+
+
+def selected_ingest_sources(only: list[str] | None) -> list[str]:
+    """Production-index sources selected by a scrape request, in canonical order."""
+    if only is None:
+        return list(CORPUS_SOURCES)
+    unknown = sorted(set(only) - set(SCRAPER_SOURCES))
+    if unknown:
+        raise SystemExit(f"unknown spider(s): {', '.join(unknown)}")
+    selected = [source for source in CORPUS_SOURCES if source in only]
+    if not selected:
+        raise SystemExit(
+            "--only selected no production corpus source (supremecourt is intentionally excluded)"
+        )
+    return selected
+
+
+def build_watch_command(args) -> list[str]:
+    sources = selected_ingest_sources(args.only)
+    command = ["uv", "run", "python", "-m", "ingest"]
+    if args.collection:
+        command += ["--collection", args.collection]
+    command += [
+        "watch",
+        "--source",
+        ",".join(sources),
+        "--poll-interval",
+        str(args.poll_interval),
+    ]
+    return command
 
 
 def _pump(proc: subprocess.Popen, tag: str) -> None:
@@ -52,10 +84,7 @@ def main() -> None:
     parser.add_argument("--collection", help="override the Qdrant collection name (watcher)")
     args = parser.parse_args()
 
-    watch_cmd = ["uv", "run", "python", "-m", "ingest"]
-    if args.collection:
-        watch_cmd += ["--collection", args.collection]
-    watch_cmd += ["watch", "--source", "all", "--poll-interval", str(args.poll_interval)]
+    watch_cmd = build_watch_command(args)
 
     scrape_cmd = ["uv", "run", "python", "-m", "legal_scrapers.run"]
     if args.start_date:
@@ -102,9 +131,15 @@ def main() -> None:
 
     # Wait for the scrape to finish; the watcher then keeps running as a daemon.
     scraper.wait()
+    if scraper.returncode and watcher.poll() is None:
+        # A failed crawl must not leave an idle writer running forever or later report success.
+        watcher.send_signal(signal.SIGTERM)
     if not stopping.is_set():
-        print("[run_all] scrape finished; watcher still running and waiting for new "
-              "documents. Press Ctrl-C to stop it.")
+        if scraper.returncode:
+            print(f"[run_all] scrape failed with exit {scraper.returncode}; stopping watcher.")
+        else:
+            print("[run_all] scrape finished; watcher still running and waiting for new "
+                  "documents. Press Ctrl-C to stop it.")
 
     # Block until the watcher exits (on Ctrl-C, which we forward above).
     watcher.wait()
@@ -124,7 +159,7 @@ def main() -> None:
     for t in threads:
         t.join(timeout=2)
 
-    sys.exit(scraper.returncode or 0)
+    sys.exit(scraper.returncode or watcher.returncode or 0)
 
 
 if __name__ == "__main__":

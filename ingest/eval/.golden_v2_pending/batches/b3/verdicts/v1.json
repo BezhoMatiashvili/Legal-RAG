@@ -1,0 +1,62 @@
+[
+ {
+  "qid": "q236",
+  "verdict": "accept",
+  "checks": {"answers": true, "no_hindsight": true, "labels": true, "faithful_answer": true, "coherent": true},
+  "reasons": "Quote states the termination reason (amendment cured the constitutional defect, plaintiff's representative requested termination of case N1748); only this termination ruling can answer 'why was it terminated'; answer matches the document (Minister's order N663 amended by N1096 in 2025, Deputy Public Defender's motion)."
+ },
+ {
+  "qid": "q212",
+  "verdict": "reject",
+  "checks": {"answers": true, "no_hindsight": false, "labels": true, "faithful_answer": true, "coherent": true},
+  "reasons": "Not discriminative: corpus grep found 142 constcourt docs on marijuana consumption + imprisonment, including near-identical sibling Supreme Court referrals on the same Art 273 question (docs 1255, 2130, 2162 share essentially the same title) and the actual judgment (doc 1265, Givi Shanidze v Parliament) that answers this broad EN question authoritatively, so the gold referral cannot be singled out."
+ },
+ {
+  "qid": "q217",
+  "verdict": "reject",
+  "checks": {"answers": true, "no_hindsight": false, "labels": true, "faithful_answer": true, "coherent": true},
+  "reasons": "Boilerplate-answerable: sibling TAS permit 20781 is the same applicant (PSP pharmacy) with an identical facade-sign request and the identical 'first-class object, no construction permit needed' answer, and further pharmacy facade-sign docs (20581, 52178) exist, so the query has no feature discriminating doc 20772."
+ },
+ {
+  "qid": "q234",
+  "verdict": "accept",
+  "checks": {"answers": true, "no_hindsight": true, "labels": true, "faithful_answer": true, "coherent": true},
+  "reasons": "Span explicitly states adoption by the Constituent Assembly on 21 February 1921, matching meta date 1921-02-21; famous pre-hoc question with the constitution itself as the canonical unique gold; temporal label and KA language correct."
+ },
+ {
+  "qid": "q206",
+  "verdict": "reject",
+  "checks": {"answers": true, "no_hindsight": false, "labels": true, "faithful_answer": true, "coherent": true},
+  "reasons": "Keyword query has no own identifier and is equally answered by siblings: doc 1002 is the Constitutional Court's ruling on the very same complaint N575 restating the same owner-cannot-appeal claim, doc 291 is the 2007 judgment on Art 52 confiscation vs owner's court access, and doc 5005 raises the same issue, so the gold complaint is not discriminated."
+ },
+ {
+  "qid": "q247",
+  "verdict": "accept",
+  "checks": {"answers": true, "no_hindsight": true, "labels": true, "faithful_answer": true, "coherent": true},
+  "reasons": "Resolution quote directly states complaint N1657 was not accepted for merits; document confirms the subject (vaccination precondition for non-distance clinical training of medical-field students) and the First Collegium (N1/7/1657, Roinishvili panel); unique named case discriminates."
+ },
+ {
+  "qid": "q227",
+  "verdict": "accept",
+  "checks": {"answers": true, "no_hindsight": true, "labels": true, "faithful_answer": true, "coherent": true},
+  "reasons": "Quote gives the answering rule (information held in a computer system/data-storage medium must be requested under CPC Art 136); the DVD-recording framing matches only this tbappeal ruling (corpus grep: it is the sole doc mentioning DVD; 81 tbappeal docs total)."
+ },
+ {
+  "qid": "q204",
+  "verdict": "accept",
+  "checks": {"answers": true, "no_hindsight": true, "labels": true, "faithful_answer": true, "coherent": true},
+  "reasons": "Quote answers directly (first-class object, no construction permit, written consent issued); the 'right bank of the Mtkvari' location uniquely discriminates — corpus grep found only one other doc with that phrase (23398, a coefficient-determination case that does not answer the permit question)."
+ },
+ {
+  "qid": "q223",
+  "verdict": "reject",
+  "checks": {"answers": true, "no_hindsight": false, "labels": true, "faithful_answer": true, "coherent": true},
+  "reasons": "Pure template query with zero unique identifiers: corpus grep found three sibling 'fence up to 4m / reconstruction' permits (24662, 22612, 12284) each containing the identical 'I-class object, no construction permit needed' boilerplate, so any of the four answers the keyword query equally."
+ },
+ {
+  "qid": "q249",
+  "verdict": "accept",
+  "checks": {"answers": true, "no_hindsight": true, "labels": true, "faithful_answer": true, "coherent": true},
+  "reasons": "Quote (resolution N51 header, 15 December 2010) answers the temporal question; corpus grep over Khulo culture-service docs shows only this document contains both N51 and the 15-December date, and the query carries its own identifiers (Khulo council, 2010, N51)."
+ }
+]

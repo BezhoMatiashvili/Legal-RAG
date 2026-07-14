@@ -49,11 +49,29 @@ def rc_of(row: dict) -> int | None:
     return (row.get("knobs") or {}).get("rerank_candidates")
 
 
+def _index_key(row: dict):
+    """Stable, hashable identity of the index a row was measured against (or None) — so a
+    re-indexed corpus (new embed model / point count) is not collapsed with the old one."""
+    b = row.get("backend")
+    if not isinstance(b, dict):
+        return None
+    return (b.get("collection") or b.get("collection_name"),
+            b.get("embed_model"), b.get("points") or b.get("points_count"))
+
+
 def dedup_latest(rows: list[dict]) -> list[dict]:
-    """Keep the newest row per (mode-label, config_hash, relevance)."""
+    """Keep the newest row per (mode-label, config_hash, relevance, eval-set, index).
+
+    ``eval_set_hash`` and the index identity are part of the key so v1/v2 golden-set runs and
+    pre/post-reindex runs are NOT silently collapsed into one (which dropped a comparable row).
+    For a homogeneous single-eval-set report these added components are constant, so the
+    grouping — and the rendered report — are unchanged.
+    """
     best: dict = {}
     for r in sorted(rows, key=lambda r: r.get("timestamp", "")):
-        best[(r.get("mode"), r.get("config_hash"), r.get("relevance_level"))] = r
+        key = (r.get("mode"), r.get("config_hash"), r.get("relevance_level"),
+               r.get("eval_set_hash"), _index_key(r))
+        best[key] = r
     return list(best.values())
 
 

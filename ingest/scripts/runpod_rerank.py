@@ -6,11 +6,12 @@ retrieval + metrics stay local (set RERANK_REMOTE_URL=http://localhost:8900 for 
 Transport is the SSH tunnel (encrypted); the pod is wiped by termination. Reuses the embed
 orchestrator's RunPod/SSH helpers (runpod_orchestrate.py).
 
-    python scripts/runpod_rerank.py up     # provision + serve; blocks holding the tunnel;
-                                           #   writes ~/gpu_embed_work/rerank_ready with the URL
-    python scripts/runpod_rerank.py down   # emergency terminate (reads ~/gpu_embed_work/pod.id)
+    RUNPOD_SPEND_APPROVED=1 python scripts/runpod_rerank.py up --apply
+                                           # provision + serve; blocks holding the tunnel;
+                                           # writes $GPU_WORKDIR/rerank_ready with the URL
+    python scripts/runpod_rerank.py down   # emergency terminate; no approval required
 
-To stop cleanly: `touch ~/gpu_embed_work/rerank_stop` (or SIGTERM the `up` process).
+To stop cleanly: `touch "$GPU_WORKDIR/rerank_stop"` (or SIGTERM the `up` process).
 """
 
 import atexit
@@ -23,6 +24,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import runpod_orchestrate as O  # noqa: E402  — reuse gql/ssh/provision/terminate helpers
+from ingest.operational import (  # noqa: E402
+    RUNPOD_SPEND_APPROVAL_ENV,
+    require_explicit_approval,
+)
 
 PORT = 8900
 READY = O.WORKDIR / "rerank_ready"
@@ -115,7 +120,12 @@ def open_tunnel(ip: str, port: int) -> None:
     raise RuntimeError("SSH tunnel health check failed")
 
 
-def up() -> None:
+def up(*, apply: bool = False) -> None:
+    require_explicit_approval(
+        apply=apply,
+        approval_env=RUNPOD_SPEND_APPROVAL_ENV,
+        operation="paid RunPod reranker workflow",
+    )
     signal.signal(signal.SIGTERM, _sig)
     signal.signal(signal.SIGINT, _sig)
     atexit.register(_terminate)
@@ -155,6 +165,9 @@ if __name__ == "__main__":
         pid_file = O.WORKDIR / "pod.id"
         O.terminate(pid_file.read_text().strip() if pid_file.exists() else None)
     elif cmd == "up":
-        up()
+        unknown = [arg for arg in sys.argv[2:] if arg != "--apply"]
+        if unknown:
+            raise SystemExit(f"unknown argument(s): {unknown}")
+        up(apply="--apply" in sys.argv[2:])
     else:
-        sys.exit(f"usage: {sys.argv[0]} [up|down]")
+        raise SystemExit(f"usage: {sys.argv[0]} [up --apply|down]")

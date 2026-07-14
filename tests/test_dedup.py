@@ -136,6 +136,13 @@ class DedupPipelineTests(unittest.TestCase):
         item = {"case_id": "777"}  # chamber missing -> key is None -> pass
         self.assertIs(self.pipe.process_item(item, sp), item)
 
+    def test_empty_body_is_exported_but_not_persisted_as_seen(self):
+        sp = _make(_Spider, self.tmp)
+        item = {"document_id": "EMPTY", "body_markdown": ""}
+
+        self.assertIs(self.pipe.process_item(item, sp), item)
+        self.assertNotIn("EMPTY", sp._seen_keys)
+
 
 if __name__ == "__main__":
     unittest.main()

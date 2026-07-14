@@ -7,8 +7,7 @@ embed process. Run it, then open the URL it prints:
     .venv/bin/python scripts/monitor_server.py
     # → http://localhost:8765
 
-If the embed resumes on a different pod, update POD_IP/POD_PORT below (or set env
-MON_POD_IP / MON_POD_PORT).
+Set MON_POD_IP and MON_POD_PORT to the active source pod before starting it.
 """
 from __future__ import annotations
 
@@ -21,10 +20,17 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-POD_IP = os.environ.get("MON_POD_IP", "209.170.80.132")
-POD_PORT = os.environ.get("MON_POD_PORT", "13979")
-KEY = str(Path.home() / "gpu_embed_work" / "id_ed25519")
-KH = str(Path.home() / "gpu_embed_work" / "known_hosts")
+INGEST_ROOT = Path(__file__).resolve().parents[1]
+_workdir_value = os.environ.get("GPU_WORKDIR")
+GPU_WORKDIR = (
+    (INGEST_ROOT / _workdir_value if not Path(_workdir_value).is_absolute() else Path(_workdir_value))
+    if _workdir_value
+    else INGEST_ROOT / ".state" / "gpu-work"
+)
+POD_IP = os.environ.get("MON_POD_IP", "")
+POD_PORT = os.environ.get("MON_POD_PORT", "")
+KEY = str(Path(os.environ.get("GPU_SSH_KEY", GPU_WORKDIR / "id_ed25519")))
+KH = str(Path(os.environ.get("GPU_KNOWN_HOSTS", GPU_WORKDIR / "known_hosts")))
 PORT = int(os.environ.get("MON_PORT", "8765"))
 POLL_S = 15
 
@@ -202,11 +208,29 @@ tick();setInterval(tick,4000);
 </script></body></html>"""
 
 
+_ALLOWED_HOSTS = {"127.0.0.1", "localhost", "[::1]"}
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):  # quiet
         pass
 
+    def _host_allowed(self) -> bool:
+        # Loopback-bound, but a DNS-rebinding page can still read /data cross-origin; require a
+        # loopback Host header. Real local browser access sends Host: localhost:PORT.
+        host = (self.headers.get("Host") or "").strip().lower()
+        if host.startswith("["):
+            hostname = host[: host.find("]") + 1] if "]" in host else host
+        else:
+            hostname = host.rsplit(":", 1)[0] if ":" in host else host
+        return hostname in _ALLOWED_HOSTS
+
     def do_GET(self):
+        if not self._host_allowed():
+            self.send_response(403)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         if self.path.startswith("/data"):
             body = json.dumps(_computed()).encode()
             self.send_response(200)
@@ -224,6 +248,8 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
+    if not POD_IP or not POD_PORT:
+        raise SystemExit("MON_POD_IP and MON_POD_PORT are required")
     threading.Thread(target=poll_loop, daemon=True).start()
     srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     print(f"Embed monitor → http://localhost:{PORT}   (Ctrl-C to stop; read-only, safe)")

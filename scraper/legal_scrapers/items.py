@@ -46,10 +46,13 @@ class MatsneItem(scrapy.Item):
     status = scrapy.Field(input_processor=MapCompose(str.strip, class_to_status), output_processor=TakeFirst())
     additional_status = scrapy.Field(input_processor=MapCompose(str.strip), output_processor=TakeFirst())
 
-    # Consolidation metadata, derived from the detail page's #publication-switcher (the list
-    # of consolidated versions). A doc amended/re-published over time exposes ≥2 versions
-    # (consolidated); a one-shot act exposes ≤1. Set directly on the loaded item in
-    # parse_document (not via a processor), so these are plain fields.
+    # Consolidation metadata. is_consolidated = "matsne main (consolidated) document"
+    # (matsne's type=main class: the base act carrying the current consolidated text, as
+    # opposed to amendment/informational acts). Derived from the detail page's
+    # #publication-switcher (≥1 listed version ⇒ True — sound but incomplete: a base act
+    # never amended has no switcher) and forced True by provenance in doc_type=main
+    # crawls. consolidated_count = number of switcher versions (0 = never amended). Set
+    # directly on the loaded item in parse_document (not via a processor), plain fields.
     is_consolidated = scrapy.Field()
     consolidated_count = scrapy.Field()
     consolidated_dates = scrapy.Field()
@@ -113,6 +116,10 @@ class ConstcourtItem(scrapy.Item):
     authors = _f()
     college = _f()
     docx_url = _f()
+    source_binary_url = _f()
+    content_kind = _f()
+    content_complete = _f()
+    extraction_status = _f()
     body_markdown = _body()
 
 
@@ -130,6 +137,10 @@ class NaprItem(scrapy.Item):
     decision_date = _f()           # KANC_DATE
     decision_no = _f()             # KANC_NO
     pdf_url = _f()
+    source_binary_url = _f()
+    content_kind = _f()
+    content_complete = _f()
+    extraction_status = _f()
     body_markdown = _body()
 
 
@@ -141,7 +152,12 @@ class TbappealItem(scrapy.Item):
     title = _f()
     date = _f()
     pdf_url = _f()
+    source_binary_url = _f()
     featured_image_url = _f()
+    article_summary = _body()
+    content_kind = _f()
+    content_complete = _f()
+    extraction_status = _f()
     body_markdown = _body()
 
 
@@ -180,6 +196,9 @@ class TasItem(scrapy.Item):
     status = _f()
     nomenclature = _f()
     nomenclature_case_id = _f()
+    content_kind = _f()
+    content_complete = _f()
+    extraction_status = _f()
     body_markdown = _body()
 
     # --- detail: document / decision ----------------------------------------

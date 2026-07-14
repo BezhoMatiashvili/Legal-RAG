@@ -13,12 +13,20 @@ from ingest.sources import SOURCES, _parse_date, normalize, normalize_status
         ("19-05-2017", "2017-05-19"),          # DD-MM-YYYY (tbappeal)
         ("26 მარტი 2026", "2026-03-26"),       # Georgian month (constcourt)
         ("26 მარტის 2026 17:55", "2026-03-26"),  # Georgian genitive + time
+        ("30 მაისი 2016", "2016-05-30"),
+        ("30 მაისის 2016", "2016-05-30"),
+        ("2 თებერვლის 2024", "2024-02-02"),
+        ("3 სექტემბრის 2024", "2024-09-03"),
+        ("4 ოქტომბრის 2024", "2024-10-04"),
+        ("5 ნოემბრის 2024", "2024-11-05"),
+        ("6 დეკემბრის 2024", "2024-12-06"),
         ("1 იანვარი 2020", "2020-01-01"),
         ("31 დეკემბერი 2025", "2025-12-31"),
         ("garbage", None),
         ("", None),
         (None, None),
         ("32/01/2020", None),                  # invalid day -> None
+        ("31/02/2020", None),                  # impossible calendar date -> None
     ],
 )
 def test_parse_date_formats(raw, iso):
@@ -122,6 +130,22 @@ def test_tas_number():
     })
     assert doc.document_number == "AR11039800"
     assert doc.date == "2024-06-03"
+    assert doc.content_complete is False
+    assert doc.content_kind == "legacy_unlabeled"
+    assert doc.extraction_status == "malformed"
+
+
+def test_tas_explicit_full_decision_lineage_is_normalized():
+    doc = normalize("tas", {
+        "document_id": "1039801", "document_no": "AR11039801",
+        "body_markdown": "full published decision text",
+        "content_kind": "decision_full_text", "content_complete": True,
+        "extraction_status": "full_text",
+    })
+
+    assert doc.content_complete is True
+    assert doc.content_kind == "decision_full_text"
+    assert doc.extraction_status == "full_text"
 
 
 def test_tbappeal_has_no_number():
@@ -130,6 +154,23 @@ def test_tbappeal_has_no_number():
     })
     assert doc.document_number is None
     assert doc.date == "2017-05-19"
+    assert doc.content_kind == "article_summary"
+    assert doc.content_complete is False
+    assert doc.extraction_status == "malformed"
+
+
+def test_binary_content_lineage_is_normalized():
+    doc = normalize("tbappeal", {
+        "slug": "full", "title": "T", "body_markdown": "full ruling",
+        "article_summary": "news summary", "content_kind": "ruling_full_text",
+        "content_complete": True, "extraction_status": "full_text",
+        "source_binary_url": "https://court.example/ruling.pdf",
+    })
+    assert doc.content_complete is True
+    assert doc.content_kind == "ruling_full_text"
+    assert doc.extraction_status == "full_text"
+    assert doc.source_binary_url.endswith("ruling.pdf")
+    assert doc.article_summary == "news summary"
 
 
 def test_ecd_mapping_joins_title_and_reads_dynamic_court():

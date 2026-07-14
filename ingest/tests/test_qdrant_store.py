@@ -1,6 +1,22 @@
+import dataclasses
+
+import pytest
+
 from ingest.chunking import Chunk
+from ingest.config import ConfigurationError, load_config, retrieval_fingerprint_sha256
 from ingest.dedup import content_hash
-from ingest.qdrant_store import KEYWORD_FIELDS, TEXT_FIELDS, _rfc3339, build_payload
+from ingest.qdrant_store import (
+    KEYWORD_FIELDS,
+    TEXT_FIELDS,
+    _rfc3339,
+    build_payload,
+    chunking_fingerprint,
+    delete_doc_chunks_from,
+    ensure_collection,
+    upsert_points,
+    validate_generation_write_target,
+    vector_space_id,
+)
 from ingest.sources import CanonicalDoc
 
 
@@ -80,7 +96,7 @@ def test_new_index_fields_are_declared():
     assert "document_number" in KEYWORD_FIELDS
     assert "registration_code" in KEYWORD_FIELDS
     assert "status" in KEYWORD_FIELDS
-    assert set(TEXT_FIELDS) == {"text", "title", "parties"}
+    assert set(TEXT_FIELDS) == {"text", "title", "parties", "article_summary"}
 
 
 def test_build_payload_carries_content_hash():
@@ -95,7 +111,196 @@ def test_build_payload_carries_content_hash():
     assert "content_hash" in KEYWORD_FIELDS
 
 
+def test_build_payload_carries_content_completeness_lineage():
+    doc = _doc(
+        content_kind="ruling_full_text",
+        content_complete=True,
+        extraction_status="full_text",
+        source_binary_url="https://court.example/ruling.pdf",
+        article_summary="summary",
+    )
+    payload = build_payload(
+        doc, Chunk(text="ruling", chunk_index=0, heading_path=[], token_count=1)
+    )
+    assert payload["content_kind"] == "ruling_full_text"
+    assert payload["content_complete"] is True
+    assert payload["extraction_status"] == "full_text"
+    assert payload["source_binary_url"].endswith("ruling.pdf")
+    assert payload["article_summary"] == "summary"
+
+
+def test_build_payload_carries_optional_document_chunk_count():
+    chunk = Chunk(text="a", chunk_index=0, heading_path=[], token_count=1)
+    assert "document_chunk_count" not in build_payload(_doc(), chunk)
+    assert build_payload(_doc(), chunk, document_chunk_count=7)["document_chunk_count"] == 7
+
+
+def test_build_payload_carries_optional_document_state_hash():
+    chunk = Chunk(text="a", chunk_index=0, heading_path=[], token_count=1)
+    assert "document_state_hash" not in build_payload(_doc(), chunk)
+    assert build_payload(_doc(), chunk, document_state_hash="state")["document_state_hash"] == "state"
+
+
 def test_build_payload_content_hash_changes_with_body():
     a = build_payload(_doc(body_markdown="v1"), Chunk(text="x", chunk_index=0, heading_path=[], token_count=1))
     b = build_payload(_doc(body_markdown="v2"), Chunk(text="x", chunk_index=0, heading_path=[], token_count=1))
     assert a["content_hash"] != b["content_hash"]
+
+
+def _generation_cfg(**over):
+    cfg = dataclasses.replace(
+        load_config(),
+        generation_id="gen_20260713_verified",
+        collection_name="georgian_legal__gen_gen_20260713_verified",
+        embedding_revision="a" * 40,
+        tokenizer_revision="b" * 40,
+        reranker_revision="c" * 40,
+        rerank_enabled=False,
+    )
+    return dataclasses.replace(cfg, **over)
+
+
+def test_generation_payload_carries_complete_cryptographic_identity():
+    cfg = _generation_cfg(embed_header_v2=True)
+    payload = build_payload(
+        _doc(),
+        Chunk(text="x", chunk_index=0, heading_path=[], token_count=1),
+        document_chunk_count=1,
+        document_state_hash="c" * 64,
+        cfg=cfg,
+    )
+    assert payload["schema_version"] == 1
+    assert payload["generation_id"] == cfg.generation_id
+    assert payload["embedding_model"] == cfg.embed_model
+    assert payload["embedding_revision"] == "a" * 40
+    assert payload["tokenizer_model"] == cfg.tokenizer_model
+    assert payload["tokenizer_revision"] == "b" * 40
+    assert payload["reranker_model"] == cfg.rerank_model
+    assert payload["reranker_revision"] == "c" * 40
+    assert payload["vector_space_id"] == vector_space_id(cfg)
+    assert payload["chunking_fingerprint"] == chunking_fingerprint(cfg)
+    assert payload["document_header"] is True
+    assert payload["retrieval_fingerprint"] == retrieval_fingerprint_sha256(cfg)
+    assert len(payload["retrieval_fingerprint"]) == 64
+
+
+def test_generation_payload_rejects_partial_identity_and_document_markers():
+    chunk = Chunk(text="x", chunk_index=0, heading_path=[], token_count=1)
+    with pytest.raises(ConfigurationError, match="TOKENIZER_REVISION"):
+        build_payload(
+            _doc(),
+            chunk,
+            document_chunk_count=1,
+            document_state_hash="c" * 64,
+            cfg=_generation_cfg(tokenizer_revision=None),
+        )
+    with pytest.raises(ConfigurationError, match="RERANK_REVISION"):
+        build_payload(
+            _doc(),
+            chunk,
+            document_chunk_count=1,
+            document_state_hash="c" * 64,
+            cfg=_generation_cfg(reranker_revision=None),
+        )
+    with pytest.raises(ConfigurationError, match="immutable revisions"):
+        build_payload(
+            _doc(),
+            chunk,
+            document_chunk_count=1,
+            document_state_hash="c" * 64,
+            cfg=_generation_cfg(reranker_revision="main"),
+        )
+    with pytest.raises(ConfigurationError, match="document_chunk_count"):
+        build_payload(_doc(), chunk, cfg=_generation_cfg())
+
+
+def test_legacy_payload_remains_unversioned():
+    payload = build_payload(
+        _doc(), Chunk(text="x", chunk_index=0, heading_path=[], token_count=1)
+    )
+    assert "schema_version" not in payload
+    assert "generation_id" not in payload
+
+
+def test_generation_writer_refuses_stable_alias_before_client_access():
+    class NoClientAccess:
+        def collection_exists(self, _name):
+            raise AssertionError("client must not be accessed")
+
+    cfg = _generation_cfg(collection_name="georgian_legal")
+    with pytest.raises(ConfigurationError, match="physical collection"):
+        ensure_collection(NoClientAccess(), cfg)
+
+
+def test_generation_writer_requires_explicit_generation_before_client_access():
+    class NoClientAccess:
+        def collection_exists(self, _name):
+            raise AssertionError("client must not be accessed")
+
+    cfg = dataclasses.replace(
+        _generation_cfg(), generation_id=None, collection_name="georgian_legal"
+    )
+    with pytest.raises(ConfigurationError, match="explicit non-legacy GENERATION_ID"):
+        ensure_collection(
+            NoClientAccess(),
+            cfg,
+            apply=True,
+            environ={"QDRANT_WRITE_APPROVED": "1"},
+        )
+
+
+def test_generation_writer_requires_apply_and_independent_approval():
+    cfg = _generation_cfg()
+    with pytest.raises(ConfigurationError, match="--apply"):
+        validate_generation_write_target(
+            cfg, apply=False, environ={"QDRANT_WRITE_APPROVED": "1"}
+        )
+    with pytest.raises(ConfigurationError, match="QDRANT_WRITE_APPROVED"):
+        validate_generation_write_target(cfg, apply=True, environ={})
+
+    validate_generation_write_target(
+        cfg, apply=True, environ={"QDRANT_WRITE_APPROVED": "1"}
+    )
+    validate_generation_write_target(
+        cfg, apply=True, environ={"RUNPOD_EPHEMERAL_QDRANT": "1"}
+    )
+
+
+def test_generation_writer_requires_exact_physical_name_not_suffix():
+    cfg = _generation_cfg(
+        collection_name="scratch__gen_gen_20260713_verified"
+    )
+    with pytest.raises(ConfigurationError, match="exact physical collection"):
+        validate_generation_write_target(
+            cfg, apply=True, environ={"QDRANT_WRITE_APPROVED": "1"}
+        )
+
+
+def test_recreate_requires_separate_destructive_approval_before_client_access():
+    class NoClientAccess:
+        def collection_exists(self, _name):
+            raise AssertionError("client must not be accessed")
+
+    with pytest.raises(ConfigurationError, match="QDRANT_RECREATE_APPROVED"):
+        ensure_collection(
+            NoClientAccess(),
+            _generation_cfg(),
+            recreate=True,
+            apply=True,
+            environ={"QDRANT_WRITE_APPROVED": "1"},
+        )
+
+
+@pytest.mark.parametrize("collection", ["georgian_legal", "georgian_legal_delta"])
+def test_low_level_mutations_refuse_serving_collections(collection):
+    class NoClientAccess:
+        def upsert(self, **_kwargs):
+            raise AssertionError("client must not be accessed")
+
+        def delete(self, **_kwargs):
+            raise AssertionError("client must not be accessed")
+
+    with pytest.raises(ConfigurationError, match="strictly read-only"):
+        upsert_points(NoClientAccess(), collection, [object()])
+    with pytest.raises(ConfigurationError, match="strictly read-only"):
+        delete_doc_chunks_from(NoClientAccess(), collection, "ecd", "1", 0)

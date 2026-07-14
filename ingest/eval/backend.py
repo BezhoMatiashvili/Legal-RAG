@@ -15,10 +15,13 @@ from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+from ingest.retrieval import RetrievalRequest, execute_retrieval
+
 from .bm25 import BM25Index, tokenize
 from .metrics import Hit
 
 MODES = ("bm25", "dense", "sparse", "hybrid", "rerank", "routed")
+PRODUCTION_MODES = ("production", "client_translated")
 _RRF_K = 60
 
 
@@ -140,6 +143,65 @@ class FakeBackend:
 
         # score field is informational for fake modes; ranking is what matters
         return [self._hit(i, 1.0 / (rank + 1)) for rank, i in enumerate(order)], lat
+
+
+class ProductionBackend:
+    """Quality-evaluation backend that executes the serving retrieval path verbatim.
+
+    ``production`` sends the authored query unchanged. ``client_translated`` is a separate
+    client-orchestrated track that substitutes only translations explicitly present in the
+    supplied artifact; it is never silently mixed into the direct production metrics.
+    """
+
+    def __init__(self, cfg, client, embedder, reranker=None, *, translations=None):
+        self.cfg = cfg
+        self.client = client
+        self.embedder = embedder
+        self.reranker = reranker
+        self.translations = translations or {}
+        self.last_outcome = None
+
+    @staticmethod
+    def _hits(points) -> list[Hit]:
+        hits = []
+        for point in points:
+            payload = point.payload or {}
+            hits.append(
+                Hit(
+                    payload.get("source"),
+                    payload.get("document_id"),
+                    payload.get("chunk_index", -1),
+                    float(point.score),
+                )
+            )
+        return hits
+
+    def search(self, query: str, mode: str, k: int) -> tuple[list[Hit], dict[str, float]]:
+        if mode not in PRODUCTION_MODES:
+            raise ValueError(f"production backend does not implement ablation mode {mode!r}")
+        if mode == "client_translated":
+            effective_query = self.translations.get(query, query)
+        else:
+            effective_query = query
+        request = RetrievalRequest(
+            query=effective_query,
+            requested_limit=k,
+            route=True,
+            track=mode,
+        )
+        outcome = execute_retrieval(
+            self.cfg,
+            self.client,
+            self.embedder,
+            self.reranker,
+            request,
+        )
+        self.last_outcome = outcome
+        timings = {
+            stage: outcome.timings_ms.get(stage, 0.0) / 1000.0
+            for stage in ("embed", "search", "rerank")
+        }
+        return self._hits(outcome.hits), timings
 
 
 class QdrantBackend:

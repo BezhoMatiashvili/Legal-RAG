@@ -95,6 +95,13 @@ def fetch(url: str, *, timeout: float = 30.0, retries: int = 2) -> tuple[int, by
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return resp.status, resp.read()
         except urllib.error.HTTPError as exc:
+            # Transient statuses (rate-limit / gateway) must be RETRIED, not accepted as a final
+            # answer — otherwise a flaky Cloudflare window returns a non-200 that the caller reads
+            # as "no references", biasing the completeness audit toward a false "corpus complete".
+            if exc.code in (429, 500, 502, 503, 504) and attempt < retries:
+                last_exc = exc
+                time.sleep(1.5 * (attempt + 1))
+                continue
             return exc.code, exc.read() if exc.fp else b""
         except Exception as exc:  # noqa: BLE001 - transient network; retry then give up
             last_exc = exc

@@ -52,3 +52,12 @@ def test_config_reads_embed_header_v2_env(monkeypatch):
     assert load_config().embed_header_v2 is True
     monkeypatch.delenv("EMBED_HEADER_V2")
     assert load_config().embed_header_v2 is False
+
+
+def test_serving_fingerprint_changes_when_v2_header_is_enabled():
+    from ingest.config import retrieval_fingerprint
+
+    cfg = load_config()
+    off = dataclasses.replace(cfg, embed_header_v2=False)
+    on = dataclasses.replace(cfg, embed_header_v2=True)
+    assert retrieval_fingerprint(off) != retrieval_fingerprint(on)

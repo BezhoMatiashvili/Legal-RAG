@@ -28,17 +28,27 @@ import logging
 import os
 import signal
 import time
+from collections import OrderedDict
+from collections.abc import Callable
 from enum import Enum
 from pathlib import Path
+from typing import Literal
 
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, ConfigDict, Field
 from qdrant_client import models
 
 from . import qdrant_store as store
+from .collection_compatibility import (
+    CollectionIncompatibleError,
+    check_collection_compatibility,
+    require_config_manifest_compatibility,
+)
 from .config import Config, load_config, retrieval_fingerprint
+from .generation import GenerationManifest, load_generation
 from .querylog import append_query_log, build_query_record
-from .search import build_filter, detect_language, hybrid_search
+from .retrieval import RetrievalRequest, TemporalContext, execute_retrieval
+from .search import build_filter, detect_language
 from .sources import SOURCES
 
 logger = logging.getLogger("ingest.mcp_server")
@@ -57,6 +67,9 @@ _embedder = None
 _embedder_lock = asyncio.Lock()
 _reranker = None
 _reranker_lock = asyncio.Lock()
+_generation_manifest: GenerationManifest | None = None
+_generation_root: Path | None = None
+_worker_readiness_probe: Callable[[], dict] | None = None
 
 # The embed+rerank path holds the BGE-M3 + cross-encoder working set (~4.6 GB) and is
 # CPU-bound. On this RAM-tight box two concurrent searches co-thrash into swap and each
@@ -70,6 +83,183 @@ def _get_cfg() -> Config:
     if _cfg is None:
         _cfg = load_config()
     return _cfg
+
+
+def _configured_generation_manifest(cfg: Config) -> GenerationManifest | None:
+    """Checksum-load and cache the immutable generation selected by this process."""
+    global _generation_manifest, _generation_root
+    if cfg.generation_dir is None:
+        return None
+    root = cfg.generation_dir.resolve()
+    if _generation_manifest is None or _generation_root != root:
+        artifacts = load_generation(root)
+        require_config_manifest_compatibility(cfg, artifacts.manifest)
+        _generation_manifest = artifacts.manifest
+        _generation_root = root
+    return _generation_manifest
+
+
+def _install_verified_worker_runtime(cfg: Config, readiness_probe: Callable[[], dict]) -> None:
+    """Install handler-owned config/readiness before any worker singleton is used.
+
+    The environment flag alone is intentionally insufficient: only the serverless handler
+    can install this in-process probe.  This keeps a copied/forged environment from bypassing
+    the normal checksummed-generation readiness path.
+    """
+    global _cfg, _worker_readiness_probe
+    if not cfg.production_mode or not cfg.verified_worker_binding:
+        raise ValueError("worker runtime requires a verified production binding")
+    if not callable(readiness_probe):
+        raise TypeError("readiness_probe must be callable")
+    if any(value is not None for value in (_client, _embedder, _reranker)):
+        raise RuntimeError("worker runtime must be installed before clients or models load")
+    if _worker_readiness_probe is not None:
+        raise RuntimeError("worker runtime is already installed")
+    _cfg = cfg
+    _worker_readiness_probe = readiness_probe
+
+
+def _local_readiness(cfg: Config, client) -> dict:
+    """Read-only exact generation readiness; legacy collections never pass open."""
+    if cfg.verified_worker_binding:
+        if _worker_readiness_probe is None:
+            return {
+                "ok": False,
+                "code": "worker_readiness_probe_not_installed",
+                "collection": cfg.collection_name,
+                "generation_id": cfg.generation_id,
+                "issues": [
+                    {
+                        "gate": "integrity",
+                        "code": "worker_readiness_probe_not_installed",
+                    }
+                ],
+            }
+        try:
+            payload = _worker_readiness_probe()
+        except Exception as exc:  # noqa: BLE001 - readiness uncertainty fails closed
+            payload = {
+                "ok": False,
+                "code": "worker_readiness_probe_failed",
+                "error": f"{type(exc).__name__}: {exc}",
+                "issues": [
+                    {"gate": "integrity", "code": "worker_readiness_probe_failed"}
+                ],
+            }
+        if not isinstance(payload, dict):
+            payload = {
+                "ok": False,
+                "code": "worker_readiness_probe_invalid",
+                "issues": [
+                    {"gate": "integrity", "code": "worker_readiness_probe_invalid"}
+                ],
+            }
+        elif payload.get("ok") and (
+            payload.get("collection") != cfg.collection_name
+            or payload.get("generation_id") != cfg.generation_id
+        ):
+            payload = {
+                "ok": False,
+                "code": "worker_readiness_identity_mismatch",
+                "collection": payload.get("collection"),
+                "generation_id": payload.get("generation_id"),
+                "issues": [
+                    {
+                        "gate": "integrity",
+                        "code": "worker_readiness_identity_mismatch",
+                    }
+                ],
+            }
+        return payload
+
+    manifest = _configured_generation_manifest(cfg)
+    if manifest is None:
+        info = client.get_collection(cfg.collection_name)
+        return {
+            "ok": False,
+            "code": "generation_manifest_not_configured",
+            "collection": cfg.collection_name,
+            "points": getattr(info, "points_count", None),
+            "generation_id": cfg.generation_id,
+            "issues": [
+                {
+                    "gate": "integrity",
+                    "code": "generation_manifest_not_configured",
+                }
+            ],
+        }
+    result = check_collection_compatibility(client, cfg.collection_name, manifest)
+    payload = result.to_dict()
+    payload["collection"] = cfg.collection_name
+    payload["points"] = result.points_count
+    return payload
+
+
+def _require_local_readiness(cfg: Config, client) -> None:
+    readiness = _local_readiness(cfg, client)
+    if not readiness["ok"]:
+        codes = ", ".join(
+            str(issue.get("code")) for issue in readiness.get("issues", [])
+        )
+        raise CollectionIncompatibleError(
+            f"production retrieval abstained: collection readiness failed ({codes})"
+        )
+
+
+# --- Result cache -------------------------------------------------------------
+# Identical repeat queries return the cached formatted result instead of re-running the whole
+# retrieval (the RunPod round-trip in remote mode, or the ~28 s CPU rerank locally). In-memory
+# and per-process (cleared on /mcp respawn and worker snapshot restore); keyed on the full
+# request + retrieval_fingerprint so a serving-config change invalidates. The feature is
+# opt-in because local writers run in another process and cannot invalidate this cache.
+# Only non-empty, non-degraded successful results are stored.
+_result_cache: "OrderedDict[str, tuple[float, str]]" = OrderedDict()
+
+
+def _cache_key(cfg: Config, params) -> str:
+    material = params.model_dump(mode="json")
+    material["__fp"] = retrieval_fingerprint(cfg)
+    return json.dumps(material, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+
+
+def _cache_get(cfg: Config, key: str) -> str | None:
+    ent = _result_cache.get(key)
+    if ent is None:
+        return None
+    ts, value = ent
+    if cfg.result_cache_ttl > 0 and (time.monotonic() - ts) > cfg.result_cache_ttl:
+        _result_cache.pop(key, None)
+        return None
+    _result_cache.move_to_end(key)  # LRU: mark most-recently-used
+    return value
+
+
+def _cache_put(cfg: Config, key: str, value: str) -> None:
+    _result_cache[key] = (time.monotonic(), value)
+    _result_cache.move_to_end(key)
+    while len(_result_cache) > cfg.result_cache_size:
+        _result_cache.popitem(last=False)  # evict least-recently-used
+
+
+def _cacheable_search_result(value: str) -> bool:
+    """True only for a positive, full-quality search response."""
+    text = (value or "").strip()
+    lowered = text.lower()
+    if not text or "no results found" in lowered or "retrieval degraded" in lowered:
+        return False
+    if text.startswith("> WARNING:"):
+        return False
+    if text.startswith("{"):
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            return False
+        return (
+            isinstance(payload, dict)
+            and bool(payload.get("hits"))
+            and not payload.get("degraded", False)
+        )
+    return text.startswith("# ")
 
 
 def _get_client():
@@ -150,11 +340,17 @@ async def _remote_op(op: str, params: dict | None = None) -> str:
         out = await asyncio.to_thread(_get_remote_client().call, op, params or {})
         return out.get("result") or ""
     except Exception as e:  # noqa: BLE001 - surface an actionable message to the agent
-        return (
-            f"Error (remote backend): {e}\n\n"
-            "If the serverless endpoint is gone for good, set SEARCH_BACKEND=local in "
-            "ingest/.env and reconnect /mcp to serve from the local Qdrant instead."
-        )
+        return _remote_error_text(e)
+
+
+def _remote_error_text(e: Exception) -> str:
+    """Actionable message when a remote op fails — shared by _remote_op and legal_search so
+    the wording (and the SEARCH_BACKEND=local escape hatch) stays in one place."""
+    return (
+        f"Error (remote backend): {e}\n\n"
+        "If the serverless endpoint is gone for good, set SEARCH_BACKEND=local in "
+        "ingest/.env and reconnect /mcp to serve from the local Qdrant instead."
+    )
 
 
 def _publish_manifest(cfg: Config) -> dict | None:
@@ -275,9 +471,10 @@ class SearchInput(BaseModel):
     )
     is_consolidated: bool | None = Field(
         None,
-        description="Filter matsne acts by consolidation: true = the act has consolidated "
-        "versions (it was amended/re-published over time), false = a one-shot act never "
-        "amended.",
+        description="Filter matsne acts by document class: true = a main (consolidated) "
+        "document — the base normative act carrying the current consolidated text "
+        "(matsne's 'ძირითადი (კონსოლიდირებული)' filter), false = an amendment or "
+        "informational act.",
     )
     document_number: str | None = Field(
         None,
@@ -308,6 +505,30 @@ class SearchInput(BaseModel):
     response_format: ResponseFormat = Field(
         ResponseFormat.MARKDOWN,
         description="'markdown' for readable results, 'json' for full payloads.",
+    )
+
+
+def _retrieval_request(params: SearchInput) -> RetrievalRequest:
+    """Translate the MCP wire model into the provider-neutral production request."""
+
+    return RetrievalRequest(
+        query=params.query,
+        requested_limit=params.top_k,
+        route=True,
+        language=params.language,
+        temporal_context=TemporalContext(date_from=params.date_from, date_to=params.date_to),
+        filters={
+            "source": params.source,
+            "court": params.court,
+            "status": params.status,
+            "is_consolidated": params.is_consolidated,
+            "document_type": params.document_type,
+            "document_number": params.document_number,
+            "registration_code": params.registration_code,
+            "parties": params.parties,
+            "contains": params.contains,
+        },
+        track="production_direct",
     )
 
 
@@ -342,6 +563,13 @@ async def legal_search(params: SearchInput) -> str:
     For exact identifier lookups use ``legal_lookup``; for non-semantic browsing/filtering
     use ``legal_browse``. To read a full document after a chunk looks relevant, pass its
     ``source`` + ``document_id`` to ``legal_get_document``.
+
+    Current-law precision — when the ask is about what the law says *now* (current rules,
+    obligations, in-force provisions), set ``status='in_force'`` and, for matsne statutes,
+    ``is_consolidated=true`` — the consolidated base act carries the current text, whereas a
+    bare amendment act only changes it piecemeal. Leave both unset for historical or
+    as-of-a-past-date questions, and drop them (per the retry playbook) if the target law
+    fails to surface, since not every source populates ``status``.
 
     Retry playbook — when the top hits don't actually match the ask, iterate instead of
     settling: (a) re-query in Georgian legal terminology (statute vocabulary, synonyms);
@@ -381,72 +609,86 @@ async def legal_search(params: SearchInput) -> str:
         "chunk_index", "heading", "text"}, ...]}.
         Returns a "No results found" message when nothing matches.
     """
+    cfg = _get_cfg()
+    local_client = None
+    if cfg.production_mode and not _use_remote():
+        try:
+            local_client = _get_client()
+            await asyncio.to_thread(_require_local_readiness, cfg, local_client)
+        except Exception as e:  # noqa: BLE001 - production must abstain before model import
+            return _handle_error(e)
+    key = _cache_key(cfg, params) if cfg.result_cache_enabled else None
+    if key is not None:
+        cached = _cache_get(cfg, key)
+        if cached is not None:
+            return cached  # identical query already answered — skip the whole round-trip
+
     if _use_remote():
         t0 = time.perf_counter()
-        result = await _remote_op("search", params.model_dump(mode="json"))
+        try:
+            out = await asyncio.to_thread(
+                _get_remote_client().call, "search", params.model_dump(mode="json"))
+            result, ok = (out.get("result") or ""), True
+        except Exception as e:  # noqa: BLE001 - surface an actionable message to the agent
+            result, ok = _remote_error_text(e), False
         _log_query_remote(params, (time.perf_counter() - t0) * 1000)
+        if key is not None and ok and _cacheable_search_result(result):
+            _cache_put(cfg, key, result)
         return result
     try:
-        cfg = _get_cfg()
-        client = _get_client()
+        client = local_client or _get_client()
         embedder = await _get_embedder()
         reranker = await _get_reranker()
-        search_kwargs = dict(
-            top_k=params.top_k,
-            rerank_candidates=cfg.rerank_candidates,
-            rerank_min_score=cfg.rerank_min_score,
-            source=params.source,
-            court=params.court,
-            status=params.status,
-            is_consolidated=params.is_consolidated,
-            language=params.language,
-            document_type=params.document_type,
-            document_number=params.document_number,
-            registration_code=params.registration_code,
-            parties=params.parties,
-            contains=params.contains,
-            date_from=params.date_from,
-            date_to=params.date_to,
-        )
         # Serialize the heavy embed+rerank work so overlapping queries don't co-thrash swap.
         async with _search_semaphore:
-            t0 = time.perf_counter()
-            try:
-                hits = await asyncio.to_thread(
-                    hybrid_search, cfg, client, embedder, params.query,
-                    reranker=reranker, **search_kwargs,
-                )
-            except Exception as e:  # noqa: BLE001
-                # A remote GPU reranker can go away (pod terminated / tunnel dropped). Rather
-                # than hang or error the tool, degrade to the RRF-fused order and keep serving.
-                if reranker is None or not _is_remote_reranker(reranker):
-                    raise
-                logger.warning("remote reranker unreachable (%s); falling back to RRF order", e)
-                hits = await asyncio.to_thread(
-                    hybrid_search, cfg, client, embedder, params.query,
-                    reranker=None, **search_kwargs,
-                )
-            elapsed_ms = (time.perf_counter() - t0) * 1000
+            outcome = await asyncio.to_thread(
+                execute_retrieval,
+                cfg,
+                client,
+                embedder,
+                reranker,
+                _retrieval_request(params),
+            )
     except Exception as e:  # noqa: BLE001 - surface an actionable message to the agent
         return _handle_error(e)
 
+    hits = outcome.hits
+    elapsed_ms = outcome.timings_ms["total"]
+    degraded = outcome.degraded
+    if degraded:
+        logger.warning(
+            "remote reranker unreachable (%s); falling back to RRF order",
+            outcome.degraded_reason,
+        )
     _log_query(cfg, params, hits, elapsed_ms)
 
     if not hits:
-        return "No results found. Try a broader query or remove filters."
+        out = "No results found. Try a broader query or remove filters."
+        return out
 
-    fp = retrieval_fingerprint(cfg)
+    fp = outcome.retrieval_fingerprint
     if params.response_format is ResponseFormat.JSON:
         payload = {
             "count": len(hits), "collection": cfg.collection_name, "fingerprint": fp,
             "hits": [_hit_dict(h) for h in hits],
         }
-        return json.dumps(payload, ensure_ascii=False, indent=2)
-
-    blocks = [f"# {len(hits)} results for: {params.query}", ""]
-    blocks.extend(_format_hit_md(rank, hit) for rank, hit in enumerate(hits, 1))
-    blocks.append(f"\n> index: {cfg.collection_name} · fp {fp}")
-    return "\n".join(blocks)
+        if degraded:
+            payload["degraded"] = True
+        out = json.dumps(payload, ensure_ascii=False, indent=2)
+    else:
+        blocks = [f"# {len(hits)} results for: {params.query}", ""]
+        blocks.extend(_format_hit_md(rank, hit) for rank, hit in enumerate(hits, 1))
+        blocks.append(f"\n> index: {cfg.collection_name} · fp {fp}")
+        if degraded:
+            blocks.insert(
+                0,
+                "> WARNING: retrieval degraded — the configured remote reranker was "
+                "unavailable, so these hits use hybrid-fusion order only.\n",
+            )
+        out = "\n".join(blocks)
+    if key is not None and not degraded:
+        _cache_put(cfg, key, out)
+    return out
 
 
 def _log_query_remote(params, elapsed_ms: float) -> None:
@@ -684,11 +926,73 @@ def _dedup_documents(points) -> list[dict]:
                 "court": p.get("court"),
                 "language": p.get("language"),
                 "source_url": p.get("source_url"),
-                "chunk_count": entry["chunk_count"],
+                "chunk_count": p.get("document_chunk_count") or entry["chunk_count"],
             }
         )
     docs.sort(key=lambda d: d["date_sort"], reverse=True)
     return docs
+
+
+_DOCUMENT_PAYLOAD_FIELDS = (
+    "source",
+    "document_id",
+    "document_number",
+    "registration_code",
+    "document_type",
+    "title",
+    "parties",
+    "date",
+    "date_raw",
+    "court",
+    "language",
+    "source_url",
+    "chunk_index",
+    "document_chunk_count",
+)
+
+
+def _condition_list(value) -> list:
+    if value is None:
+        return []
+    return value if isinstance(value, list) else [value]
+
+
+def _document_scroll_filter(flt: models.Filter | None) -> models.Filter:
+    """Add the indexed chunk-zero condition while preserving every caller filter."""
+    chunk_zero = models.FieldCondition(key="chunk_index", match=models.MatchValue(value=0))
+    if flt is None:
+        return models.Filter(must=[chunk_zero])
+    return models.Filter(
+        should=flt.should,
+        min_should=flt.min_should,
+        must=[*_condition_list(flt.must), chunk_zero],
+        must_not=flt.must_not,
+    )
+
+
+def _iter_document_points(
+    client,
+    collection: str,
+    flt: models.Filter | None,
+    *,
+    chunk_zero_only: bool,
+    page: int = 512,
+):
+    """Stream metadata-only records; never accumulate full chunk payloads/text in memory."""
+    scroll_filter = _document_scroll_filter(flt) if chunk_zero_only else flt
+    offset = None
+    while True:
+        batch, offset = client.scroll(
+            collection_name=collection,
+            scroll_filter=scroll_filter,
+            with_payload=_DOCUMENT_PAYLOAD_FIELDS,
+            with_vectors=False,
+            limit=page,
+            offset=offset,
+        )
+        yield from batch
+        if offset is None:
+            break
 
 
 def _format_doc_line(rank: int, d: dict) -> str:
@@ -799,6 +1103,18 @@ class BrowseInput(BaseModel):
     court: str | None = Field(None, description="Exact court value, e.g. 'supremecourt'.")
     language: str | None = Field(None, description="Language code, e.g. 'ka'.")
     document_number: str | None = Field(None, description="Exact official document number.")
+    status: str | None = Field(
+        None,
+        description="Legal status (matsne acts only): 'in_force', 'repealed', or "
+        "'pending'. Use 'in_force' to restrict to law currently in effect.",
+    )
+    is_consolidated: bool | None = Field(
+        None,
+        description="Filter matsne acts by document class: true = a main (consolidated) "
+        "document — the base normative act carrying the current consolidated text "
+        "(matsne's 'ძირითადი (კონსოლიდირებული)' filter), false = an amendment or "
+        "informational act.",
+    )
     parties: str | None = Field(None, description="Full-text match on party/person names.")
     contains: str | None = Field(
         None, description="Full-text keyword/phrase that must appear in the document body."
@@ -807,7 +1123,9 @@ class BrowseInput(BaseModel):
     date_to: str | None = Field(None, description="Latest date, inclusive, YYYY-MM-DD.")
     limit: int = Field(20, description="Max documents to return.", ge=1, le=200)
     offset: int = Field(0, description="Documents to skip (pagination).", ge=0)
-    sort: str = Field("date_desc", description="'date_desc' (newest first) or 'date_asc'.")
+    sort: Literal["date_desc", "date_asc"] = Field(
+        "date_desc", description="'date_desc' (newest first) or 'date_asc'."
+    )
     response_format: ResponseFormat = Field(
         ResponseFormat.MARKDOWN,
         description="'markdown' for a readable list, 'json' for structured records.",
@@ -825,7 +1143,7 @@ class BrowseInput(BaseModel):
     },
 )
 async def legal_browse(params: BrowseInput) -> str:
-    """List documents by structured filters — date range, type, court, number, party, keyword.
+    """List documents by structured filters — date range, type, court, number, party, keyword, status, consolidation.
 
     Non-semantic and no model load: this is the "browse the corpus" tool, complementary to
     the meaning-based ``legal_search``. Use it to answer "all decisions from this court in
@@ -839,7 +1157,11 @@ async def legal_browse(params: BrowseInput) -> str:
         "limit", "documents": [...]}. ``count`` is the page size, not the global total.
     """
     if _use_remote():
-        return await _remote_op("browse", params.model_dump(mode="json"))
+        # exclude_none keeps old-field-only calls wire-compatible with a serverless
+        # worker built before status/is_consolidated existed (its BrowseInput is
+        # extra="forbid"); calls that USE the new filters fail loudly there until the
+        # image is redeployed — the correct signal.
+        return await _remote_op("browse", params.model_dump(mode="json", exclude_none=True))
     try:
         cfg = _get_cfg()
         client = _get_client()
@@ -849,16 +1171,28 @@ async def legal_browse(params: BrowseInput) -> str:
             court=params.court,
             language=params.language,
             document_number=params.document_number,
+            status=params.status,
+            is_consolidated=params.is_consolidated,
             parties=params.parties,
             contains=params.contains,
             date_from=params.date_from,
             date_to=params.date_to,
         )
-        points = await asyncio.to_thread(_scroll_all, client, cfg.collection_name, flt)
+        # All structured filters are replicated on every chunk, so chunk zero is sufficient.
+        # A body ``contains`` filter can match a later chunk; in that case stream all matching
+        # chunk ids but request metadata only and deduplicate incrementally.
+        docs = await asyncio.to_thread(
+            _dedup_documents,
+            _iter_document_points(
+                client,
+                cfg.collection_name,
+                flt,
+                chunk_zero_only=params.contains is None,
+            ),
+        )
     except Exception as e:  # noqa: BLE001
         return _handle_error(e)
 
-    docs = _dedup_documents(points)
     if params.sort == "date_asc":
         docs.reverse()
     page = docs[params.offset : params.offset + params.limit]
@@ -1154,13 +1488,14 @@ async def legal_get_document_versions(params: GetVersionsInput) -> str:
     },
 )
 async def legal_health() -> str:
-    """Liveness/readiness probe: confirms Qdrant is reachable and the collection is populated.
+    """Liveness/readiness probe for exact immutable generation compatibility.
 
     Returns JSON ``{ok, collection, points, qdrant_url, fingerprint}``; ``ok`` is false with
     an actionable hint if Qdrant is unreachable or the collection is missing. No model load.
 
-    In remote mode this probes the serverless endpoint's health API instead (instant, never
-    wakes — and never bills — a worker) and reports the locally-mirrored publish manifest."""
+    In remote mode this probes only the serverless control plane (instant and non-billing).
+    That is liveness, not corpus readiness, so it cannot report ``ok=true`` without a worker
+    generation check; the locally mirrored publish intent is included for diagnosis."""
     if _use_remote():
         cfg = _get_cfg()
         try:
@@ -1172,20 +1507,40 @@ async def legal_health() -> str:
                 "hint": "Check RUNPOD_ENDPOINT_ID / RUNPOD_API_KEY in ingest/.env, or flip "
                         "SEARCH_BACKEND=local to serve from the local Qdrant.",
             }, ensure_ascii=False)
+        published = _publish_manifest(cfg)
+        publish_is_generation = bool(
+            isinstance(published, dict)
+            and published.get("schema_version") == 2
+            and published.get("generation_id")
+            and published.get("generation_manifest_sha256")
+        )
         return json.dumps({
-            "ok": True, "backend": "remote", "endpoint_id": cfg.runpod_endpoint_id,
-            "workers": h.get("workers"), "jobs": h.get("jobs"),
-            "published": _publish_manifest(cfg),
+            "ok": False,
+            "platform_ok": True,
+            "backend": "remote",
+            "code": (
+                "worker_generation_not_probed"
+                if publish_is_generation
+                else "generation_publish_manifest_missing_or_legacy"
+            ),
+            "endpoint_id": cfg.runpod_endpoint_id,
+            "workers": h.get("workers"),
+            "jobs": h.get("jobs"),
+            "published": published,
+            "hint": "Use the worker health operation/readiness gate before promotion; "
+                    "control-plane liveness cannot prove corpus identity.",
         }, ensure_ascii=False)
     try:
         cfg = _get_cfg()
         client = _get_client()
-        info = await asyncio.to_thread(client.get_collection, cfg.collection_name)
-        return json.dumps({
-            "ok": True, "collection": cfg.collection_name,
-            "points": getattr(info, "points_count", None),
-            "qdrant_url": cfg.qdrant_url, "fingerprint": retrieval_fingerprint(cfg),
-        }, ensure_ascii=False)
+        readiness = await asyncio.to_thread(_local_readiness, cfg, client)
+        readiness.update(
+            {
+                "qdrant_url": cfg.qdrant_url,
+                "fingerprint": retrieval_fingerprint(cfg),
+            }
+        )
+        return json.dumps(readiness, ensure_ascii=False)
     except Exception as e:  # noqa: BLE001
         return json.dumps({
             "ok": False, "error": f"{type(e).__name__}: {e}",

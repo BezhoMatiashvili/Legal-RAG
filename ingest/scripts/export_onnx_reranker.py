@@ -25,14 +25,23 @@ INT8 = OUT_DIR / "bge-reranker-v2-m3-int8.onnx"
 _MAX_LENGTH = 512
 
 
-def main() -> None:
-    import torch
+def _load_reranker(model_name: str, revision: str | None):
     from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
+    revision_kwargs = {"revision": revision} if revision is not None else {}
+    tokenizer = AutoTokenizer.from_pretrained(model_name, **revision_kwargs)
+    model = AutoModelForSequenceClassification.from_pretrained(
+        model_name, **revision_kwargs
+    )
+    return tokenizer, model
+
+
+def main() -> None:
     cfg = load_config()
+    import torch
+
     print(f"loading {cfg.rerank_model} (fp32, cpu)...")
-    tokenizer = AutoTokenizer.from_pretrained(cfg.rerank_model)
-    model = AutoModelForSequenceClassification.from_pretrained(cfg.rerank_model)
+    tokenizer, model = _load_reranker(cfg.rerank_model, cfg.reranker_revision)
     model.eval()
 
     sample = tokenizer([["query", "text"]], padding=True, truncation=True,

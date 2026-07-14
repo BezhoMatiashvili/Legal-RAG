@@ -16,7 +16,7 @@ atexit + signals + poll deadline):
   5. always terminate + cost-report.
 
 Usage (from ingest/):
-    nohup .venv/bin/python scripts/runpod_orchestrate_reembed.py > ~/gpu_embed_work/reembed_v2.log 2>&1 &
+    nohup .venv/bin/python scripts/runpod_orchestrate_reembed.py > "$GPU_WORKDIR/reembed_v2.log" 2>&1 &
     .venv/bin/python scripts/runpod_orchestrate_reembed.py terminate   # emergency
 """
 from __future__ import annotations
@@ -34,6 +34,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import runpod_orchestrate as O  # noqa: E402 — gql/ssh/provision/terminate helpers
+from ingest.operational import refuse_legacy_operation  # noqa: E402
 
 V2_COLLECTION = "georgian_legal_v2"
 ROWS_SRC = O.INGEST / ".state" / "reembed_v2" / "rows"
@@ -49,11 +50,10 @@ GOLDEN_SET = "v2"  # frozen 337-pair superset of v1; has temporal + more citatio
 # Per-GPU cost is ~flat, so fewer GPUs = same $, just slower wall-clock.
 # Single GPU (2026-07-11): balance is tight ($4.74) so run one cheap-first GPU; the batch=256
 # fix makes a single 4090 finish in ~5-6h. Cascade kept as a list for reuse but 1-only here.
-GPU_COUNTS = [1]
-# Cheapest-first by $/hr (4000Ada $0.26 < A5000 $0.27 < 3090 $0.44 < 4090 $0.69): a cheap GPU
-# completes the whole run well under the $4.74 balance (slower); 4090 is last resort.
-GPU_PREFERENCE = ["NVIDIA RTX 4000 Ada Generation", "NVIDIA RTX A5000",
-                  "NVIDIA GeForce RTX 3090", "NVIDIA GeForce RTX 4090"]
+GPU_COUNTS = [4, 2, 1]  # user asked to speed up: try a 4-GPU pod, fall back 4->2->1 on capacity
+# 4090-first (user's choice): cheap GPUs are 3-4x slower (13-23h — impractical) for this
+# workload, so the 4090 (~5.8h at batch 256) is the only practical single-GPU option.
+GPU_PREFERENCE = ["NVIDIA GeForce RTX 4090", "NVIDIA RTX A5000", "NVIDIA GeForce RTX 3090"]
 ACTUAL_GPUS = 1  # set by step_provision_cascade to the count actually obtained
 # Single-GPU wall-clock for the full 2.65M chunks; deadline = this / actual_count + buffer.
 DEADLINE_1GPU_S = {"NVIDIA GeForce RTX 4090": 6 * 3600,
@@ -65,7 +65,7 @@ POLL_S = 60
 DEAD_CHECKS = 6
 TUNNEL_QDRANT = 16333
 TUNNEL_RERANK = 18900
-BUDGET_CEILING = 4.0  # clean-abort with room for eval+pull under the $4.74 balance
+BUDGET_CEILING = float(os.environ.get("REEMBED_BUDGET_CEILING", "4.4"))  # env-overridable; default clean-aborts just under the old $4.74 balance
 
 # References = v1-header LIVE collection at the CURRENT corpus on the v2 golden set (337)
 # with v2 translations, written by scripts/scratchpad/ref_v2_driver.sh. (v2 ⊇ v1, so these
@@ -350,6 +350,7 @@ def step_gate(hyb: dict, rr: dict) -> bool:
 
 
 def step_pull_and_restore(ip: str, port: int, expected_points: int) -> None:
+    refuse_legacy_operation("non-generation re-embed snapshot restore")
     snap = OUT / f"{V2_COLLECTION}.snapshot"
     _retry(lambda: O.pull_file(f"/workspace/out/{V2_COLLECTION}.snapshot", snap, ip, port,
                                timeout=1800),
@@ -371,6 +372,7 @@ def step_pull_and_restore(ip: str, port: int, expected_points: int) -> None:
 
 
 def main() -> None:
+    refuse_legacy_operation("v2 re-embed and non-generation restore")
     OUT.mkdir(parents=True, exist_ok=True)
     if not REF_FILE.exists():  # fail before spending pod money
         raise SystemExit(f"reference file {REF_FILE} missing — run ref_v2_driver.sh first")
@@ -393,14 +395,21 @@ def main() -> None:
         _retry(lambda: O.push_file(EMBED_SH, "/workspace/runpod_reembed_v2.sh",
                                    O._ip, O._port, timeout=120), what="embed script push")
         step_launch(O._ip, O._port, passphrase)
-        # deadline = single-GPU wall-clock / actual shard count, + 1h buffer
-        deadline = DEADLINE_1GPU_S.get(gpu_used, DEADLINE_1GPU_DEFAULT) / ACTUAL_GPUS + 3600
+        # deadline = single-GPU wall-clock / actual shard count, + 2h fixed buffer. The buffer is
+        # GPU-count-independent overhead (fresh torch-cu124 install + 4x model download ~40min +
+        # count-settle up to 10min); the +1h buffer starved finalization on the 4x3090 run (embed
+        # ate the whole 3h deadline, snapshot never ran, pod wiped). DONE now lands before the
+        # snapshot too, so this only has to cover setup+embed+verify.
+        deadline = DEADLINE_1GPU_S.get(gpu_used, DEADLINE_1GPU_DEFAULT) / ACTUAL_GPUS + 7200
         points = step_poll(O._ip, O._port, deadline, O._price or 0.0, O._provisioned_at)
         step_tunnel(O._ip, O._port)
         step_start_rerank_server(O._ip, O._port)
         hyb, rr = step_eval()
         verdict = step_gate(hyb, rr)
-        if verdict:
+        if verdict and os.environ.get("REEMBED_SKIP_PULL") == "1":
+            O.log("gate PASS — but REEMBED_SKIP_PULL=1: verdict recorded, SKIPPING the ~24GB pull "
+                  "(insufficient balance to adopt now; top up then pull separately)")
+        elif verdict:
             step_pull_and_restore(O._ip, O._port, points)
     finally:
         _kill_tunnel()

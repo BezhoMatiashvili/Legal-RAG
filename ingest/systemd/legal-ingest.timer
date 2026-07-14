@@ -1,0 +1,15 @@
+# Fires legal-ingest.service daily at 05:00 local (box is UTC+4 → 01:00 UTC),
+# when no interactive/eval work should be running. Persistent=true catches up
+# after downtime (desktop box may be off overnight).
+
+[Unit]
+Description=Daily trigger for Georgian Legal RAG ingest
+
+[Timer]
+OnCalendar=*-*-* 05:00:00
+Persistent=true
+RandomizedDelaySec=15min
+Unit=legal-ingest.service
+
+[Install]
+WantedBy=timers.target

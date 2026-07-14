@@ -1,10 +1,10 @@
-# GPU dependency set for the RunPod serverless worker image.
+# Development input for the RunPod serverless worker dependency set.
 #
 # Deliberately NOT derived from ingest/pyproject.toml: that env pins CPU-only torch via
-# [tool.uv.sources] (right for the local box, wrong for the worker). These are the exact
-# pins already proven on RunPod GPUs by scripts/runpod_embed_delta.sh — torch floats on
-# the cu124 index just like that script installs it, so the resolved combo matches the
-# stack the corpus was embedded and G2-verified with.
+# [tool.uv.sources] (right for the local box, wrong for the worker). This file contains
+# floating entries and MUST NOT be installed into a production image. Dockerfile treats it
+# as an intentionally failing default until a complete, exact, hash-locked file is supplied
+# alongside runtime-identity.json from a read-only known-good worker capture.
 --extra-index-url https://download.pytorch.org/whl/cu124
 torch
 FlagEmbedding==1.4.0

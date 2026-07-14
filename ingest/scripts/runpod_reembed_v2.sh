@@ -6,6 +6,11 @@
 # checkpoints inside $WORK/rows).
 set -uo pipefail
 
+if [ "${RUNPOD_EPHEMERAL_QDRANT:-0}" != "1" ]; then
+  echo "refusing legacy re-embed outside an explicitly attested ephemeral RunPod Qdrant" >&2
+  exit 78
+fi
+
 WORK="${WORK:-/workspace}"
 OUT="$WORK/out"
 COLLECTION="${COLLECTION_NAME:-georgian_legal_v2}"
@@ -76,9 +81,14 @@ for i in $(seq 1 120); do  # wait for wait=False upserts to settle
 done
 echo "[$(date -u +%FT%TZ)] points=$POINTS expected=$EXPECTED"
 [ "$POINTS" = "$EXPECTED" ] || { echo "FATAL: point count mismatch"; exit 1; }
+# Write DONE as soon as the embed is COUNT-VERIFIED — BEFORE the slow (~20GB) snapshot — so a
+# verified embed survives a tight deadline or a slow/failed snapshot. step_poll returns here;
+# eval reads the LIVE pod collection over the tunnel, and the snapshot finishes off the hot path
+# (ready well before the on-PASS pull, which runs only after tunnel+rerank-server+eval).
+echo "$POINTS" > "$OUT/DONE"
+echo "[$(date -u +%FT%TZ)] reembed_v2 embed VERIFIED  points=$POINTS — DONE written; creating snapshot"
 
-SNAP=$(curl -sf -X POST "http://127.0.0.1:6333/collections/${COLLECTION}/snapshots" \
+SNAP=$(curl -sf -m 1200 -X POST "http://127.0.0.1:6333/collections/${COLLECTION}/snapshots" \
   | "$PY" -c "import sys,json; print(json.load(sys.stdin)['result']['name'])")
 cp "$WORK/qdrant_snapshots/${COLLECTION}/${SNAP}" "$OUT/${COLLECTION}.snapshot"
-echo "[$(date -u +%FT%TZ)] reembed_v2 DONE  points=$POINTS  snapshot=$SNAP"
-echo "$POINTS" > "$OUT/DONE"
+echo "[$(date -u +%FT%TZ)] reembed_v2 snapshot ready  points=$POINTS  snapshot=$SNAP"

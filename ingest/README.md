@@ -22,15 +22,27 @@ docker compose up -d            # start Qdrant -> http://localhost:6333/dashboar
 uv sync                         # installs torch + FlagEmbedding + qdrant-client on Py 3.12
 ```
 
-## Ingest (pilot)
+## Ingest (immutable candidate only)
+
+Mutating commands never target the stable `georgian_legal` serving alias. They require
+an explicit generation, its exact physical collection name, `--apply`, and an independent
+approval. Recreating even a candidate collection additionally requires
+`QDRANT_RECREATE_APPROVED=1`.
+
 ```bash
-# small slice per source to validate end-to-end (first run downloads the ~2GB model)
-uv run python -m ingest ingest --source ecd --limit 30 --recreate
-uv run python -m ingest ingest --source constcourt --limit 30
-uv run python -m ingest ingest --source all --limit 50        # everything, capped
+export GENERATION_ID=gen_20260713_candidate
+export COLLECTION_NAME="georgian_legal__gen_${GENERATION_ID}"
+export QDRANT_WRITE_APPROVED=1
+
+# small candidate slice to validate end-to-end
+uv run python -m ingest ingest --source ecd --limit 30 --apply
+
+# destructive candidate recreation is a separate approval
+QDRANT_RECREATE_APPROVED=1 uv run python -m ingest ingest \
+  --source all --recreate --apply
 ```
 Flags: `--source <spider|all>`, `--limit N` (cap docs), `--run latest|<run_id>`,
-`--recreate` (drop+recreate collection), `--resume` (continue from checkpoint),
+`--recreate` (drop+recreate an approved candidate), `--resume` (continue from checkpoint),
 `--batch-size`, `--no-progress`.
 
 A live progress panel (one row per source: `docs/total`, chunks, skipped, rate, phase)
@@ -50,12 +62,9 @@ Instead of a one-shot ingest, `watch` keeps running: it first **backfills every
 already-scraped document oldest→newest** (reading across *all* `artifacts/<source>/runs/*`,
 not just `latest`), then **waits and ingests new documents as the scraper produces them**.
 
-```bash
-uv run python -m ingest watch --source all                 # backfill, then wait for new docs
-uv run python -m ingest watch --source matsne --once       # backfill everything, then exit
-uv run python -m ingest watch --source all --poll-interval 10
-uv run python -m ingest watch --source all --recreate      # rebuild from scratch, then watch
-```
+`watch` has the same immutable-generation and approval requirements. Scheduled/live
+invocation remains disabled; for an explicitly approved candidate, use
+`python -m ingest watch ... --apply` with the environment above.
 Flags: `--source <spider|all>`, `--poll-interval N` (idle seconds between polls, default 5),
 `--once` (backfill-then-exit, no waiting), `--recreate` (drop+recreate the collection and
 clear watch state), `--batch-size`, `--limit` (debug cap). The global `--collection` applies.

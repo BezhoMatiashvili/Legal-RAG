@@ -46,7 +46,7 @@ def main():
     chunk_cfg = {"max_tokens": cfg.chunk_tokens, "overlap": cfg.chunk_overlap,
                  "min_tokens": cfg.chunk_min_tokens}
     from ingest.embedding import make_token_counter
-    count_tokens = make_token_counter(cfg.embed_model)
+    count_tokens = make_token_counter(cfg.tokenizer_model, cfg.tokenizer_revision)
 
     gold = goldset.load_golden_set()
     bodies = goldset.SnapshotBodies(needed=goldset.gold_docs(gold))

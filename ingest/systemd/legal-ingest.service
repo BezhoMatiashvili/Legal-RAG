@@ -1,0 +1,32 @@
+# Georgian Legal RAG — daily incremental ingest (scrape → CPU embed → verify).
+# User unit. Stage it now, but do not enable until the integrity/migration/retrieval gate
+# in ingest/docs/deployment.md passes (ingest also yellows the index during writes):
+#   mkdir -p ~/.config/systemd/user
+#   cp ingest/systemd/legal-ingest.{service,timer} ~/.config/systemd/user/
+#   printf 'LEGAL_SEARCH_REPO=%s\n' "$PWD" > ~/.config/georgia-legal-search.env
+#   chmod 600 ~/.config/georgia-legal-search.env
+#   systemctl --user daemon-reload
+#   # After approval: uncomment DAILY_INGEST_APPROVED below, then enable the timer.
+#   # systemctl --user enable --now legal-ingest.timer
+#   loginctl enable-linger $USER   # timer fires even with no login session
+# See ingest/docs/deployment.md for the full runbook.
+
+[Unit]
+Description=Georgian Legal RAG daily ingest (scrape, embed delta, verify coverage)
+
+[Service]
+Type=oneshot
+# Fail closed until the deployment runbook's integrity/migration gate is complete.
+EnvironmentFile=-%h/.config/georgia-legal-search.env
+#Environment=DAILY_INGEST_APPROVED=1
+# bash performs the required-variable check before it resolves or executes a repository path.
+ExecStart=/usr/bin/bash -lc ': "${LEGAL_SEARCH_REPO:?set LEGAL_SEARCH_REPO in ~/.config/georgia-legal-search.env}"; exec "$LEGAL_SEARCH_REPO/ingest/scripts/daily_ingest.sh"'
+# Stay polite on the shared 30 GB desktop box: low CPU/IO priority, hard runtime cap
+# (TimeoutStartSec is the runtime cap for Type=oneshot; RuntimeMaxSec is ignored).
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=6h
+# Per-stage knobs (defaults shown; see daily_ingest.sh header):
+#Environment=DAILY_INGEST_LOOKBACK_DAYS=14
+# (quotes around the whole assignment are required — the value contains spaces)
+#Environment="DAILY_INGEST_SOURCES=matsne ecd constcourt napr tas tbappeal"

@@ -185,8 +185,17 @@ def build_delta(
                             rejected_newer.add(did)
                             continue  # not the indexed revision — keep looking in older runs
                     report = hygiene.assess(raw)
-                    if not report.is_usable:
-                        stats["quarantined"][did] = report.quarantine_reason
+                    incomplete_reason = None
+                    if not doc.content_complete:
+                        incomplete_reason = (
+                            f"incomplete_content:{doc.content_kind}:{doc.extraction_status}"
+                        )
+                    if incomplete_reason or not report.is_usable:
+                        stats["quarantined"][did] = (
+                            report.quarantine_reason
+                            if not report.is_usable
+                            else incomplete_reason
+                        )
                         pending.discard(did)
                         continue
                     chash = dedup.content_hash(clean_body)

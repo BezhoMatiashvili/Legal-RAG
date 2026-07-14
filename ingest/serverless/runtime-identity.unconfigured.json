@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "status": "unconfigured",
+  "required_external_evidence": [
+    "base_image repository digest",
+    "exact Python version",
+    "exact torch CUDA wheel version and SHA-256",
+    "exact CUDA runtime version",
+    "complete serverless requirements lock SHA-256",
+    "Qdrant release archive SHA-256, official checksum asset, and evidence SHA-256",
+    "known-good worker artifact SHA-256"
+  ]
+}

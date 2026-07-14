@@ -16,6 +16,7 @@ and assert the vectors match before trusting a GPU-embedded index.
 import hashlib
 import json
 import logging
+import os
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -55,6 +56,21 @@ def snapshot_doc_to_canonical(d: dict) -> CanonicalDoc:
         body_markdown=d["body_markdown"],
         extra={},
         promoted=d.get("promoted") or {},
+        is_consolidated=d.get("is_consolidated"),
+        consolidated_count=d.get("consolidated_count"),
+        content_kind=d.get("content_kind") or (
+            "article_summary" if d.get("source") == "tbappeal" else "full_text"
+        ),
+        content_complete=(
+            bool(d.get("content_complete"))
+            if "content_complete" in d
+            else d.get("source") != "tbappeal"
+        ),
+        extraction_status=d.get("extraction_status") or (
+            "malformed" if d.get("source") == "tbappeal" else "full_text"
+        ),
+        source_binary_url=d.get("source_binary_url"),
+        article_summary=d.get("article_summary"),
     )
 
 
@@ -127,14 +143,26 @@ def _checkpoint_path(cfg: Config, source: str) -> Path:
 
 def _load_ckpt(cfg: Config, source: str) -> dict:
     p = _checkpoint_path(cfg, source)
-    return json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        # A torn checkpoint (crash mid-write) must not abort --resume; restart fresh
+        # (idempotent uuid5 upserts overwrite in place, so a re-embed cannot duplicate).
+        logger.warning("%s: ignoring corrupt embed checkpoint %s (%s) — starting fresh",
+                       source, p, exc)
+        return {}
 
 
 def _save_ckpt(cfg: Config, source: str, payload: dict) -> None:
     cfg.state_dir.mkdir(parents=True, exist_ok=True)
-    _checkpoint_path(cfg, source).write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    path = _checkpoint_path(cfg, source)
+    # Atomic write (tmp then os.replace): _save_ckpt runs after every acknowledged upsert during
+    # a long GPU embed, so a crash/preemption mid-write must not truncate the checkpoint.
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
 
 
 def embed_docs(

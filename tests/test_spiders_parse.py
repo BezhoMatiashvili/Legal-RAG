@@ -3,7 +3,7 @@ import sys
 import unittest
 from pathlib import Path
 from urllib.parse import parse_qs
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from scrapy import Request
 from scrapy.exceptions import DontCloseSpider
@@ -57,6 +57,13 @@ class MatsneTwoPhaseTests(unittest.TestCase):
 
 
 class ConstcourtParseTests(unittest.TestCase):
+    def test_empty_page_retry_bypasses_duplicate_filter_and_cache(self):
+        request = ConstcourtSpider().request_page(3, empty_retry=True)
+
+        self.assertTrue(request.dont_filter)
+        self.assertTrue(request.meta["dont_cache"])
+        self.assertTrue(request.meta["empty_retry"])
+
     def test_teaser_body_triggers_docx_fetch(self):
         spider = ConstcourtSpider()
         body = (
@@ -91,6 +98,24 @@ class ConstcourtParseTests(unittest.TestCase):
         self.assertEqual(item["legal_id"], "2")
         self.assertEqual(item["doc_type"], "განჩინება")
         self.assertIn("სრული ტექსტი", item["body_markdown"])
+
+    def test_docx_parse_failure_records_quality_failure_and_emits_no_teaser(self):
+        spider = ConstcourtSpider()
+        spider.record_quality_failure = MagicMock()
+        request = Request(
+            url="https://constcourt.ge/uploads/documents/bad.docx",
+            meta={"data": {"legal_id": "7", "body_markdown": TEASER_MARKER}},
+        )
+        response = TextResponse(url=request.url, body=b"bad", request=request)
+
+        with patch(
+            "legal_scrapers.spiders.constcourt_spider.docx_to_markdown",
+            side_effect=ValueError("bad docx"),
+        ):
+            out = list(spider.parse_docx_body(response))
+
+        self.assertEqual(out, [])
+        spider.record_quality_failure.assert_called_once()
 
 
 class SupremecourtParseTests(unittest.TestCase):
@@ -248,7 +273,7 @@ def _tas_list_record():
     return {
         "documentId": 25755,
         "documentNo": "AR125755",
-        "address": "; ქალაქი თბილისი , გლდანი , მიკრო/რაიონი I , კორპუსი 16 ",
+        "address": "სინთეზური მისამართი ტესტისთვის",
         "registrationDate": "2012-02-24 12:21:34",
         "createDateStr": "24/02/2012",
         "cachedInfo": (
@@ -272,7 +297,7 @@ def _tas_detail():
             "documentStatusId": 1,
             "documentTypeId": 73058,
             "amountToPay": 0,
-            "address": "; ქალაქი თბილისი , გლდანი , მიკრო/რაიონი I , კორპუსი 16 ",
+            "address": "სინთეზური მისამართი ტესტისთვის",
             "responseText": (
                 "<pre>ფასადზე I კლასის ფანჯრების შეცვლის თაობაზე</pre>\n"
                 "<pre>ქ. თბილისის მერიის სსიპ თბილისის არქიტექტურის სამსახური "
@@ -280,31 +305,31 @@ def _tas_detail():
             ),
         },
         "docAuthor": {
-            "firstName": "თამარ",
-            "lastName": "მგელაშვილი",
-            "personalNo": "16001020967",
-            "birhtDate": "1970-07-12T20:00:00.000Z",
-            "address": "დუშეთი ს. მიგრიაულთა ",
-            "email": "tamar@mail.ru",
-            "phoneNumber": "555383887",
-            "passSerialNumber": "ბ0752055",
-            "personId": 171136,
+            "firstName": "ტესტი",
+            "lastName": "მომხმარებელი",
+            "personalNo": "TEST-PERSON-ID",
+            "birhtDate": "2000-01-01T20:00:00.000Z",
+            "address": "სინთეზური მისამართი ტესტისთვის",
+            "email": "user@example.invalid",
+            "phoneNumber": "TEST-PHONE",
+            "passSerialNumber": "TEST-PASSPORT",
+            "personId": 1,
         },
         "executorEmployee": {
-            "firstName": "ეკა",
-            "lastName": "კვირკველია",
-            "personalNo": "01024022244",
-            "email": "eka@gmail.com",
-            "phoneNumber": "568321515",
-            "employeeId": 525,
+            "firstName": "სატესტო",
+            "lastName": "თანამშრომელი",
+            "personalNo": "TEST-EMPLOYEE-ID",
+            "email": "employee@example.invalid",
+            "phoneNumber": "TEST-EMPLOYEE-PHONE",
+            "employeeId": 2,
         },
         "mapInfos": [
             {
-                "naprCadCode": "01.11.12.007.010.01.178",
-                "naprAddress": "ქალაქი თბილისი , გლდანი , მიკრო/რაიონი I , კორპუსი 16 ",
+                "naprCadCode": "TEST-CADASTRAL-CODE",
+                "naprAddress": "სინთეზური მისამართი ტესტისთვის",
                 "naprArea": 17,
                 "naprPurpose": "არასასოფლო სამეურნეო",
-                "naprOwner": "თამარ   მგელაშვილი (P/N: 16001020967)",
+                "naprOwner": "ტესტი მომხმარებელი (P/N: TEST-PERSON-ID)",
                 "naprCoowner": None,
                 "naprRegNo": None,
             }
@@ -353,8 +378,8 @@ class TasDetailTests(unittest.TestCase):
         self.assertEqual(item["decision_status_id"], 1)
         self.assertEqual(item["decision"], "თანხმობა")
         self.assertEqual(item["decision_no"], 65192)
-        self.assertEqual(item["applicant_name"], "თამარ მგელაშვილი")
-        self.assertEqual(item["applicant_personal_no"], "16001020967")
+        self.assertEqual(item["applicant_name"], "ტესტი მომხმარებელი")
+        self.assertEqual(item["applicant_personal_no"], "TEST-PERSON-ID")
         self.assertEqual(item["document_type_id"], 73058)
         self.assertTrue(item["can_see_final_result"])
 
@@ -363,8 +388,8 @@ class TasDetailTests(unittest.TestCase):
         self.assertEqual(item["acquaint_date"], "2012-03-06")
 
         # Executor + cadastral.
-        self.assertEqual(item["executor_name"], "ეკა კვირკველია")
-        self.assertEqual(item["cad_code"], "01.11.12.007.010.01.178")
+        self.assertEqual(item["executor_name"], "სატესტო თანამშრომელი")
+        self.assertEqual(item["cad_code"], "TEST-CADASTRAL-CODE")
         self.assertEqual(item["land_area"], 17)
         self.assertEqual(item["land_purpose"], "არასასოფლო სამეურნეო")
 
@@ -379,6 +404,9 @@ class TasDetailTests(unittest.TestCase):
         # Decision text: converted, no code fences from the <pre> wrappers.
         self.assertIn("ადასტურებს", item["response_markdown"])
         self.assertNotIn("```", item["response_markdown"])
+        self.assertEqual(item["content_kind"], "decision_full_text")
+        self.assertTrue(item["content_complete"])
+        self.assertEqual(item["extraction_status"], "full_text")
 
         # Body weaves the title info + decision together.
         self.assertIn("**გადაწყვეტილება:** თანხმობა", item["body_markdown"])
@@ -396,6 +424,9 @@ class TasDetailTests(unittest.TestCase):
         self.assertNotIn("decision", item)
         self.assertNotIn("applicant_name", item)
         self.assertNotIn("parcels", item)
+        self.assertEqual(item["content_kind"], "list_metadata")
+        self.assertFalse(item["content_complete"])
+        self.assertEqual(item["extraction_status"], "malformed")
 
     def test_unsubmitted_draft_is_not_enriched(self):
         spider = TasSpider()
@@ -406,6 +437,20 @@ class TasDetailTests(unittest.TestCase):
         self.assertEqual(item["document_no"], "AR125755")
         self.assertNotIn("decision", item)
         self.assertNotIn("applicant_name", item)
+        self.assertEqual(item["content_kind"], "draft_metadata")
+        self.assertFalse(item["content_complete"])
+        self.assertEqual(item["extraction_status"], "malformed")
+
+    def test_detail_without_decision_text_remains_incomplete(self):
+        spider = TasSpider()
+        detail = _tas_detail()
+        detail["document"]["responseText"] = ""
+
+        item = spider.build_item(_tas_list_record(), detail)
+
+        self.assertEqual(item["content_kind"], "detail_metadata")
+        self.assertFalse(item["content_complete"])
+        self.assertEqual(item["extraction_status"], "malformed")
 
 
 if __name__ == "__main__":

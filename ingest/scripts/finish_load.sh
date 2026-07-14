@@ -5,12 +5,18 @@
 # Safe to re-run: completed parts are skipped; a bad md5 aborts before restoring.
 set -uo pipefail
 
-POD_IP=47.47.180.65
-POD_PORT=13457
-KEY=/home/bezhomatiashvili/gpu_embed_work/id_ed25519
-KH=/home/bezhomatiashvili/gpu_embed_work/known_hosts
-PD=/home/bezhomatiashvili/gpu_embed_work/out_multi/parts
-SNAP=/home/bezhomatiashvili/gpu_embed_work/out_multi/georgian_legal.snapshot
+echo "Legacy direct restore into georgian_legal is disabled; use an immutable generation and guarded promotion." >&2
+exit 78
+
+: "${POD_IP:?set POD_IP to the source pod address}"
+: "${POD_PORT:?set POD_PORT to the source pod SSH port}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+INGEST_DIR="$(dirname "$SCRIPT_DIR")"
+WORKDIR="${GPU_WORKDIR:-$INGEST_DIR/.state/gpu-work}"
+KEY="${GPU_SSH_KEY:-$WORKDIR/id_ed25519}"
+KH="${GPU_KNOWN_HOSTS:-$WORKDIR/known_hosts}"
+PD="$WORKDIR/out_multi/parts"
+SNAP="$WORKDIR/out_multi/georgian_legal.snapshot"
 SRC_MD5=378985d49eac43f681e90a4fbdeb47ea
 SIZE=24166869504
 SSHOPTS="-p $POD_PORT -i $KEY -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$KH -o ConnectTimeout=20 -o ServerAliveInterval=20"
@@ -55,4 +61,4 @@ curl -s http://localhost:6333/collections/georgian_legal \
 
 echo "[$(date +%T)] DONE ✓  If points_count is ~2453915, the corpus is loaded and permanent."
 echo "Next: stop the pod billing with:"
-echo "   cd /home/bezhomatiashvili/Desktop/Projects/Georgia-Legal-Search/ingest && .venv/bin/python scripts/runpod_orchestrate_multi.py terminate"
+echo "   cd \"$INGEST_DIR\" && .venv/bin/python scripts/runpod_orchestrate_multi.py terminate"

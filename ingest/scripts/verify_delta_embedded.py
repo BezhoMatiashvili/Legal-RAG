@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Prove every doc scraped in the delta runs is embedded in the main collection.
+"""Check document-ID coverage for docs scraped in delta runs.
 
 Collects every unique ``document_id`` across the given matsne run items files (default:
 all runs whose id >= --runs-since) and exact-counts its chunks in ``georgian_legal``
@@ -88,7 +88,8 @@ def main() -> None:
         for did in missing[:10]:
             print(f"  {did} | {docs[did]}")
         raise SystemExit(1)
-    print("✅ every scraped delta doc is embedded and queryable.")
+    print("✅ every scraped delta doc has at least one index point "
+          "(ID coverage only; integrity was not verified).")
 
 
 if __name__ == "__main__":

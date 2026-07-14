@@ -149,14 +149,39 @@ def heading_spans(text: str) -> list[tuple[int, int, str]]:
     return out
 
 
+def _split_oversized_run(
+    text: str, start: int, max_tokens: int, count: Callable[[str], int]
+) -> list[tuple[str, int, int, int]]:
+    """Hard-split a single whitespace-free run that itself exceeds the token budget.
+
+    A legal document body occasionally embeds a long run with no internal whitespace
+    (e.g. an inline base64 data URI) — ``_atoms``'s word-window packer otherwise has no
+    smaller unit to fall back to. Binary-searches the split point via ``count()`` so it
+    works for any tokenizer, not just a word counter, and keeps offsets exact. Recursion
+    bottoms out at a single character, which is returned as-is even if `count` still
+    reports it over budget (nothing smaller to split into).
+    """
+    tok = count(text)
+    if tok <= max_tokens or len(text) <= 1:
+        return [(text, tok, start, start + len(text))]
+    mid = len(text) // 2
+    return _split_oversized_run(text[:mid], start, max_tokens, count) + _split_oversized_run(
+        text[mid:], start + mid, max_tokens, count
+    )
+
+
 def _atoms(
     body: str, max_tokens: int, count: Callable[[str], int]
 ) -> list[tuple[str, int, int, int]]:
     """Break a section body into atoms ``(text, tok, start, end)`` (offsets into ``body``).
 
     Paragraphs first; oversized ones split into sentences; pathologically long sentences
-    packed into word windows. Offsets are recovered from match positions so they stay
-    exact through every ``.strip()``/``split`` (which otherwise drop that information).
+    packed into word windows; a single word that itself exceeds the budget (e.g. an inline
+    base64 blob with no whitespace) is hard-split further by :func:`_split_oversized_run`
+    so every atom this function returns fits the budget — callers (``_pack``) can then
+    safely treat "atom over budget" as unreachable rather than a document-killing error.
+    Offsets are recovered from match positions so they stay exact through every
+    ``.strip()``/``split`` (which otherwise drop that information).
     """
     atoms: list[tuple[str, int, int, int]] = []
     for para_raw, p_start, _ in _split_keep_pos(body, _PARA_RE):
@@ -184,6 +209,14 @@ def _atoms(
             wtok = 0
             for w, ws, we in words:
                 wt = count(w) or 1
+                if wt > max_tokens:
+                    if window:
+                        atoms.append(
+                            (" ".join(x[0] for x in window), wtok, window[0][1], window[-1][2])
+                        )
+                        window, wtok = [], 0
+                    atoms.extend(_split_oversized_run(w, ws, max_tokens, count))
+                    continue
                 if window and wtok + wt > max_tokens:
                     atoms.append(
                         (" ".join(x[0] for x in window), wtok, window[0][1], window[-1][2])
@@ -198,7 +231,13 @@ def _atoms(
     return atoms
 
 
-def _pack(atoms, max_tokens, overlap, min_tokens) -> list[tuple[str, int, int, int]]:
+def _pack(
+    atoms,
+    max_tokens,
+    overlap,
+    min_tokens,
+    count: Callable[[str], int] | None = None,
+) -> list[tuple[str, int, int, int]]:
     """Greedily pack atoms to the token budget, seeding each new chunk with overlap.
 
     Returns ``(text, tok, char_start, char_end)`` per chunk; the char span is the
@@ -208,8 +247,20 @@ def _pack(atoms, max_tokens, overlap, min_tokens) -> list[tuple[str, int, int, i
     packed: list[tuple[list[tuple[str, int, int, int]], int]] = []
     cur: list[tuple[str, int, int, int]] = []
     cur_tok = 0
+
+    def token_count(subset) -> int:
+        if count is None:
+            return sum(atom[1] for atom in subset)
+        return count("\n\n".join(atom[0] for atom in subset))
+
     for atom in atoms:
-        if cur and cur_tok + atom[1] > max_tokens:
+        atom_tok = token_count([atom])
+        if atom_tok > max_tokens:
+            raise ValueError(
+                f"atom exceeds chunk budget ({atom_tok} > {max_tokens}); "
+                "the tokenizer could not split a single non-whitespace token safely"
+            )
+        if cur and token_count([*cur, atom]) > max_tokens:
             packed.append((cur, cur_tok))
             seed: list[tuple[str, int, int, int]] = []
             seed_tok = 0
@@ -218,9 +269,15 @@ def _pack(atoms, max_tokens, overlap, min_tokens) -> list[tuple[str, int, int, i
                     break
                 seed.insert(0, a)
                 seed_tok += a[1]
-            cur, cur_tok = list(seed), seed_tok
+            # An atom may itself consume most/all of the budget. Retain only as much overlap
+            # as fits beside it; overlap is a recall aid, never permission to exceed the model
+            # input contract.
+            while seed and token_count([*seed, atom]) > max_tokens:
+                seed_tok -= seed.pop(0)[1]
+            cur = list(seed)
+            cur_tok = token_count(cur)
         cur.append(atom)
-        cur_tok += atom[1]
+        cur_tok = token_count(cur)
     if cur:
         packed.append((cur, cur_tok))
 
@@ -228,7 +285,15 @@ def _pack(atoms, max_tokens, overlap, min_tokens) -> list[tuple[str, int, int, i
     if len(packed) >= 2 and packed[-1][1] < min_tokens:
         tail_atoms, tail_tok = packed.pop()
         prev_atoms, prev_tok = packed[-1]
-        packed[-1] = (prev_atoms + tail_atoms, prev_tok + tail_tok)
+        merged = prev_atoms + tail_atoms
+        merged_tok = token_count(merged)
+        if merged_tok <= max_tokens:
+            packed[-1] = (merged, merged_tok)
+        else:
+            packed.append((tail_atoms, tail_tok))
+
+    if any(tok > max_tokens for _, tok in packed):
+        raise AssertionError("chunk packer emitted a token-budget overflow")
 
     return [
         (
@@ -260,7 +325,11 @@ def chunk_document(
     idx = 0
     for path, body, body_start in _split_sections(text or ""):
         for piece, tok, cstart, cend in _pack(
-            _atoms(body, max_tokens, count_tokens), max_tokens, overlap, min_tokens
+            _atoms(body, max_tokens, count_tokens),
+            max_tokens,
+            overlap,
+            min_tokens,
+            count_tokens,
         ):
             chunks.append(
                 Chunk(

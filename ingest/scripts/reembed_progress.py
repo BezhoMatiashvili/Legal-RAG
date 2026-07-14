@@ -1,9 +1,9 @@
 #!/usr/bin/env python
-"""Poll the re-embed pod's Qdrant point count → ~/gpu_embed_work/reembed_progress.json.
+"""Poll the re-embed pod's Qdrant point count → ``$GPU_WORKDIR/reembed_progress.json``.
 
 Runs alongside (not inside) runpod_orchestrate_reembed.py so the dashboard can show live
 "X / TOTAL embedded (Y%)" during the ~3h GPU re-embed. Reuses the orchestrator's RunPod/SSH
-helpers; reads the pod id from ~/gpu_embed_work/pod.id. Exits when the pod is gone or the
+helpers; reads the pod id from ``$GPU_WORKDIR/pod.id``. Exits when the pod is gone or the
 collection is complete.
 
     .venv/bin/python scripts/reembed_progress.py --total 2654818 --collection georgian_legal_v2

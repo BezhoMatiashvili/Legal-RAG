@@ -22,7 +22,10 @@ import urllib.error
 import urllib.request
 
 _BASE = "https://api.runpod.ai/v2"
-_POLL_INTERVAL_S = 1.5
+_POLL_INTERVAL_S = 1.5   # cap on the poll cadence (cold-start steady state)
+_POLL_INITIAL_S = 0.15   # first poll fires fast so a WARM job returns in ~1 poll instead of
+# waiting a fixed 1.5 s; the interval then backs off geometrically toward the cap. Purely a
+# transport-latency change — it does not affect any result the worker returns.
 # Same browser UA the rest of the RunPod tooling sends (Cloudflare 403s the default
 # python-urllib agent on api.runpod.io; harmless on api.runpod.ai).
 _UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -96,6 +99,9 @@ class RunPodQueueClient:
         deadline = time.monotonic() + budget
         status = submitted.get("status") or "IN_QUEUE"
         poll_errors = 0
+        # Fast-first poll: a warm job finishes in ~1 poll, so start well below the cap and
+        # back off geometrically. self.poll_interval still governs the cold-start cadence.
+        interval = min(_POLL_INITIAL_S, self.poll_interval)
         while time.monotonic() < deadline:
             # One blip (Cloudflare 502, connection reset) must not abandon a job that is
             # mid-cold-start on the worker; only persistent failure aborts the poll.
@@ -119,7 +125,8 @@ class RunPodQueueClient:
             if status in _TERMINAL_FAILURES:
                 raise RemoteOpError(
                     f"job {job_id} ({op}) ended {status}: {st.get('error') or 'no detail'}")
-            time.sleep(self.poll_interval)
+            time.sleep(interval)
+            interval = min(interval * 1.6, self.poll_interval)  # geometric backoff to the cap
 
         # Not cancelled on purpose: let the worker finish booting so the retry lands warm.
         raise EndpointWarmingUp(

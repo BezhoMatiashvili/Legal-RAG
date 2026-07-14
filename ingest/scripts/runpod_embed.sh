@@ -14,9 +14,20 @@
 # ingest/ exists, skips the venv build if present, resumes the embed from per-source checkpoints).
 set -euo pipefail
 
+if [ "${RUNPOD_EPHEMERAL_QDRANT:-0}" != "1" ]; then
+  echo "refusing legacy embed outside an explicitly attested ephemeral RunPod Qdrant" >&2
+  exit 78
+fi
+
 WORK="${WORK:-/workspace}"
 OUT="$WORK/out"
-COLLECTION="${COLLECTION_NAME:-georgian_legal}"
+GENERATION_ID="${GENERATION_ID:-}"
+COLLECTION="${COLLECTION_NAME:-}"
+if [[ ! "$GENERATION_ID" =~ ^[a-z0-9][a-z0-9_-]{7,127}$ ]] || \
+   [ "$COLLECTION" != "georgian_legal__gen_${GENERATION_ID}" ]; then
+  echo "refusing embed without exact GENERATION_ID/physical collection binding" >&2
+  exit 78
+fi
 QDRANT_VER="${QDRANT_VER:-v1.12.4}"
 mkdir -p "$OUT"
 exec > >(tee -a "$OUT/embed.log") 2>&1
@@ -70,7 +81,7 @@ cd "$WORK/ingest"
 export QDRANT_URL="http://127.0.0.1:6333" COLLECTION_NAME="$COLLECTION"
 export EMBED_DEVICE="cuda" EMBED_USE_FP16="true" EMBED_BATCH_SIZE="${EMBED_BATCH_SIZE:-256}"
 "$PY" -m ingest embed --checksum >"$OUT/checksum_stdout.txt" 2>&1 || true
-"$PY" -m ingest embed --source all --batch-size 256   # resumes if re-run (smaller upsert batch)
+"$PY" -m ingest embed --source all --batch-size 256 --apply   # resumes if re-run
 
 # --- 5. persist GPU checksum + Qdrant snapshot for transfer back ---------------
 "$PY" - <<'PYEOF'

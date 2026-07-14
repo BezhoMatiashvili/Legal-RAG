@@ -33,6 +33,13 @@ from scrapy.loader import ItemLoader
 from ..items import TasItem
 from ..utils.dates import date_part
 from ..utils.markdown import safe_html_to_markdown
+from ..utils.pagination import (
+    advertised_page_count,
+    finalize_pagination_scope,
+    get_pagination_reconciler,
+    handle_pagination_request_failure,
+    parse_advertised_count,
+)
 from .base import BaseLegalSpider
 
 BASE_URL = "https://docs.tbilisi.gov.ge"
@@ -312,6 +319,7 @@ class TasSpider(BaseLegalSpider):
     PAGE_DELAY_MS = 1500     # politeness between in-page list DWR calls
     DETAIL_DELAY_MS = 300    # politeness between per-document detail DWR calls
     DETAIL_TIMEOUT_MS = 60000
+    MAX_PAGES = 20_000
 
     custom_settings = {
         # Scoped to this spider: the ExtJS/DWR app only renders under a real browser,
@@ -331,14 +339,37 @@ class TasSpider(BaseLegalSpider):
     }
 
     async def start(self):
+        scope = self.pagination_scope()
+        get_pagination_reconciler(self, scope, max_pages=self.MAX_PAGES)
         yield scrapy.Request(
             GRID_URL,
             callback=self.parse_docs,
-            meta={"playwright": True, "playwright_include_page": True},
+            errback=self.pagination_request_failed,
+            meta={
+                "playwright": True,
+                "playwright_include_page": True,
+                "pagination_scope": scope,
+                "pagination_cursor": 0,
+            },
         )
+
+    def pagination_scope(self):
+        return (
+            f"date:{self.scraping_start_date.isoformat()}:"
+            f"{self.scraping_end_date.isoformat()}"
+        )
+
+    def pagination_request_failed(self, failure):
+        return handle_pagination_request_failure(self, failure)
 
     async def parse_docs(self, response):
         page = response.meta["playwright_page"]
+        scope = response.meta.get("pagination_scope") or self.pagination_scope()
+        tracker = get_pagination_reconciler(
+            self,
+            scope,
+            max_pages=self.MAX_PAGES,
+        )
         s, e = self.scraping_start_date, self.scraping_end_date
         date_args = {
             "y": s.year, "m": s.month, "d": s.day,
@@ -347,29 +378,139 @@ class TasSpider(BaseLegalSpider):
         try:
             await page.wait_for_function(_READY_JS, timeout=60000)
 
+            # Due identities must refresh even when their original registration date is
+            # outside the normal discovery window. The public detail RPC is keyed by ID,
+            # so it is safe to issue this bounded slice before listing pagination.
+            for doc_id in self.iter_refresh_keys():
+                detail = await self._fetch_detail(page, doc_id)
+                if detail is None:
+                    continue
+                document = detail.get("document") or {}
+                record = {
+                    "documentId": doc_id,
+                    "documentNo": document.get("documentNo"),
+                    "address": document.get("address"),
+                    "registrationDate": document.get("registrationDate"),
+                    "createDateStr": document.get("createDateStr"),
+                }
+                self.crawler.stats.inc_value("dedup/direct_refresh_scheduled")
+                yield self.build_item(record, detail)
+                await page.wait_for_timeout(self.DETAIL_DELAY_MS)
+
             start = 0
             total = None
             while True:
-                data = await page.evaluate(_FETCH_PAGE_JS, {**date_args, "start": start, "limit": self.PAGE_SIZE})
-                total = data["total"]
-                records = data["source"]
+                page_number = (start // self.PAGE_SIZE) + 1
+                if page_number > self.MAX_PAGES:
+                    tracker.mark_cap(
+                        cursor=start,
+                        configured_cap=self.MAX_PAGES,
+                    )
+                    finalize_pagination_scope(self, tracker, url=response.url)
+                    break
+                # Retry the list fetch on a transient DWR timeout instead of letting it propagate
+                # out of parse_docs and abort the ENTIRE tas crawl (this loop drives all
+                # pagination). A read-only page.evaluate is idempotent, so retrying is safe.
+                data = None
+                last_error = None
+                for attempt in range(3):
+                    try:
+                        data = await page.evaluate(
+                            _FETCH_PAGE_JS, {**date_args, "start": start, "limit": self.PAGE_SIZE})
+                        break
+                    except Exception as exc:  # noqa: BLE001 - transient list-fetch fault; retry
+                        last_error = exc
+                        self.logger.warning("tas: list fetch failed at start=%s (attempt %d/3): %s",
+                                            start, attempt + 1, exc)
+                        await page.wait_for_timeout(2000 * (attempt + 1))
+                if data is None:
+                    self.logger.error("tas: list fetch permanently failed at start=%s — stopping "
+                                      "pagination (partial coverage this run)", start)
+                    tracker.mark_failure(
+                        "exhausted_retries",
+                        cursor=start,
+                        detail=str(last_error or "empty page result"),
+                    )
+                    finalize_pagination_scope(self, tracker, url=response.url)
+                    break
+                if not isinstance(data, dict):
+                    failure_kind = (
+                        "waf_or_non_json" if isinstance(data, str) else "callback_failure"
+                    )
+                    tracker.mark_failure(
+                        failure_kind,
+                        cursor=start,
+                        detail="DWR listing result is not an object",
+                    )
+                    finalize_pagination_scope(self, tracker, url=response.url)
+                    break
+                raw_total = data.get("total")
+                try:
+                    total = parse_advertised_count(raw_total)
+                except ValueError:
+                    tracker.mark_failure(
+                        "callback_failure",
+                        cursor=start,
+                        detail=f"invalid advertised total: {raw_total!r}",
+                    )
+                    finalize_pagination_scope(self, tracker, url=response.url)
+                    break
+                records = data.get("source")
+                if not isinstance(records, list):
+                    tracker.mark_failure(
+                        "callback_failure",
+                        cursor=start,
+                        detail="DWR listing source is not a list",
+                    )
+                    finalize_pagination_scope(self, tracker, url=response.url)
+                    break
+
+                next_start = start + self.PAGE_SIZE
+                terminal = not records or next_start >= total
+                tracker.observe_page(
+                    start,
+                    [
+                        record.get("documentId")
+                        if isinstance(record, dict)
+                        else None
+                        for record in records
+                    ],
+                    advertised_total=total,
+                    advertised_pages=advertised_page_count(total, self.PAGE_SIZE),
+                    page_number=page_number,
+                    terminal=terminal,
+                )
                 if not records:
+                    finalize_pagination_scope(self, tracker, url=response.url)
                     break
 
                 for record in records:
+                    if not isinstance(record, dict):
+                        continue
                     if self.is_seen({"document_id": record.get("documentId")}):
                         self.crawler.stats.inc_value("dedup/skipped")
                         continue
                     detail = await self._fetch_detail(page, record.get("documentId"))
+                    if detail is None:
+                        continue
                     yield self.build_item(record, detail)
                     await page.wait_for_timeout(self.DETAIL_DELAY_MS)
 
-                start += self.PAGE_SIZE
-                if start >= total:
+                start = next_start
+                if terminal:
+                    finalize_pagination_scope(self, tracker, url=response.url)
                     break
                 await page.wait_for_timeout(self.PAGE_DELAY_MS)
 
             self.logger.info("tas: fetched up to %s of %s documents", min(start, total or 0), total)
+        except Exception as exc:  # noqa: BLE001 - callback failures must leave repair evidence
+            tracker.mark_failure(
+                "callback_failure",
+                cursor=locals().get("start", 0),
+                detail=str(exc),
+            )
+            finalize_pagination_scope(self, tracker, url=response.url)
+            self.logger.error("tas: pagination callback failed: %s", exc)
         finally:
             await page.close()
 
@@ -383,10 +524,22 @@ class TasSpider(BaseLegalSpider):
             )
         except Exception as exc:  # noqa: BLE001 - enrichment must be best-effort
             self.logger.warning("tas: detail fetch failed for %s: %s", doc_id, exc)
+            self.record_quality_failure(
+                "detail_fetch_failed",
+                DETAIL_URL.format(doc_id),
+                detail=str(exc),
+                context={"document_id": doc_id},
+            )
             return None
         if not detail or not detail.get("ok"):
             self.logger.info(
                 "tas: no detail for %s (%s)", doc_id, (detail or {}).get("reason")
+            )
+            self.record_quality_failure(
+                "detail_fetch_failed",
+                DETAIL_URL.format(doc_id),
+                detail=str((detail or {}).get("reason") or "empty detail response"),
+                context={"document_id": doc_id},
             )
             return None
         return detail
@@ -414,6 +567,14 @@ class TasSpider(BaseLegalSpider):
         document = (detail or {}).get("document") or {}
         if not detail or document.get("documentStatusId") == _DRAFT_STATUS_ID:
             # List-only item: detail unavailable or the draft was never submitted.
+            loader.add_value(
+                "content_kind",
+                "draft_metadata"
+                if document.get("documentStatusId") == _DRAFT_STATUS_ID
+                else "list_metadata",
+            )
+            loader.add_value("content_complete", False)
+            loader.add_value("extraction_status", "malformed")
             loader.add_value(
                 "body_markdown",
                 self._list_body(nomenclature, stadiums, record.get("address")),
@@ -447,6 +608,19 @@ class TasSpider(BaseLegalSpider):
         request_text = _request_text(detail.get("docValues"), labels)
         response_markdown = _response_to_markdown(document.get("responseText"))
         nomenclature_full = _nomenclature_full(detail.get("nomenklaturMarkup"))
+
+        # A populated detail descriptor is not itself proof that the actual decision
+        # text was published. Keep request/metadata-only records retryable and out of
+        # the serving corpus until responseText supplies the full decision body.
+        has_full_decision = bool(response_markdown and response_markdown.strip())
+        loader.add_value(
+            "content_kind",
+            "decision_full_text" if has_full_decision else "detail_metadata",
+        )
+        loader.add_value("content_complete", has_full_decision)
+        loader.add_value(
+            "extraction_status", "full_text" if has_full_decision else "malformed"
+        )
 
         loader.add_value("document_type_id", document.get("documentTypeId"))
         loader.add_value("deadline_date", deadline_iso)

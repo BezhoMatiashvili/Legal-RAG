@@ -2,6 +2,8 @@
 
 from types import SimpleNamespace
 
+import pytest
+
 from ingest.config import load_config, retrieval_fingerprint
 from ingest.mcp_server import _stitch_overlap
 from ingest.querylog import append_query_log, build_query_record
@@ -82,6 +84,20 @@ def test_pii_query_written_locally_verbatim(tmp_path):
                              hits=[], latency_ms=1.0, fingerprint="fp")
     append_query_log(rec, p)
     assert json.loads(p.read_text())["query"] == "ს. წიკლაური 01001012345"
+    assert (p.stat().st_mode & 0o777) == 0o600
+
+
+def test_query_log_refuses_insecure_existing_file_without_chmod(tmp_path):
+    p = tmp_path / "q.jsonl"
+    p.write_text("owner evidence\n", encoding="utf-8")
+    p.chmod(0o644)
+
+    with pytest.raises(PermissionError, match="refusing to chmod"):
+        append_query_log({"new": True}, p)
+
+    assert (p.stat().st_mode & 0o777) == 0o644
+    assert p.read_text(encoding="utf-8") == "owner evidence\n"
+    assert (p.parent.stat().st_mode & 0o777) == 0o700
 
 
 def test_retrieval_fingerprint_stable_and_sensitive():

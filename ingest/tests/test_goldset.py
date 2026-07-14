@@ -34,6 +34,7 @@ def test_holdout_is_51_docs():
     assert len(goldset.load_holdout()) == 51
 
 
+@pytest.mark.snapshot
 def test_reground_passes_on_all_103_real_spans():
     gold = goldset.load_golden_set()
     bodies = goldset.SnapshotBodies(needed=goldset.gold_docs(gold))
@@ -45,6 +46,7 @@ def test_enforce_holdout_passes_for_real_gold():
     goldset.enforce_holdout(gold, goldset.load_holdout())  # no raise
 
 
+@pytest.mark.snapshot
 def test_span_coverage_lint_passes_on_real_set():
     gold = goldset.load_golden_set()
     bodies = goldset.SnapshotBodies(needed=goldset.gold_docs(gold))
