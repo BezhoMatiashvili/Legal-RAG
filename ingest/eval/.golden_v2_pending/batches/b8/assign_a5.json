@@ -1,0 +1,65 @@
+[
+ {
+  "query_type": "cross_lingual",
+  "source": "napr",
+  "document_id": "85766",
+  "stratum": "napr",
+  "title": "დაკმაყოფილებაზე უარის თქმის შესახებ გადაწყვეტილება  (რეგისტრაციაზე უარის თქმის შესახებ №************-07 (20.11.2025) გადაწყვეტილება).",
+  "body_char_len": 4834,
+  "qid": "q458"
+ },
+ {
+  "query_type": "cross_lingual",
+  "source": "napr",
+  "document_id": "89098",
+  "stratum": "napr",
+  "title": "დაკმაყოფილებაზე უარის თქმის შესახებ გადაწყვეტილება (სარეგისტრაციო წარმოების შეწყვეტის შესახებ №************-08 (09.03.2026), რეგისტრაციაზე უარის თქმის შესახებ №************-16 (26.01.2026) და №************-13 (29.10.2020) გადაწყვეტილებები).",
+  "body_char_len": 5993,
+  "qid": "q454"
+ },
+ {
+  "query_type": "natural_question",
+  "source": "tas",
+  "document_id": "11934",
+  "stratum": "tas",
+  "title": "AR111934 — აბრებისა და რეკლამების განთავსება / ახალი მშენებლობა",
+  "body_char_len": 1912,
+  "qid": "q500"
+ },
+ {
+  "query_type": "paraphrase",
+  "source": "tas",
+  "document_id": "20884",
+  "stratum": "tas",
+  "title": "AR120884 — შერჩეული პროექტის მშენებლობის შესაძლებლობის განსაზღვრა მიწის ნაკვეთზე",
+  "body_char_len": 1506,
+  "qid": "q476"
+ },
+ {
+  "query_type": "paraphrase",
+  "source": "tas",
+  "document_id": "24571",
+  "stratum": "tas",
+  "title": "AR124571 — აბრებისა და რეკლამების განთავსება / ახალი მშენებლობა",
+  "body_char_len": 2721,
+  "qid": "q473"
+ },
+ {
+  "query_type": "keyword",
+  "source": "tas",
+  "document_id": "25005",
+  "stratum": "tas",
+  "title": "AR125005 — აბრებისა და რეკლამების განთავსება / ახალი მშენებლობა",
+  "body_char_len": 754,
+  "qid": "q469"
+ },
+ {
+  "query_type": "natural_question",
+  "source": "tbappeal",
+  "document_id": "ganchineba-informatsiis-mkhareta-shoris-gatsvlis-taobaze",
+  "stratum": "tbappeal",
+  "title": "განჩინება ინფორმაციის მხარეთა შორის გაცვლის თაობაზე",
+  "body_char_len": 2202,
+  "qid": "q491"
+ }
+]

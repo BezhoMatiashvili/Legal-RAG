@@ -1,0 +1,56 @@
+[
+ {
+  "qid": "q251",
+  "verdict": "accept",
+  "checks": {"answers": true, "no_hindsight": true, "labels": true, "faithful_answer": true, "coherent": true},
+  "reasons": "Span states the new 2016-02-29 deadline set by №4203-Iს (adopted 2015-09-04 per body); №4203-Iს + deadline text are corpus-unique to this doc and the answer matches the document."
+ },
+ {
+  "qid": "q253",
+  "verdict": "accept",
+  "checks": {"answers": true, "no_hindsight": true, "labels": true, "faithful_answer": true, "coherent": true},
+  "reasons": "Span directly states art. 18(3) is in force until the 1997 state budget law takes effect; KA interrogative, discriminative (law name + article + parliament resolution), answer faithful to both sentences of point 3."
+ },
+ {
+  "qid": "q232",
+  "verdict": "accept",
+  "checks": {"answers": true, "no_hindsight": true, "labels": true, "faithful_answer": true, "coherent": true},
+  "reasons": "Quote states the owner-or-notarized-PoA rule answering the EN question; corpus grep shows the phrase in only 2 TAS docs and only this one concerns a garage, so it discriminates."
+ },
+ {
+  "qid": "q230",
+  "verdict": "accept",
+  "checks": {"answers": true, "no_hindsight": true, "labels": true, "faithful_answer": true, "coherent": true},
+  "reasons": "Span (no grounds to change the verdict or grant the prosecution appeal) answers whether the appellate court upheld it; verified zero content-word overlap with the query, and the axe-threat-against-mother Kutaisi appeal facts are unique."
+ },
+ {
+  "qid": "q235",
+  "verdict": "accept",
+  "checks": {"answers": true, "no_hindsight": true, "labels": true, "faithful_answer": true, "coherent": true},
+  "reasons": "Span supplies the amended act's identity (2021-12-28 №14) not stated in the query; among the 5-doc Shuakhevi 2022-budget family only this doc is resolution №25, so the query discriminates."
+ },
+ {
+  "qid": "q225",
+  "verdict": "accept",
+  "checks": {"answers": true, "no_hindsight": true, "labels": true, "faithful_answer": true, "coherent": true},
+  "reasons": "Span gives the adoption date (Tbilisi, 17 August 1984, №2622-X) answering the day question; the decree indeed adds the fictitious-marriage article and rewrites the gambling article, and the answer follows the document (meta's 31/08 is publication, not adoption)."
+ },
+ {
+  "qid": "q210",
+  "verdict": "accept",
+  "checks": {"answers": true, "no_hindsight": true, "labels": true, "faithful_answer": true, "coherent": true},
+  "reasons": "Legal-citation query carries the doc's own number №211402 (matches meta document_number, unique in the napr snapshot), the doc IS the cited decision, and the span/answer correctly reflect refusal of the administrative complaint over cadastral-data change."
+ },
+ {
+  "qid": "q205",
+  "verdict": "accept",
+  "checks": {"answers": true, "no_hindsight": true, "labels": true, "faithful_answer": true, "coherent": true},
+  "reasons": "Span states exactly what was requested (suspension of the registration proceeding until final criminal decision); grep shows the Finance Ministry Investigation Service forest-fund-fraud context is unique to this doc, so the EN query discriminates."
+ },
+ {
+  "qid": "q211",
+  "verdict": "accept",
+  "checks": {"answers": true, "no_hindsight": true, "labels": true, "faithful_answer": true, "coherent": true},
+  "reasons": "Citation query contains the doc's own case number 330210018002483473 (matches meta, corpus-unique) plus content keywords; answer verified against the body (7 May 2019, MIA appeal rejected, 2000 GEL reduced penalty upheld)."
+ }
+]

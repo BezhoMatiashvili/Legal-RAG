@@ -1,0 +1,92 @@
+[
+ {
+  "query_type": "cross_lingual",
+  "source": "constcourt",
+  "document_id": "13260",
+  "stratum": "constcourt",
+  "title": "საქართველოს საკონსტიტუციო სასამართლოს მოსამართლის - თეიმურაზ ტუღუშის განსხვავებული აზრი საქართველოს საკონსტიტუციო სასამართლოს პლენუმის 2022 წლის 23 თებერვლის №3/1/1681 განჩინებასთან დაკავშირებით",
+  "body_char_len": 11895,
+  "qid": "q396"
+ },
+ {
+  "query_type": "cross_lingual",
+  "source": "constcourt",
+  "document_id": "1616",
+  "stratum": "constcourt",
+  "title": "ბოლნისის რაიონული სასამართლოს კონსტიტუციური წარდგინება საქართველოს სისხლის სამართლის კოდექსის 262-ე მუხლის პირველი ნაწილის ის ნორმატიული შინაარსის კონსტიტუციურობაზე, რომელიც ითვალისწინებს სისხლისსამართლებრივი სასჯელის სახით თავისუფლების აღკვეთის გამოყენების შესაძლებლობას 70 გრამამდე (მოცემულ შემთხვევაში 6,7 გრამი) ნარკოტიკული საშუალება - „გამომშრალი მარიხუანის“  პირადი მოხმარების მიზნებისთვის საქართველოში უკანონოდ შემოტანის გამო.",
+  "body_char_len": 7368,
+  "qid": "q393"
+ },
+ {
+  "query_type": "natural_question",
+  "source": "constcourt",
+  "document_id": "19492",
+  "stratum": "constcourt",
+  "title": "ს.მ. საქართველოს პარლამენტის წინააღმდეგ",
+  "body_char_len": 89238,
+  "qid": "q367"
+ },
+ {
+  "query_type": "cross_lingual",
+  "source": "constcourt",
+  "document_id": "9091",
+  "stratum": "constcourt",
+  "title": "თეიმურაზ ლომიძე საქართველოს მთავრობის წინააღმდეგ",
+  "body_char_len": 10404,
+  "qid": "q364"
+ },
+ {
+  "query_type": "natural_question",
+  "source": "ecd",
+  "document_id": "206964",
+  "stratum": "ecd",
+  "title": "010100218700050677 — განაჩენი",
+  "body_char_len": 12884,
+  "qid": "q370"
+ },
+ {
+  "query_type": "natural_question",
+  "source": "ecd",
+  "document_id": "371798",
+  "stratum": "ecd",
+  "title": "010210118001997747 — განჩინება/გადაწყვეტილება",
+  "body_char_len": 12351,
+  "qid": "q356"
+ },
+ {
+  "query_type": "cross_lingual",
+  "source": "ecd",
+  "document_id": "430438",
+  "stratum": "ecd",
+  "title": "050100118002299159 — განაჩენი",
+  "body_char_len": 18004,
+  "qid": "q397"
+ },
+ {
+  "query_type": "paraphrase",
+  "source": "ecd",
+  "document_id": "433085",
+  "stratum": "ecd",
+  "title": "010100117002183549 — განაჩენი",
+  "body_char_len": 10484,
+  "qid": "q391"
+ },
+ {
+  "query_type": "paraphrase",
+  "source": "ecd",
+  "document_id": "441478",
+  "stratum": "ecd",
+  "title": "180100118002468345 — განაჩენი",
+  "body_char_len": 24859,
+  "qid": "q373"
+ },
+ {
+  "query_type": "paraphrase",
+  "source": "ecd",
+  "document_id": "5299994",
+  "stratum": "ecd",
+  "title": "231210019002984257 — გადაწყვეტილება",
+  "body_char_len": 18425,
+  "qid": "q375"
+ }
+]

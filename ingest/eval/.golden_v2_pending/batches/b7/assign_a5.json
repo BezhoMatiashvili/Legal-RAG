@@ -1,0 +1,92 @@
+[
+ {
+  "query_type": "legal_citation",
+  "source": "napr",
+  "document_id": "85766",
+  "stratum": "napr",
+  "title": "დაკმაყოფილებაზე უარის თქმის შესახებ გადაწყვეტილება  (რეგისტრაციაზე უარის თქმის შესახებ №************-07 (20.11.2025) გადაწყვეტილება).",
+  "body_char_len": 4834,
+  "qid": "q432"
+ },
+ {
+  "query_type": "legal_citation",
+  "source": "napr",
+  "document_id": "85975",
+  "stratum": "napr",
+  "title": "ა/ს დაკმაყოფილებაზე უარის თქმის შესახებ გადაწყვეტილება (რეგისტრაციაზე უარის თქმის შესახებ №************-05 (10.04.2024) გადაწყვეტილება).",
+  "body_char_len": 13036,
+  "qid": "q438"
+ },
+ {
+  "query_type": "cross_lingual",
+  "source": "napr",
+  "document_id": "86166",
+  "stratum": "napr",
+  "title": "დაკმაყოფილებაზე უარის თქმის შესახებ გადაწყვეტილება (სარეგისტრაციო წარმოების შეწყვეტის შესახებ №************-09 (15.12.2025) გადაწყვეტილება).",
+  "body_char_len": 5985,
+  "qid": "q433"
+ },
+ {
+  "query_type": "legal_citation",
+  "source": "napr",
+  "document_id": "88738",
+  "stratum": "napr",
+  "title": "ა/ს დაკმაყოფილებაზე უარის თქმის შესახებ გადაწყვეტილება (რეგისტრაციაზე შესახებ №************-04 (29.03.2024) გადაწყვეტილება).",
+  "body_char_len": 3097,
+  "qid": "q441"
+ },
+ {
+  "query_type": "legal_citation",
+  "source": "napr",
+  "document_id": "89098",
+  "stratum": "napr",
+  "title": "დაკმაყოფილებაზე უარის თქმის შესახებ გადაწყვეტილება (სარეგისტრაციო წარმოების შეწყვეტის შესახებ №************-08 (09.03.2026), რეგისტრაციაზე უარის თქმის შესახებ №************-16 (26.01.2026) და №************-13 (29.10.2020) გადაწყვეტილებები).",
+  "body_char_len": 5993,
+  "qid": "q423"
+ },
+ {
+  "query_type": "natural_question",
+  "source": "tas",
+  "document_id": "12262",
+  "stratum": "tas",
+  "title": "AR112262 — 4 მ-მდე სიმაღლის მქონე ღობე / ახალი მშენებლობა",
+  "body_char_len": 1162,
+  "qid": "q415"
+ },
+ {
+  "query_type": "legal_citation",
+  "source": "tas",
+  "document_id": "155749",
+  "stratum": "tas",
+  "title": "AR1155749 — მრავალფუნქციური კომპლექსი/შენობა / IV კლასი / მიშენება ან მიშენება - დაშენება",
+  "body_char_len": 2556,
+  "qid": "q417"
+ },
+ {
+  "query_type": "keyword",
+  "source": "tas",
+  "document_id": "24376",
+  "stratum": "tas",
+  "title": "AR124376 — აბრებისა და რეკლამების განთავსება / კორექტირება",
+  "body_char_len": 1530,
+  "qid": "q409"
+ },
+ {
+  "query_type": "cross_lingual",
+  "source": "tbappeal",
+  "document_id": "braldebulis-mimart-giraos-gamoqenebis-safudzvlebi",
+  "stratum": "tbappeal",
+  "title": "ბრალდებულის მიმართ გირაოს გამოყენების საფუძვლები",
+  "body_char_len": 2311,
+  "qid": "q420"
+ },
+ {
+  "query_type": "keyword",
+  "source": "tbappeal",
+  "document_id": "sakredito-urtiertobis-shetsqveta",
+  "stratum": "tbappeal",
+  "title": "საკრედიტო ურთიერთობის შეწყვეტა",
+  "body_char_len": 1584,
+  "qid": "q430"
+ }
+]

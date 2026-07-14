@@ -1,0 +1,92 @@
+[
+ {
+  "query_type": "natural_question",
+  "source": "constcourt",
+  "document_id": "1194",
+  "stratum": "constcourt",
+  "title": "საქართველოს საკონსტიტუციო სასამართლოს წევრების -  გიორგი კვერენჩხილაძისა და მაია კოპალეიშვილის  განსხვავებული აზრი",
+  "body_char_len": 12583,
+  "qid": "q240"
+ },
+ {
+  "query_type": "keyword",
+  "source": "constcourt",
+  "document_id": "1289",
+  "stratum": "constcourt",
+  "title": "შპს „მეტალინვესტი“ საქართველოს პარლამენტის წინააღმდეგ",
+  "body_char_len": 3966,
+  "qid": "q221"
+ },
+ {
+  "query_type": "keyword",
+  "source": "constcourt",
+  "document_id": "1325",
+  "stratum": "constcourt",
+  "title": "საქართველოს სახალხო დამცველი საქართველოს პარლამენტის წინააღმდეგ",
+  "body_char_len": 30373,
+  "qid": "q206"
+ },
+ {
+  "query_type": "natural_question",
+  "source": "constcourt",
+  "document_id": "13697",
+  "stratum": "constcourt",
+  "title": "კალინკა გედენიძე, თამარ გელიაშვილი, დაიანა დარციმელია, ირაკლი ჭელიძე და სალომე რთველიაშვილი საქართველოს მთავრობის და საქართველოს განათლებისა და მეცნიერების მინისტრის წინააღმდეგ",
+  "body_char_len": 16242,
+  "qid": "q247"
+ },
+ {
+  "query_type": "legal_citation",
+  "source": "constcourt",
+  "document_id": "1694",
+  "stratum": "constcourt",
+  "title": "შპს  „ბლექსი ტელეკომი“ საქართველოს პარლამენტის წინააღმდეგ",
+  "body_char_len": 34074,
+  "qid": "q216"
+ },
+ {
+  "query_type": "natural_question",
+  "source": "constcourt",
+  "document_id": "18744",
+  "stratum": "constcourt",
+  "title": "საქართველოს სახალხო დამცველი საქართველოს იუსტიციის მინისტრის წინააღმდეგ",
+  "body_char_len": 10969,
+  "qid": "q236"
+ },
+ {
+  "query_type": "cross_lingual",
+  "source": "constcourt",
+  "document_id": "2173",
+  "stratum": "constcourt",
+  "title": "საქართველოს უზენაესი სასამართლოს კონსტიტუციური წარდგინებები საქართველოს სისხლის სამართლის კოდექსის 273-ე მუხლის იმ ნორმატიული შინაარსის კონსტიტუციურობის თაობაზე, რომელიც ითვალისწინებს სისხლისსამართლებრივი სასჯელის სახით თავისუფლების აღკვეთის გამოყენების შესაძლებლობას ნარკოტიკული საშუალება  მარიხუანის მოხმარებისთვის.",
+  "body_char_len": 9347,
+  "qid": "q212"
+ },
+ {
+  "query_type": "cross_lingual",
+  "source": "constcourt",
+  "document_id": "221",
+  "stratum": "constcourt",
+  "title": "საქართველოს მოქალაქე ჟანა აბულაძე საქართველოს პარლამენტის წინააღმდეგ",
+  "body_char_len": 11811,
+  "qid": "q238"
+ },
+ {
+  "query_type": "paraphrase",
+  "source": "ecd",
+  "document_id": "432539",
+  "stratum": "ecd",
+  "title": "090100118002464298 — განაჩენი",
+  "body_char_len": 9401,
+  "qid": "q230"
+ },
+ {
+  "query_type": "legal_citation",
+  "source": "ecd",
+  "document_id": "435984",
+  "stratum": "ecd",
+  "title": "330210018002483473 — განჩინება/გადაწყვეტილება",
+  "body_char_len": 21269,
+  "qid": "q211"
+ }
+]

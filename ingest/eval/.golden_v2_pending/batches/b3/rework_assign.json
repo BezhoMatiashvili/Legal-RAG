@@ -1,0 +1,153 @@
+[
+ {
+  "query_type": "paraphrase",
+  "source": "tas",
+  "document_id": "25668",
+  "stratum": "matsne/საკრებულოს დადგენილება",
+  "title": "AR125668 — აბრებისა და რეკლამების განთავსება / ახალი მშენებლობა",
+  "body_char_len": 376,
+  "qid": "q220",
+  "doc_swapped": true,
+  "rejection_reason": "original doc was title-only (376 chars): span in a trailing heading maps to no chunk; paraphrase needs substantive body text"
+ },
+ {
+  "query_type": "keyword",
+  "source": "constcourt",
+  "document_id": "1325",
+  "stratum": "constcourt",
+  "title": "საქართველოს სახალხო დამცველი საქართველოს პარლამენტის წინააღმდეგ",
+  "body_char_len": 30373,
+  "qid": "q206",
+  "rejection_reason": "Keyword query has no own identifier and is equally answered by siblings: doc 1002 is the Constitutional Court's ruling on the very same complaint N575 restating the same owner-cannot-appeal claim, doc 291 is the 2007 judgment on Art 52 confiscation vs owner's court access, and doc 5005 raises the same issue, so the gold complaint is not discriminated."
+ },
+ {
+  "query_type": "cross_lingual",
+  "source": "constcourt",
+  "document_id": "2173",
+  "stratum": "constcourt",
+  "title": "საქართველოს უზენაესი სასამართლოს კონსტიტუციური წარდგინებები საქართველოს სისხლის სამართლის კოდექსის 273-ე მუხლის იმ ნორმატიული შინაარსის კონსტიტუციურობის თაობაზე, რომელიც ითვალისწინებს სისხლისსამართლებრივი სასჯელის სახით თავისუფლების აღკვეთის გამოყენების შესაძლებლობას ნარკოტიკული საშუალება  მარიხუანის მოხმარებისთვის.",
+  "body_char_len": 9347,
+  "qid": "q212",
+  "rejection_reason": "Not discriminative: corpus grep found 142 constcourt docs on marijuana consumption + imprisonment, including near-identical sibling Supreme Court referrals on the same Art 273 question (docs 1255, 2130, 2162 share essentially the same title) and the actual judgment (doc 1265, Givi Shanidze v Parliament) that answers this broad EN question authoritatively, so the gold referral cannot be singled out."
+ },
+ {
+  "query_type": "cross_lingual",
+  "source": "matsne",
+  "document_id": "2946276",
+  "stratum": "matsne/საქართველოს მთავრობის დადგენილება",
+  "title": "„სახელმწიფო უსაფრთხოებისა და კრიზისების მართვის საბჭოსთან არსებული საქართველოს ეროვნული უსაფრთხოების კონცეპტუალური დოკუმენტების შემუშავების მაკოორდინირებელი მუდმივმოქმედი უწყებათაშორისი კომისიის შექმნისა და მისი დებულების დამტკიცების შესახებ“ საქართველოს მთავრობის 2014 წლის 11 ივნისის №392 დადგენილებაში ცვლილების შეტანის თაობაზე",
+  "body_char_len": 2918,
+  "qid": "q215",
+  "rejection_reason": "Not discriminating: the identical chairman provision (PM's assistant on state security = Council secretary, commission chair) appears verbatim in at least the base resolution matsne 2370987 and the earlier amendment matsne 2696556, so at least three sibling docs answer the question equally and the single gold (itself just a repealed amendment) poisons scoring."
+ },
+ {
+  "query_type": "paraphrase",
+  "source": "tas",
+  "document_id": "20772",
+  "stratum": "tas",
+  "title": "AR120772 — აბრებისა და რეკლამების განთავსება / ახალი მშენებლობა",
+  "body_char_len": 2383,
+  "qid": "q217",
+  "rejection_reason": "Boilerplate-answerable: sibling TAS permit 20781 is the same applicant (PSP pharmacy) with an identical facade-sign request and the identical 'first-class object, no construction permit needed' answer, and further pharmacy facade-sign docs (20581, 52178) exist, so the query has no feature discriminating doc 20772."
+ },
+ {
+  "query_type": "cross_lingual",
+  "source": "ecd",
+  "document_id": "5471917",
+  "stratum": "ecd",
+  "title": "190310019003083534 — გადაწყვეტილება",
+  "body_char_len": 17529,
+  "qid": "q218",
+  "rejection_reason": "Boilerplate-answerable: ~53 ECD decisions contain the same templated MoD contract clause 'ჯარიმის სახით 3 000' (34 with the exact sentence), and the query carries no case-specific identifier (names redacted, no case number), so dozens of sibling judgments answer it equally."
+ },
+ {
+  "query_type": "cross_lingual",
+  "source": "matsne",
+  "document_id": "1863579",
+  "stratum": "matsne/consolidated",
+  "title": "ამბროლაურის მუნიციპალიტეტის ტერიტორიაზე არსებული ადგილობრივი მნიშვნელობის საავტომობილო გზების ნუსხის დამტკიცების შესახებ",
+  "body_char_len": 24643,
+  "qid": "q219",
+  "rejection_reason": "Non-discriminating: the identical a-61 row 'ფუტიეთი-სხვავა-კრიხი-ამბროლაური ... 14.8' appears in three sibling versions of the Ambrolauri road list (matsne 1863579, 2594734, 3441045) and the gold is the repealed 2013 version, so retrieving an equally-correct sibling would be scored wrong."
+ },
+ {
+  "query_type": "keyword",
+  "source": "constcourt",
+  "document_id": "1289",
+  "stratum": "constcourt",
+  "title": "შპს „მეტალინვესტი“ საქართველოს პარლამენტის წინააღმდეგ",
+  "body_char_len": 3966,
+  "qid": "q221",
+  "rejection_reason": "Non-discriminating within the same constcourt case family: docs 929 (გადაწყვეტილება), 919 (განჩინება) and 926 (საოქმო ჩანაწერი) all contain every query keyword (კონსტიტუციური სარჩელი, მეწარმეთა შესახებ, საცილო/ბათილობა, 18 თვე), so the query cannot pick the complaint (1289) over its siblings."
+ },
+ {
+  "query_type": "keyword",
+  "source": "tas",
+  "document_id": "22466",
+  "stratum": "tas",
+  "title": "AR122466 — 4 მ-მდე სიმაღლის მქონე ღობე / რეკონსტრუქცია",
+  "body_char_len": 2903,
+  "qid": "q223",
+  "rejection_reason": "Pure template query with zero unique identifiers: corpus grep found three sibling 'fence up to 4m / reconstruction' permits (24662, 22612, 12284) each containing the identical 'I-class object, no construction permit needed' boilerplate, so any of the four answers the keyword query equally."
+ },
+ {
+  "query_type": "natural_question",
+  "source": "matsne",
+  "document_id": "3240239",
+  "stratum": "matsne/საკრებულოს დადგენილება",
+  "title": "„ჭიათურის მუნიციპალიტეტის დასახლების საერთო კრების დებულების დამტკიცების შესახებ“  ჭიათურის მუნიციპალიტეტის საკრებულოს 2016 წლის 12 იანვრის №1 დადგენილებაში ცვლილების შეტანის თაობაზე",
+  "body_char_len": 2096,
+  "qid": "q224",
+  "rejection_reason": "Non-discriminating: the identical >2000-voters/chapter-4 provision also appears in the in-force 2018 Chiatura regulation (matsne 4140512) while the gold is the repealed 2016 amendment, so the version-agnostic question is answered equally (arguably better) by the sibling."
+ },
+ {
+  "query_type": "paraphrase",
+  "source": "matsne",
+  "document_id": "1905427",
+  "stratum": "matsne/საქართველოს მინისტრის ბრძანება",
+  "title": "„საქართველოს სასჯელაღსრულების, პრობაციისა და იურიდიული დახმარების საკითხთა სამინისტროს ცენტრალური აპარატის შინაგანაწესის დამტკიცების შესახებ“ საქართველოს სასჯელაღსრულების, პრობაციისა და იურიდიული დახმარების საკითხთა მინისტრის 2012 წლის 15 ივნისის №90 ბრძანებაში ცვლილების შეტანის შესახებ",
+  "body_char_len": 1472,
+  "qid": "q226",
+  "rejection_reason": "Not discriminating: matsne doc 3017643 (the 2015 penitentiary-ministry internal regulations, article 4) contains the identical provision verbatim and matches the query's generic 'penitentiary ministry internal regulations' framing at least as well as this amendment order, so a single gold label falsely penalizes the sibling."
+ },
+ {
+  "query_type": "cross_lingual",
+  "source": "constcourt",
+  "document_id": "221",
+  "stratum": "constcourt",
+  "title": "საქართველოს მოქალაქე ჟანა აბულაძე საქართველოს პარლამენტის წინააღმდეგ",
+  "body_char_len": 11811,
+  "qid": "q238",
+  "rejection_reason": "Not discriminative: the query asks about the law's rule with no case-specific anchor, and the 75%-of-market-value provision appears verbatim in ~24 corpus docs (8 constcourt cases incl. Okudzhava/Kurdiani/Sharadze, 2 matsne, 14 ecd), any of which answers it as well as the gold admissibility ruling."
+ },
+ {
+  "query_type": "keyword",
+  "source": "ecd",
+  "document_id": "5485381",
+  "stratum": "ecd",
+  "title": "330100119002823041 — განაჩენი",
+  "body_char_len": 29597,
+  "qid": "q242",
+  "rejection_reason": "Not discriminative: the corpus contains the same case's appellate verdict (ecd 506509, identical case number 330100119002823041, also a 'განაჩენი' with the 178-acquittal and perfume-store facts), which answers the keyword query equally well as the single gold."
+ },
+ {
+  "query_type": "cross_lingual",
+  "source": "matsne",
+  "document_id": "1305041",
+  "stratum": "matsne/საქართველოს პარლამენტის დადგენილება",
+  "title": "საქართველოს პარლამენტის რეგლამენტში ცვლილებების შეტანის თაობაზე",
+  "body_char_len": 1093,
+  "qid": "q245",
+  "rejection_reason": "Non-discriminative and misleading gold: three consolidated 'საქართველოს პარლამენტის რეგლამენტი' docs (e.g. matsne 6494611, Art. 35) directly answer the present-tense question — and differently (open ballot, 3 deputies) — while the gold is a repealed 2000 amendment (secret ballot), so the query neither selects this doc nor yields a currently-correct answer."
+ },
+ {
+  "query_type": "keyword",
+  "source": "napr",
+  "document_id": "76487",
+  "stratum": "napr",
+  "title": "დაკმაყოფილებაზე უარის თქმის შესახებ გადაწყვეტილება  (რეგისტრაციაზე უარის თქმის შესახებ №************-03 (25.04.2024) გადაწყვეტილება, საკადასტრო კოდი: **.**.**.***).",
+  "body_char_len": 6539,
+  "qid": "q252",
+  "rejection_reason": "Boilerplate-answerable: at least two other napr decisions (15282, 89628) are near-identical template refusals of superficies (აღნაგობა) registration on agricultural land because the acquirer was a foreign citizen, and the anchor-free keyword query cannot discriminate the gold."
+ }
+]

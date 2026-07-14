@@ -1,0 +1,62 @@
+[
+ {
+  "qid": "q243",
+  "verdict": "accept",
+  "checks": {"answers": true, "no_hindsight": true, "labels": true, "faithful_answer": true, "coherent": true},
+  "reasons": "Citation query carries the doc's own number 05/30 (matches meta) plus the Marjanishvili theatre subject; span is the act's own header identifying it; answer (minister, 2013-09-02, statute approval) matches the body."
+ },
+ {
+  "qid": "q240",
+  "verdict": "accept",
+  "checks": {"answers": true, "no_hindsight": true, "labels": true, "faithful_answer": true, "coherent": true},
+  "reasons": "Span states the dissent's core reasoning (mechanical 50m measurement alone insufficient to identify the risk); answer's extra detail (access distance, visibility to minors) is verbatim in the surrounding dissent text; well-known public case, plausibly asked blind."
+ },
+ {
+  "qid": "q244",
+  "verdict": "accept",
+  "checks": {"answers": true, "no_hindsight": true, "labels": true, "faithful_answer": true, "coherent": true},
+  "reasons": "Temporal query on resolution No395's adoption; span gives the exact date 6 April 1992 from the act's header, meta confirms repealed status stated in the answer."
+ },
+ {
+  "qid": "q213",
+  "verdict": "accept",
+  "checks": {"answers": true, "no_hindsight": true, "labels": true, "faithful_answer": true, "coherent": true},
+  "reasons": "Span explicitly states that changing the provider clinic or increasing the requested amount requires agreement with the Government; corpus grep shows the phrase occurs in this document only, so the query discriminates."
+ },
+ {
+  "qid": "q226",
+  "verdict": "reject",
+  "checks": {"answers": true, "no_hindsight": false, "labels": true, "faithful_answer": true, "coherent": true},
+  "reasons": "Not discriminating: matsne doc 3017643 (the 2015 penitentiary-ministry internal regulations, article 4) contains the identical provision verbatim and matches the query's generic 'penitentiary ministry internal regulations' framing at least as well as this amendment order, so a single gold label falsely penalizes the sibling."
+ },
+ {
+  "qid": "q216",
+  "verdict": "accept",
+  "checks": {"answers": true, "no_hindsight": true, "labels": true, "faithful_answer": true, "coherent": true},
+  "reasons": "Complaint number 1304 is part of the doc's own number N1/7/1304 and the doc IS the ruling on it; span is the operative refusal, and the body confirms both the radio-frequency license-extension-fee subject and the court's own 'unsubstantiated' ground stated in the answer."
+ },
+ {
+  "qid": "q214",
+  "verdict": "accept",
+  "checks": {"answers": true, "no_hindsight": true, "labels": true, "faithful_answer": true, "coherent": true},
+  "reasons": "Span contains the operative authorization (free, temporary, fixed-term, no auction) and designates recipients via paragraph 2 of this ~1.7k-char single act; answer's recipient list matches paragraph 2 exactly (election-observation entities, accredited diplomatic/international representations)."
+ },
+ {
+  "qid": "q246",
+  "verdict": "accept",
+  "checks": {"answers": true, "no_hindsight": true, "labels": true, "faithful_answer": true, "coherent": true},
+  "reasons": "Query cites the doc's own number 01-2/n exactly as in meta plus discriminating topic words; span is the act's header; every answer claim (amends 2009 No135/n criteria, psychiatric and radiological visit norms, adds maxillofacial surgery norm) is verified in the body."
+ },
+ {
+  "qid": "q215",
+  "verdict": "reject",
+  "checks": {"answers": true, "no_hindsight": false, "labels": true, "faithful_answer": true, "coherent": true},
+  "reasons": "Not discriminating: the identical chairman provision (PM's assistant on state security = Council secretary, commission chair) appears verbatim in at least the base resolution matsne 2370987 and the earlier amendment matsne 2696556, so at least three sibling docs answer the question equally and the single gold (itself just a repealed amendment) poisons scoring."
+ },
+ {
+  "qid": "q231",
+  "verdict": "accept",
+  "checks": {"answers": true, "no_hindsight": true, "labels": true, "faithful_answer": true, "coherent": true},
+  "reasons": "Keyword query names the merger topic plus Akhaltsikhe/Kutaisi; gold order No05/07 is the founding act and the uniquely best match (the only other hits are a later amendment citing it and a different Borjomi/Gurjaani merger); span is the operative merger-creation provision and the answer's three theatres are in article 1."
+ }
+]

@@ -1,0 +1,92 @@
+[
+ {
+  "query_type": "cross_lingual",
+  "source": "napr",
+  "document_id": "7096",
+  "stratum": "napr",
+  "title": "ა/ს დაკმაყოფილებაზე უარის თქმის შესახებ გადაწყვეტილება (სარეგისტრაციო წარმოების მიმდინარეობის შესახებ №************-13 (14.01.2022 წ.) გადაწყვეტილება.)",
+  "body_char_len": 14438,
+  "qid": "q205"
+ },
+ {
+  "query_type": "keyword",
+  "source": "napr",
+  "document_id": "76487",
+  "stratum": "napr",
+  "title": "დაკმაყოფილებაზე უარის თქმის შესახებ გადაწყვეტილება  (რეგისტრაციაზე უარის თქმის შესახებ №************-03 (25.04.2024) გადაწყვეტილება, საკადასტრო კოდი: **.**.**.***).",
+  "body_char_len": 6539,
+  "qid": "q252"
+ },
+ {
+  "query_type": "cross_lingual",
+  "source": "tas",
+  "document_id": "10487",
+  "stratum": "tas",
+  "title": "AR110487 — ღია ავტოსადგომის მოწყობა / კორექტირება",
+  "body_char_len": 886,
+  "qid": "q232"
+ },
+ {
+  "query_type": "legal_citation",
+  "source": "tas",
+  "document_id": "10659",
+  "stratum": "tas",
+  "title": "AR110659 — აბრებისა და რეკლამების განთავსება / ახალი მშენებლობა",
+  "body_char_len": 568,
+  "qid": "q207"
+ },
+ {
+  "query_type": "paraphrase",
+  "source": "tas",
+  "document_id": "20772",
+  "stratum": "tas",
+  "title": "AR120772 — აბრებისა და რეკლამების განთავსება / ახალი მშენებლობა",
+  "body_char_len": 2383,
+  "qid": "q217"
+ },
+ {
+  "query_type": "keyword",
+  "source": "tas",
+  "document_id": "22466",
+  "stratum": "tas",
+  "title": "AR122466 — 4 მ-მდე სიმაღლის მქონე ღობე / რეკონსტრუქცია",
+  "body_char_len": 2903,
+  "qid": "q223"
+ },
+ {
+  "query_type": "paraphrase",
+  "source": "tas",
+  "document_id": "23273",
+  "stratum": "tas",
+  "title": "AR123273 — მიწის ნაკვეთის სამშენებლოდ გამოყენების პირობების დადგენა",
+  "body_char_len": 5263,
+  "qid": "q250"
+ },
+ {
+  "query_type": "natural_question",
+  "source": "tas",
+  "document_id": "25668",
+  "stratum": "tas",
+  "title": "AR125668 — აბრებისა და რეკლამების განთავსება / ახალი მშენებლობა",
+  "body_char_len": 1893,
+  "qid": "q204"
+ },
+ {
+  "query_type": "paraphrase",
+  "source": "tbappeal",
+  "document_id": "patimroba-rogorts-aghkvetis-ghonisdzieba",
+  "stratum": "tbappeal",
+  "title": "პატიმრობა როგორც აღკვეთის ღონისძიება",
+  "body_char_len": 1690,
+  "qid": "q209"
+ },
+ {
+  "query_type": "natural_question",
+  "source": "tbappeal",
+  "document_id": "sagamodziebo-kolegiis-ganchineba-videochanatseris-datvalierebis-taobaze",
+  "stratum": "tbappeal",
+  "title": "საგამოძიებო კოლეგიის განჩინება ვიდეოჩანაწერის დათვალიერების თაობაზე",
+  "body_char_len": 1924,
+  "qid": "q227"
+ }
+]

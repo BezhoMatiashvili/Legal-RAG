@@ -1,0 +1,92 @@
+[
+ {
+  "query_type": "legal_citation",
+  "source": "matsne",
+  "document_id": "3943682",
+  "stratum": "matsne/consolidated",
+  "title": "სამანდატო, საპროცედურო საკითხთა და ეთიკის კომისიის დებულების დამტკიცების შესახებ",
+  "body_char_len": 9040,
+  "qid": "q496"
+ },
+ {
+  "query_type": "legal_citation",
+  "source": "matsne",
+  "document_id": "39472",
+  "stratum": "matsne/საქართველოს პარლამენტის დადგენილება",
+  "title": "„საქართველოსა და განვითარების საერთაშორისო ასოციაციას შორის განვითარების საკრედიტო ხელშეკრულების“ რატიფიცირების თაობაზე",
+  "body_char_len": 435,
+  "qid": "q470"
+ },
+ {
+  "query_type": "paraphrase",
+  "source": "matsne",
+  "document_id": "39472",
+  "stratum": "matsne/საქართველოს პარლამენტის დადგენილება",
+  "title": "„საქართველოსა და განვითარების საერთაშორისო ასოციაციას შორის განვითარების საკრედიტო ხელშეკრულების“ რატიფიცირების თაობაზე",
+  "body_char_len": 435,
+  "qid": "q487"
+ },
+ {
+  "query_type": "cross_lingual",
+  "source": "matsne",
+  "document_id": "4069854",
+  "stratum": "matsne/consolidated",
+  "title": "ფინანსური ინსტრუმენტების სავაჭრო სისტემის ორგანიზებულ ბაზრად აღიარების წესის დამტკიცების შესახებ",
+  "body_char_len": 15065,
+  "qid": "q459"
+ },
+ {
+  "query_type": "natural_question",
+  "source": "matsne",
+  "document_id": "46192",
+  "stratum": "matsne/საქართველოს პარლამენტის დადგენილება",
+  "title": "„საქონლის დროებითი შემოტანის შესახებ“ კონვენციასთან შეერთების თაობაზე“",
+  "body_char_len": 360,
+  "qid": "q485"
+ },
+ {
+  "query_type": "cross_lingual",
+  "source": "matsne",
+  "document_id": "49960",
+  "stratum": "matsne/consolidated",
+  "title": "„სახელმწიფო ქონების მონაწილეობით (საწესდებო კაპიტალის 50%-ზე მეტი) შექმნილი საწარმოების ლიკვიდაციის წესის შესახებ დებულების დამტკიცების თაობაზე“",
+  "body_char_len": 10769,
+  "qid": "q461"
+ },
+ {
+  "query_type": "legal_citation",
+  "source": "matsne",
+  "document_id": "49960",
+  "stratum": "matsne/consolidated",
+  "title": "„სახელმწიფო ქონების მონაწილეობით (საწესდებო კაპიტალის 50%-ზე მეტი) შექმნილი საწარმოების ლიკვიდაციის წესის შესახებ დებულების დამტკიცების თაობაზე“",
+  "body_char_len": 10769,
+  "qid": "q480"
+ },
+ {
+  "query_type": "cross_lingual",
+  "source": "matsne",
+  "document_id": "5710856",
+  "stratum": "matsne/consolidated",
+  "title": "„პროკურატურის შესახებ“ საქართველოს ორგანულ კანონში ცვლილების შეტანის თაობაზე",
+  "body_char_len": 3405,
+  "qid": "q475"
+ },
+ {
+  "query_type": "natural_question",
+  "source": "matsne",
+  "document_id": "5718394",
+  "stratum": "matsne/საკრებულოს დადგენილება",
+  "title": "„გორის მუნიციპალიტეტის 2023 წლის ბიუჯეტის დამტკიცების შესახებ“\nგორის მუნიციპალიტეტის საკრებულოს 2022 წლის 23 დეკემბრის №43 დადგენილებაში\nცვლილებების შეტანის შესახებ",
+  "body_char_len": 172785,
+  "qid": "q498"
+ },
+ {
+  "query_type": "temporal",
+  "source": "matsne",
+  "document_id": "5740950",
+  "stratum": "matsne/*other",
+  "title": "ბრძანებულება საქართველოს სსრ უმაღლესი საბჭოს პრეზიდიუმისა\nსაქართველოს სსრ სისხლის სამართლის კოდექსის 148-ე მუხლში დამატების შეტანის შესახებ",
+  "body_char_len": 740,
+  "qid": "q462"
+ }
+]
