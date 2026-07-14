@@ -7,10 +7,11 @@ lived in the matsne spider; it is entirely generic, so it is factored out here f
 every spider to inherit.
 """
 
+import hashlib
 import json
 import os
 import sqlite3
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import scrapy
@@ -26,6 +27,15 @@ class BaseLegalSpider(scrapy.Spider):
     # means "already in the vector DB under this id". Subclasses override this; the
     # default ``None`` disables dedup for that spider.
     DEDUP_KEY: tuple[str, ...] | None = None
+    MAX_REFRESHES_PER_RUN = 2_000
+    _SUCCESS_OUTCOMES = frozenset({"success", "legacy_success"})
+    _PENDING_MARKERS = (
+        "pending",
+        "draft",
+        "ასამოქმედებელ",
+        "მოლოდინ",
+        "პროექტ",
+    )
 
     # Safe defaults so is_seen/dedup_key are inert until ``open_dedup_store`` runs
     # (e.g. in unit tests that call parse callbacks without ``from_crawler``).
@@ -124,14 +134,6 @@ class BaseLegalSpider(scrapy.Spider):
         self.latest_dir = self.ARTIFACTS_ROOT / self.name / "latest"
         self.run_dir.mkdir(parents=True, exist_ok=False)
         self.latest_dir.mkdir(parents=True, exist_ok=True)
-        for directory in (
-            self.ARTIFACTS_ROOT,
-            self.ARTIFACTS_ROOT / self.name,
-            self.run_dir.parent,
-            self.run_dir,
-            self.latest_dir,
-        ):
-            directory.chmod(0o700)
 
         self.items_path = self.run_dir / "items.jsonl"
         self.latest_items_path = self.latest_dir / "items.jsonl"
@@ -147,45 +149,164 @@ class BaseLegalSpider(scrapy.Spider):
             },
             priority="spider",
         )
-        settings.set("LOG_FILE", str(self.log_path), priority="spider")
-
         self.open_dedup_store(settings)
         self.write_run_metadata()
 
     # --- cross-run deduplication -------------------------------------------
 
     def open_dedup_store(self, settings):
-        """Open the per-spider SQLite seen-store and load known keys into memory.
+        """Open/migrate the per-spider success store and select bounded refreshes.
 
         Dedup is keyed on ``DEDUP_KEY`` (the same identity ingest uses), so a
         document already scraped in a previous run is skipped before its detail
         page is fetched. Disabled when ``DEDUP_ENABLED`` is False or the spider
         sets no ``DEDUP_KEY`` — in which case ``is_seen`` is always False.
+
+        Legacy ``(key, run_id, ts)`` rows are retained as unverified prior successes
+        and made immediately refresh-due. Generic sources release only the oldest
+        bounded slice each run; Supreme Court keeps its journal-backed all-key model.
         """
         self.dedup_enabled = bool(self.DEDUP_KEY) and settings.getbool(
             "DEDUP_ENABLED", True
         )
         self._seen_keys: set[str] = set()
+        self._refresh_keys: set[str] = set()
+        self._staged_dedup_records: dict[str, dict] = {}
         self._dedup_conn = None
         if not self.dedup_enabled:
             return
 
+        os.umask(0o077)
+        self._dedup_refresh_default_days = max(
+            1, settings.getint("DEDUP_REFRESH_DEFAULT_DAYS", 30)
+        )
+        self._dedup_refresh_tas_days = max(
+            1, settings.getint("DEDUP_REFRESH_TAS_DAYS", 7)
+        )
+        self._dedup_refresh_pending_days = max(
+            1, settings.getint("DEDUP_REFRESH_PENDING_DAYS", 1)
+        )
+        requested_limit = max(0, settings.getint("DEDUP_REFRESH_LIMIT", 2_000))
+        self._dedup_refresh_limit = min(
+            requested_limit, self.MAX_REFRESHES_PER_RUN
+        )
         self.dedup_db_path = self.ARTIFACTS_ROOT / self.name / "seen.sqlite"
         self.dedup_db_path.parent.mkdir(parents=True, exist_ok=True)
         self._dedup_conn = sqlite3.connect(str(self.dedup_db_path))
+        self._dedup_conn.execute("PRAGMA synchronous=FULL")
         self._dedup_conn.execute(
             "CREATE TABLE IF NOT EXISTS seen ("
-            "key TEXT PRIMARY KEY, run_id TEXT, ts TEXT)"
+            "key TEXT PRIMARY KEY, run_id TEXT, ts TEXT, "
+            "last_success TEXT, content_hash TEXT, refresh_deadline TEXT, "
+            "outcome TEXT, content_kind TEXT, content_complete INTEGER, "
+            "source_binary_url TEXT, is_consolidated INTEGER)"
         )
-        self._dedup_conn.commit()
-        self._seen_keys = {
-            row[0] for row in self._dedup_conn.execute("SELECT key FROM seen")
-        }
+        self._migrate_seen_schema()
+        self._load_seen_state()
         self.logger.info(
-            "dedup: loaded %d seen key(s) from %s",
-            len(self._seen_keys),
+            "dedup: loaded %d active key(s), selected %d refresh(es) from %s",
+            self.dedup_seen_count(),
+            len(self._refresh_keys),
             self.dedup_db_path,
         )
+
+    def _dedup_now(self) -> datetime:
+        return datetime.now(UTC)
+
+    @staticmethod
+    def _parse_dedup_timestamp(value, fallback: datetime) -> datetime:
+        if not value:
+            return fallback
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return fallback
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC)
+
+    def _migrate_seen_schema(self) -> None:
+        """Add success-state columns and make legacy rows safely refresh-due."""
+        columns = {
+            row[1] for row in self._dedup_conn.execute("PRAGMA table_info(seen)")
+        }
+        additions = {
+            "last_success": "TEXT",
+            "content_hash": "TEXT",
+            "refresh_deadline": "TEXT",
+            "outcome": "TEXT",
+            "content_kind": "TEXT",
+            "content_complete": "INTEGER",
+            "source_binary_url": "TEXT",
+            "is_consolidated": "INTEGER",
+        }
+        for name, sql_type in additions.items():
+            if name not in columns:
+                self._dedup_conn.execute(
+                    f"ALTER TABLE seen ADD COLUMN {name} {sql_type}"
+                )
+
+        now = self._dedup_now().isoformat()
+        self._dedup_conn.execute(
+            "UPDATE seen SET "
+            "last_success = CASE WHEN ts IS NULL OR trim(ts) = '' THEN ? ELSE ts END, "
+            "content_hash = '', refresh_deadline = ?, outcome = 'legacy_success', "
+            "content_kind = 'legacy_unknown', content_complete = 0, "
+            "source_binary_url = '' WHERE outcome IS NULL",
+            (now, now),
+        )
+        self._dedup_conn.commit()
+
+    def _load_seen_state(self) -> None:
+        if self.name == "supremecourt":
+            # Its fsync journal and reconciliation own retry/completeness semantics.
+            self._seen_keys = {
+                row[0] for row in self._dedup_conn.execute("SELECT key FROM seen")
+            }
+            return
+
+        # The selected slice is bounded; ordinary membership stays in SQLite instead of
+        # materializing the full corpus in Python. ISO-8601 UTC values sort chronologically.
+        rows = self._dedup_conn.execute(
+            "SELECT key FROM seen WHERE "
+            "outcome IN ('success', 'legacy_success', 'incomplete') "
+            "AND refresh_deadline <= ? "
+            "ORDER BY refresh_deadline, last_success, key LIMIT ?",
+            (self._dedup_now().isoformat(), self._dedup_refresh_limit),
+        )
+        self._refresh_keys = {row[0] for row in rows}
+
+    def iter_refresh_keys(self):
+        """Return the bounded, deterministic direct-refresh slice for this run."""
+        return iter(sorted(getattr(self, "_refresh_keys", ())))
+
+    def dedup_refresh_context(self, key: str) -> dict | None:
+        """Return persisted source lineage needed to refresh *key* safely.
+
+        A legacy row can be due without carrying every field required to reproduce
+        its source classification.  Callers must treat a ``None`` field as unknown,
+        rather than inventing a value during a listing-independent refresh.
+        """
+        if not self.dedup_enabled or self._dedup_conn is None:
+            return None
+        row = self._dedup_conn.execute(
+            "SELECT is_consolidated FROM seen WHERE key = ? AND "
+            "outcome IN ('success', 'legacy_success', 'incomplete')",
+            (key,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "is_consolidated": None if row[0] is None else bool(row[0]),
+        }
+
+    def dedup_seen_count(self) -> int:
+        if not self.dedup_enabled or self._dedup_conn is None:
+            return 0
+        row = self._dedup_conn.execute(
+            "SELECT COUNT(*) FROM seen WHERE outcome IN ('success', 'legacy_success')"
+        ).fetchone()
+        return int(row[0]) if row else 0
 
     def dedup_key(self, mapping) -> str | None:
         """Build the dedup identity from ``DEDUP_KEY`` fields of a dict/item.
@@ -205,20 +326,201 @@ class BaseLegalSpider(scrapy.Spider):
 
     def is_seen(self, mapping) -> bool:
         key = self.dedup_key(mapping)
-        return key is not None and key in self._seen_keys
+        if key is None:
+            return False
+        if key in self._seen_keys:
+            return True
+        if key in self._refresh_keys or self._dedup_conn is None:
+            return False
+        row = self._dedup_conn.execute(
+            "SELECT outcome FROM seen WHERE key = ?", (key,)
+        ).fetchone()
+        return bool(row and row[0] in self._SUCCESS_OUTCOMES)
+
+    @staticmethod
+    def _explicitly_incomplete(value) -> bool:
+        if value is False or value == 0:
+            return True
+        return isinstance(value, str) and value.strip().lower() in {
+            "0",
+            "false",
+            "no",
+        }
+
+    def _is_pending_material(self, mapping) -> bool:
+        if str(mapping.get("decision_status_id") or "").strip() == "8":
+            return True
+        text = " ".join(
+            str(mapping.get(field) or "")
+            for field in (
+                "status",
+                "additional_status",
+                "decision",
+                "decision_status",
+                "content_kind",
+            )
+        ).casefold()
+        return any(marker in text for marker in self._PENDING_MARKERS)
+
+    def _refresh_days(self, mapping) -> int:
+        if self._is_pending_material(mapping):
+            return self._dedup_refresh_pending_days
+        if self.name == "tas":
+            return self._dedup_refresh_tas_days
+        return self._dedup_refresh_default_days
+
+    def _dedup_record(self, mapping, *, force_success: bool = False) -> dict:
+        now = self._dedup_now()
+        body = str(mapping.get("body_markdown") or "")
+        content_kind = str(
+            mapping.get("content_kind") or ("full_text" if body.strip() else "missing")
+        )
+        extraction_status = str(mapping.get("extraction_status") or "").lower()
+        summary_only = "summary" in content_kind.lower() or content_kind.lower() in {
+            "metadata_only",
+            "missing",
+        }
+        extraction_incomplete = extraction_status in {
+            "scanned_no_text",
+            "truncated",
+            "malformed",
+            "resource_limited",
+        }
+        source_incomplete = self.name == "tas" and mapping.get(
+            "decision_status_id"
+        ) in (None, "")
+        complete = force_success or (
+            bool(body.strip())
+            and not self._explicitly_incomplete(mapping.get("content_complete"))
+            and not summary_only
+            and not extraction_incomplete
+            and not source_incomplete
+        )
+        outcome = "success" if complete else "incomplete"
+        refresh_deadline = (
+            now + timedelta(days=self._refresh_days(mapping)) if complete else now
+        )
+        raw_is_consolidated = mapping.get("is_consolidated")
+        is_consolidated = (
+            int(raw_is_consolidated)
+            if isinstance(raw_is_consolidated, bool)
+            or (
+                isinstance(raw_is_consolidated, int)
+                and raw_is_consolidated in (0, 1)
+            )
+            else None
+        )
+        return {
+            "key": self.dedup_key(mapping),
+            "run_id": getattr(self, "run_id", ""),
+            "ts": now.isoformat(),
+            "last_success": now.isoformat() if complete else None,
+            "content_hash": hashlib.sha256(body.encode("utf-8")).hexdigest(),
+            "refresh_deadline": refresh_deadline.isoformat(),
+            "outcome": outcome,
+            "content_kind": content_kind,
+            "content_complete": int(complete),
+            "source_binary_url": str(mapping.get("source_binary_url") or ""),
+            "is_consolidated": is_consolidated,
+        }
+
+    def stage_seen(self, mapping) -> bool:
+        """Stage a generic item outcome; return False only for a staged duplicate."""
+        key = self.dedup_key(mapping)
+        if key is None:
+            return True
+        record = self._dedup_record(mapping)
+        previous = self._staged_dedup_records.get(key)
+        if previous is not None:
+            if previous["outcome"] != "success" and record["outcome"] == "success":
+                self._staged_dedup_records[key] = record
+                self._seen_keys.add(key)
+                return True
+            return False
+        self._staged_dedup_records[key] = record
+        if record["outcome"] == "success":
+            self._seen_keys.add(key)
+        return True
+
+    def _persist_dedup_records(self, records: list[dict]) -> None:
+        if self._dedup_conn is None or not records:
+            return
+        sql = (
+            "INSERT INTO seen (key, run_id, ts, last_success, content_hash, "
+            "refresh_deadline, outcome, content_kind, content_complete, "
+            "source_binary_url, is_consolidated) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET run_id=excluded.run_id, ts=excluded.ts, "
+            "last_success=excluded.last_success, content_hash=excluded.content_hash, "
+            "refresh_deadline=excluded.refresh_deadline, outcome=excluded.outcome, "
+            "content_kind=excluded.content_kind, "
+            "content_complete=excluded.content_complete, "
+            "source_binary_url=excluded.source_binary_url, "
+            "is_consolidated=excluded.is_consolidated"
+        )
+        try:
+            self._dedup_conn.execute("BEGIN IMMEDIATE")
+            for original in records:
+                record = dict(original)
+                if record["outcome"] != "success":
+                    prior = self._dedup_conn.execute(
+                        "SELECT last_success, content_hash, is_consolidated "
+                        "FROM seen WHERE key = ?",
+                        (record["key"],),
+                    ).fetchone()
+                    if prior and prior[0]:
+                        record["last_success"] = prior[0]
+                        record["content_hash"] = prior[1]
+                        if record["is_consolidated"] is None:
+                            record["is_consolidated"] = prior[2]
+                self._dedup_conn.execute(
+                    sql,
+                    (
+                        record["key"],
+                        record["run_id"],
+                        record["ts"],
+                        record["last_success"],
+                        record["content_hash"],
+                        record["refresh_deadline"],
+                        record["outcome"],
+                        record["content_kind"],
+                        record["content_complete"],
+                        record["source_binary_url"],
+                        record["is_consolidated"],
+                    ),
+                )
+            self._dedup_conn.commit()
+        except Exception:
+            self._dedup_conn.rollback()
+            raise
+
+    def commit_staged_seen(self) -> int:
+        records = list(self._staged_dedup_records.values())
+        self._persist_dedup_records(records)
+        for record in records:
+            self._refresh_keys.discard(record["key"])
+        self._staged_dedup_records.clear()
+        return len(records)
+
+    def discard_staged_seen(self) -> None:
+        for record in self._staged_dedup_records.values():
+            if record["outcome"] == "success":
+                self._seen_keys.discard(record["key"])
+        self._staged_dedup_records.clear()
 
     def mark_seen(self, mapping) -> bool:
-        """Record a document as scraped. Returns True if it was newly added."""
+        """Immediately persist a success for custom durable pipelines.
+
+        The generic pipeline uses :meth:`stage_seen`; Supreme Court intentionally calls
+        this only after its journal append has been flushed and fsynced.
+        """
         key = self.dedup_key(mapping)
-        if key is None or key in self._seen_keys:
+        if key is None or self.is_seen(mapping):
             return False
+        record = self._dedup_record(mapping, force_success=True)
+        self._persist_dedup_records([record])
         self._seen_keys.add(key)
-        if self._dedup_conn is not None:
-            self._dedup_conn.execute(
-                "INSERT OR IGNORE INTO seen (key, run_id, ts) VALUES (?, ?, ?)",
-                (key, self.run_id, datetime.now(UTC).isoformat()),
-            )
-            self._dedup_conn.commit()
+        self._refresh_keys.discard(key)
         return True
 
     def build_run_id(self) -> str:

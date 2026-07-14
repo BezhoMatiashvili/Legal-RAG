@@ -116,6 +116,10 @@ class ConstcourtItem(scrapy.Item):
     authors = _f()
     college = _f()
     docx_url = _f()
+    source_binary_url = _f()
+    content_kind = _f()
+    content_complete = _f()
+    extraction_status = _f()
     body_markdown = _body()
 
 
@@ -133,6 +137,10 @@ class NaprItem(scrapy.Item):
     decision_date = _f()           # KANC_DATE
     decision_no = _f()             # KANC_NO
     pdf_url = _f()
+    source_binary_url = _f()
+    content_kind = _f()
+    content_complete = _f()
+    extraction_status = _f()
     body_markdown = _body()
 
 
@@ -144,7 +152,12 @@ class TbappealItem(scrapy.Item):
     title = _f()
     date = _f()
     pdf_url = _f()
+    source_binary_url = _f()
     featured_image_url = _f()
+    article_summary = _body()
+    content_kind = _f()
+    content_complete = _f()
+    extraction_status = _f()
     body_markdown = _body()
 
 
@@ -183,6 +196,9 @@ class TasItem(scrapy.Item):
     status = _f()
     nomenclature = _f()
     nomenclature_case_id = _f()
+    content_kind = _f()
+    content_complete = _f()
+    extraction_status = _f()
     body_markdown = _body()
 
     # --- detail: document / decision ----------------------------------------

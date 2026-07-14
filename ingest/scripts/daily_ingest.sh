@@ -17,8 +17,8 @@
 #         DAILY_INGEST_LOOKBACK_DAYS  scrape window (default 14; dedup makes wider safe —
 #                                     run a wide sweep monthly to catch late-published docs)
 #         DAILY_INGEST_{SCRAPE,EMBED,VERIFY}_TIMEOUT  per-stage timeout(1) values
-#         DAILY_INGEST_REQUIRE_APPROVAL=1 makes non-dry runs require
-#         DAILY_INGEST_APPROVED=1.  The systemd unit enables this fail-closed guard.
+#         DAILY_INGEST_APPROVED=1 is required for every non-dry run. Set it only after
+#                                     completing the deployment runbook gate.
 
 set -euo pipefail
 umask 077
@@ -28,6 +28,7 @@ INGEST_DIR="$(dirname "$SCRIPT_DIR")"
 REPO_ROOT="$(dirname "$INGEST_DIR")"
 STATE_DIR="$INGEST_DIR/.state"
 LOG_FILE="$STATE_DIR/daily_ingest.log"
+ROTATING_TEE=("$INGEST_DIR/.venv/bin/python" "$SCRIPT_DIR/rotating_tee.py" "$LOG_FILE")
 LOCK_DIR="$REPO_ROOT/coordination/locks"
 OWNER="daily-ingest[$$]"
 
@@ -45,16 +46,18 @@ for arg in "$@"; do
     esac
 done
 
-if [ "$DRY_RUN" -eq 0 ] \
-    && [ "${DAILY_INGEST_REQUIRE_APPROVAL:-0}" = "1" ] \
-    && [ "${DAILY_INGEST_APPROVED:-0}" != "1" ]; then
-    echo "daily ingest refused: integrity verification and corpus re-baseline approval are pending" >&2
-    echo "set DAILY_INGEST_APPROVED=1 only after completing the deployment runbook gate" >&2
+if [ "$DRY_RUN" -eq 0 ]; then
+    if [ "${DAILY_INGEST_APPROVED:-0}" != "1" ]; then
+        echo "daily ingest refused: integrity verification and corpus re-baseline approval are pending" >&2
+        echo "set DAILY_INGEST_APPROVED=1 only after completing the deployment runbook gate" >&2
+        exit 78
+    fi
+    echo "daily ingest refused: direct writes to a serving corpus remain disabled; build a new immutable generation" >&2
     exit 78
 fi
 
 mkdir -p "$STATE_DIR"
-log() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" | tee -a "$LOG_FILE"; }
+log() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" | "${ROTATING_TEE[@]}"; }
 
 # --- self-exclusion -----------------------------------------------------------------
 exec 9>"$STATE_DIR/daily_ingest.flock"
@@ -152,7 +155,7 @@ acquire_locks
 log "=== daily_ingest start (sources: $SOURCES; window: $START_DATE..today) ==="
 
 STAGE="qdrant-up"
-(cd "$INGEST_DIR" && docker compose up -d) 2>&1 | tee -a "$LOG_FILE"
+(cd "$INGEST_DIR" && docker compose up -d) 2>&1 | "${ROTATING_TEE[@]}"
 wait_green 900 || { log "Qdrant never reached green"; exit 1; }
 
 STAGE="scrape"
@@ -160,7 +163,7 @@ log "--- stage 1/3: scrape ---"
 # shellcheck disable=SC2086  # SOURCES is intentionally word-split
 (cd "$REPO_ROOT/scraper" && timeout "$SCRAPE_TIMEOUT" \
     "$REPO_ROOT/.venv/bin/python" -m legal_scrapers.run \
-    --only $SOURCES --start-date "$START_DATE" --no-progress) 2>&1 | tee -a "$LOG_FILE"
+    --only $SOURCES --start-date "$START_DATE" --no-progress) 2>&1 | "${ROTATING_TEE[@]}"
 
 STAGE="embed"
 log "--- stage 2/3: embed delta (CPU) ---"
@@ -168,13 +171,13 @@ log "--- stage 2/3: embed delta (CPU) ---"
 # ever appeared, and supremecourt is excluded from the corpus by design.
 for src in $SOURCES; do
     (cd "$INGEST_DIR" && OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}" MKL_NUM_THREADS="${MKL_NUM_THREADS:-8}" \
-        timeout "$EMBED_TIMEOUT" .venv/bin/python -m ingest watch --source "$src" --once) 2>&1 | tee -a "$LOG_FILE"
+        timeout "$EMBED_TIMEOUT" .venv/bin/python -m ingest watch --source "$src" --once) 2>&1 | "${ROTATING_TEE[@]}"
 done
 
 STAGE="verify"
 log "--- stage 3/3: verify coverage ---"
 (cd "$INGEST_DIR" && timeout "$VERIFY_TIMEOUT" \
-    .venv/bin/python scripts/verify_all_embedded.py) 2>&1 | tee -a "$LOG_FILE"
+    .venv/bin/python scripts/verify_all_embedded.py) 2>&1 | "${ROTATING_TEE[@]}"
 
 STAGE="done"
 log "=== daily_ingest OK ==="

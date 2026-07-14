@@ -1,0 +1,508 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Claude Sessions & RAG Monitor</title>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --panel2:#1c2230; --border:#2b3440;
+    --fg:#e6edf3; --dim:#8b98a5; --faint:#5b6570;
+    --green:#3fb950; --amber:#d29922; --red:#f85149; --blue:#58a6ff; --purple:#bc8cff;
+    --mono:'SF Mono',ui-monospace,'JetBrains Mono',Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+    font:14px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;}
+  a{color:var(--blue)}
+  .wrap{max-width:1400px;margin:0 auto;padding:18px 20px 60px}
+  header{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:18px}
+  header h1{font-size:18px;margin:0;font-weight:650;letter-spacing:.2px}
+  .sub{color:var(--dim);font-size:12.5px}
+  .live{display:inline-flex;align-items:center;gap:6px;color:var(--dim);font-size:12px;margin-left:auto}
+  .dot{width:9px;height:9px;border-radius:50%;background:var(--green);box-shadow:0 0 0 0 rgba(63,185,80,.6);animation:pulse 2s infinite}
+  .dot.off{background:var(--red);animation:none}
+  @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(63,185,80,.5)}70%{box-shadow:0 0 0 7px rgba(63,185,80,0)}100%{box-shadow:0 0 0 0 rgba(63,185,80,0)}}
+
+  .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;margin-bottom:18px}
+  .tile{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:13px 15px}
+  .tile .lab{font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:var(--faint);font-weight:600}
+  .tile .big{font-size:23px;font-weight:680;margin-top:3px;font-variant-numeric:tabular-nums}
+  .tile .big small{font-size:13px;color:var(--dim);font-weight:500}
+  .bar{height:7px;border-radius:5px;background:#0a0e14;margin-top:9px;overflow:hidden;border:1px solid var(--border)}
+  .bar>span{display:block;height:100%;border-radius:5px;transition:width .5s ease}
+  .ok{color:var(--green)} .warn{color:var(--amber)} .bad{color:var(--red)} .muted{color:var(--dim)}
+
+  h2.section{font-size:12px;text-transform:uppercase;letter-spacing:.8px;color:var(--faint);
+    margin:22px 0 11px;font-weight:700}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(420px,1fr));gap:14px}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:15px 16px;
+    border-left:3px solid var(--faint)}
+  .card.working{border-left-color:var(--green)}
+  .card.waiting{border-left-color:var(--amber)}
+  .card.idle{border-left-color:var(--faint);opacity:.72}
+  .chead{display:flex;align-items:center;gap:9px}
+  .chead .title{font-weight:650;font-size:15px}
+  .badge{font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;
+    padding:3px 8px;border-radius:20px;white-space:nowrap}
+  .badge.working{background:rgba(63,185,80,.16);color:var(--green)}
+  .badge.waiting{background:rgba(210,153,34,.16);color:var(--amber)}
+  .badge.idle{background:rgba(139,152,165,.13);color:var(--dim)}
+  .meta{color:var(--dim);font-size:12px;margin-top:3px;display:flex;gap:10px;flex-wrap:wrap}
+  .chip{background:var(--panel2);border:1px solid var(--border);border-radius:6px;padding:1px 7px;
+    font-family:var(--mono);font-size:11px;color:var(--dim)}
+  .chip.warn{color:var(--amber)} .chip.bad{color:var(--red)} .chip.ok{color:var(--green)}
+
+  /* pipeline step tracker */
+  .steps{display:flex;align-items:center;gap:7px;flex-wrap:wrap;margin-top:11px}
+  .step{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;font-weight:600;
+    padding:3px 10px;border-radius:20px;border:1px solid var(--border);color:var(--faint);
+    background:var(--panel2)}
+  .step.done{color:var(--green);border-color:rgba(63,185,80,.4)}
+  .step.active{color:var(--amber);border-color:rgba(210,153,34,.55);
+    box-shadow:0 0 0 0 rgba(210,153,34,.4);animation:steppulse 1.6s infinite}
+  .step.failed{color:var(--red);border-color:rgba(248,81,73,.5)}
+  .step-arrow{color:var(--faint);font-size:11px}
+  @keyframes steppulse{0%{box-shadow:0 0 0 0 rgba(210,153,34,.35)}
+    70%{box-shadow:0 0 0 6px rgba(210,153,34,0)}100%{box-shadow:0 0 0 0 rgba(210,153,34,0)}}
+  .said{margin:11px 0 4px;font-size:12.5px;color:#c9d4e0;background:var(--panel2);
+    border:1px solid var(--border);border-radius:8px;padding:8px 10px;max-height:66px;overflow:hidden}
+  .prog{margin-top:12px}
+  .prog .plab{display:flex;justify-content:space-between;font-size:11.5px;color:var(--dim);margin-bottom:5px}
+  .tasks{margin-top:9px;display:flex;flex-direction:column;gap:3px;max-height:172px;overflow:auto}
+  .task{display:flex;gap:7px;align-items:baseline;font-size:12.5px}
+  .task .ic{width:13px;text-align:center;flex:none}
+  .task.completed{color:var(--faint)} .task.completed .tx{text-decoration:line-through}
+  .task.in_progress{color:var(--fg);font-weight:600}
+  .task.in_progress .ic{color:var(--amber)}
+  .task.completed .ic{color:var(--green)}
+  .task.pending .ic{color:var(--faint)}
+  .feed{margin-top:12px;border-top:1px solid var(--border);padding-top:9px;
+    display:flex;flex-direction:column;gap:4px;max-height:190px;overflow:auto}
+  .fitem{display:flex;gap:9px;font-size:12px;align-items:baseline}
+  .fitem .ft{color:var(--faint);font-family:var(--mono);font-size:11px;flex:none;width:42px;text-align:right}
+  .fitem .fl{color:#c2ccd6}
+  .fitem .tg{font-family:var(--mono);font-size:10px;color:var(--faint);flex:none}
+  .tool-Bash{color:var(--blue)} .tool-Edit,.tool-Write{color:var(--purple)}
+  .tool-TaskUpdate,.tool-TaskCreate{color:var(--amber)} .tool-AskUserQuestion{color:var(--green)}
+
+  .two{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  @media(max-width:820px){.two{grid-template-columns:1fr}}
+  table{width:100%;border-collapse:collapse;font-size:12.5px}
+  td{padding:3px 4px;border-bottom:1px solid var(--border)}
+  td.r{text-align:right;font-variant-numeric:tabular-nums;font-family:var(--mono);color:var(--dim)}
+  .q{font-family:var(--mono);font-size:12px}
+  .empty{color:var(--faint);font-size:12.5px;padding:6px 2px}
+
+  /* process monitor */
+  .ptools{display:flex;gap:9px;align-items:center;margin-bottom:10px;flex-wrap:wrap}
+  .ptools>span{font-size:11px;color:var(--faint);text-transform:uppercase;letter-spacing:.5px}
+  #pfilter{background:#0a0e14;border:1px solid var(--border);border-radius:7px;color:var(--fg);
+    padding:6px 11px;font-size:12.5px;min-width:230px;flex:1;font-family:var(--mono)}
+  #pfilter:focus{outline:none;border-color:var(--blue)}
+  .sb{background:var(--panel2);border:1px solid var(--border);color:var(--dim);border-radius:6px;
+    padding:5px 11px;font-size:11.5px;cursor:pointer;font-weight:600}
+  .sb.on{color:var(--fg);border-color:var(--blue);background:rgba(88,166,255,.12)}
+  .ptable{max-height:420px;overflow:auto;border:1px solid var(--border);border-radius:8px}
+  table.ptab{width:100%;border-collapse:collapse;font-size:12px}
+  table.ptab thead th{position:sticky;top:0;z-index:1;background:var(--panel2);text-align:left;
+    padding:7px 9px;font-size:10.5px;text-transform:uppercase;letter-spacing:.5px;color:var(--faint);
+    border-bottom:1px solid var(--border)}
+  table.ptab td{padding:3px 9px;border-bottom:1px solid #1b222b;font-family:var(--mono);white-space:nowrap}
+  table.ptab tr:hover td{background:#1a212b}
+  td.cmd{overflow:hidden;text-overflow:ellipsis;max-width:560px;color:#c2ccd6}
+  td.hot{color:var(--amber);font-weight:700}
+  td.bigrss{color:var(--red);font-weight:700}
+  tr.mine td.cmd{color:var(--blue)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>🖥 Claude Sessions &amp; RAG Monitor</h1>
+    <span class="sub" id="proj"></span>
+    <span class="live"><span class="dot" id="dot"></span><span id="upd">connecting…</span></span>
+  </header>
+
+  <div class="tiles" id="tiles"></div>
+
+  <h2 class="section">Pipeline · scrape → GPU embed</h2>
+  <div class="two" style="margin-bottom:6px">
+    <div class="card" id="scrapecard"><div class="empty">no matsne run yet</div></div>
+    <div class="card" id="gpucard"><div class="empty">no delta-embed run yet</div></div>
+  </div>
+
+  <h2 class="section">Pipeline · I6 v2 re-embed (delta → re-baseline → GPU re-embed → gate)</h2>
+  <div class="two" style="margin-bottom:6px">
+    <div class="card" id="deltacard"><div class="empty">no post-scrape delta embed yet</div></div>
+    <div class="card" id="reembedcard"><div class="empty">I6 orchestrator not launched yet</div></div>
+  </div>
+
+  <h2 class="section">Embedding coverage → Qdrant</h2>
+  <div class="card" id="covcard" style="margin-bottom:6px">
+    <div class="empty">no coverage report yet — run <code>scripts/verify_all_embedded.py</code></div>
+  </div>
+
+  <h2 class="section">Recent legal_search latencies</h2>
+  <div class="tile"><table id="queries"></table></div>
+
+  <h2 class="section">All processes <span class="muted" id="procount"></span></h2>
+  <div class="tile">
+    <div class="ptools">
+      <input id="pfilter" placeholder="filter… e.g. python, ingest, mcp, bash, qdrant, chrome">
+      <span>sort</span>
+      <button class="sb on" data-k="rss_mb">MEM</button>
+      <button class="sb" data-k="cpu">CPU</button>
+      <button class="sb" data-k="pid">PID</button>
+    </div>
+    <div class="ptable">
+      <table class="ptab">
+        <thead><tr>
+          <th>PID</th><th>PPID</th><th class="r">CPU%</th><th class="r">MEM</th>
+          <th>UPTIME</th><th>COMMAND</th>
+        </tr></thead>
+        <tbody id="proctable"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <h2 class="section" id="sesshdr">Sessions</h2>
+  <div class="grid" id="sessions"></div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => (s??'').toString().replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+
+function ago(sec){
+  if(sec<60) return sec+'s';
+  if(sec<3600) return Math.floor(sec/60)+'m '+(sec%60)+'s';
+  const h=Math.floor(sec/3600); return h+'h '+Math.floor((sec%3600)/60)+'m';
+}
+function relTs(iso){
+  if(!iso) return '';
+  const s=Math.max(0,Math.round((Date.now()-new Date(iso).getTime())/1000));
+  return s<60?s+'s':(s<3600?Math.floor(s/60)+'m':Math.floor(s/3600)+'h');
+}
+function cls(pct){ return pct>=90?'bad':pct>=70?'warn':'ok'; }
+function barcolor(pct){ return pct>=90?'var(--red)':pct>=70?'var(--amber)':'var(--green)'; }
+
+function tile(lab, big, sub, pct){
+  let bar='';
+  if(pct!=null) bar=`<div class="bar"><span style="width:${Math.min(100,pct)}%;background:${barcolor(pct)}"></span></div>`;
+  return `<div class="tile"><div class="lab">${lab}</div>
+    <div class="big ${pct!=null?cls(pct):''}">${big}${sub?` <small>${sub}</small>`:''}</div>${bar}</div>`;
+}
+
+function render(s){
+  $('proj').textContent = '· '+(s.projShort||'');
+  $('upd').textContent = 'updated '+s.now+' · every 3s';
+  $('dot').classList.remove('off');
+
+  const sy=s.system, rag=s.rag, pod=rag.pod, sls=rag.serverless||{};
+  // Serverless endpoint card (replaces the old SSH-tunnel GPU pod when configured).
+  let gpuLab='GPU rerank pod', gpuTxt, gpuSub;
+  if (sls.configured){
+    gpuLab='Serverless GPU';
+    const w=sls.workers||{}, running=(w.running||0), idle=(w.idle||0);
+    gpuTxt = !sls.up ? `<span class="bad">● unreachable</span>`
+      : running ? `<span class="ok">● busy</span>`
+      : idle ? `<span class="ok">● warm</span>`
+      : `<span class="warn">● scaled to zero</span>`;
+    gpuSub = (sls.backend==='remote'?'remote mode':'local mode')
+      + (sls.published?` · ${(sls.published.points/1e6).toFixed(2)}M pts published`:'');
+  } else {
+    gpuTxt = pod.up ? `<span class="ok">● up</span>` : `<span class="bad">● down</span>`;
+    gpuSub = pod.up ? (pod.device||'') : 'CPU / RRF fallback';
+  }
+  $('tiles').innerHTML =
+    tile('RAM', sy.ram_used_gb+'<small>/'+sy.ram_total_gb+' GB</small>', sy.ram_pct+'%', sy.ram_pct) +
+    tile('Swap', sy.swap_used_gb+'<small>/'+sy.swap_total_gb+' GB</small>', sy.swap_pct+'%', sy.swap_pct) +
+    tile('Load (1m)', sy.load, 'cores busy', null) +
+    tile(gpuLab, gpuTxt, gpuSub, null) +
+    tile('MCP servers', rag.mcp_count, (rag.mcp_rss_gb||0)+' GB · '+(rag.mcp_cpu||0)+'% cpu', null) +
+    qdrantTile(s.qdrant||{}, rag);
+
+  renderScrape(s.scrape||{active:false});
+  renderGpu(s.gpu||{active:false});
+  renderCoverage(s.coverage||{}, s.qdrant||{}, s.gpu||{});
+  renderReembed(s.reembed||{});
+
+  lastProcs = s.processes || [];
+  renderProcs();
+
+  $('queries').innerHTML = (rag.queries||[]).length ? rag.queries.map(q=>{
+    const c = q.latency_s>60?'bad':q.latency_s>10?'warn':'ok';
+    return `<tr><td class="q">${esc(q.q)}</td><td class="r ${c}">${q.latency_s}s</td>
+      <td class="r">${esc(q.route||'')}</td></tr>`;
+  }).join('') : '<tr><td class="empty">no queries logged yet</td></tr>';
+
+  const sess = s.sessions||[];
+  $('sesshdr').textContent = `Sessions (${sess.filter(x=>x.status!=='idle').length} active)`;
+  $('sessions').innerHTML = sess.map(card).join('') || '<div class="empty">no recent sessions</div>';
+}
+
+function card(s){
+  const badge = {working:'working',waiting:'waiting for you',idle:'idle'}[s.status]||s.status;
+  const tasks = (s.tasks||[]).map(t=>{
+    const ic = t.status==='completed'?'✓':t.status==='in_progress'?'▶':'○';
+    return `<div class="task ${t.status}"><span class="ic">${ic}</span>
+      <span class="tx">${esc(t.subject)}</span></div>`;
+  }).join('');
+  const prog = s.task_total ? `<div class="prog">
+      <div class="plab"><span>To-do</span><span>${s.task_done}/${s.task_total} done</span></div>
+      <div class="bar"><span style="width:${Math.round(100*s.task_done/s.task_total)}%;background:var(--green)"></span></div>
+      <div class="tasks">${tasks}</div></div>` : '';
+  const feed = (s.feed||[]).map(f=>
+    `<div class="fitem"><span class="ft">${relTs(f.t)}</span>
+      <span class="fl">${esc(f.label)}</span>
+      <span class="tg tool-${esc(f.tool)}">${esc(f.tool)}</span></div>`).join('')
+    || '<div class="empty">no tool activity</div>';
+  const said = s.last_text ? `<div class="said">💬 ${esc(s.last_text)}</div>` : '';
+  return `<div class="card ${s.status}">
+    <div class="chead">
+      <span class="title">${esc(s.slug)}</span>
+      <span class="badge ${s.status}">${badge}</span>
+    </div>
+    <div class="meta">
+      <span class="chip">${esc(s.short)}</span>
+      <span class="chip">⎇ ${esc(s.branch)}</span>
+      <span>⏱ ${ago(s.age_s)} ago</span>
+      <span>${s.messages} msgs</span>
+    </div>
+    ${said}${prog}
+    <div class="feed">${feed}</div>
+  </div>`;
+}
+
+function qdrantTile(qd, rag){
+  if(!('up' in qd))   // old server process without the qdrant field — not a real outage
+    return tile('Qdrant', (rag.qdrant_gb!=null?rag.qdrant_gb:'–'), 'GB resident', null);
+  if(!qd.up) return tile('Qdrant', '<span class="bad">● down</span>',
+    (rag.qdrant_gb!=null?rag.qdrant_gb+' GB resident':''), null);
+  const stC = qd.status==='green'?'ok':qd.status==='yellow'?'warn':'bad';
+  const pts = qd.points!=null ? (qd.points/1e6).toFixed(2)+'M' : '–';
+  return tile('Qdrant · georgian_legal', pts+'<small> pts</small>',
+    `<span class="${stC}">● ${qd.status||'?'}</span> · ${(rag.qdrant_gb!=null?rag.qdrant_gb+' GB':'')}`
+    + (qd.delta_points!=null?` · delta ${(qd.delta_points/1e3).toFixed(0)}k`:''), null);
+}
+
+// Chain tracker: embed (GPU) → pull snapshot → restore → merge → verify.
+// Phase states come from the orchestrator log (gpu.*) + live process checks (cov.*).
+function covSteps(cov, g){
+  const anyLive = (g.active&&g.orchestrator_alive&&!g.done) || cov.merge_running || cov.verify_running;
+  if(!anyLive) return '';
+  const phase=g.phase||'';
+  const EMBED=['starting','packaged','booting pod','uploading payload','embedding on GPU'];
+  const PULL=['snapshotting','downloading snapshot'];
+  const RESTORE=['verifying + restoring','restoring locally'];
+  const failed=phase.startsWith('FAILED');
+  let idx; // index of the active step
+  if(cov.verify_running) idx=4;
+  else if(cov.merge_running) idx=3;
+  else if(g.done) idx=3;                    // orchestrator finished, merge about to start
+  else if(RESTORE.includes(phase)) idx=2;
+  else if(PULL.includes(phase)) idx=1;
+  else idx=0;
+  const names=['embed on GPU','pull snapshot','restore','merge → main','verify'];
+  const icons=['⚡','⬇','📦','🔀','✔'];
+  const steps=names.map((n,i)=>{
+    const st=i<idx?'done':i===idx?(failed&&i===0?'failed':'active'):'';
+    const ic=i<idx?'✓':icons[i];
+    return `<span class="step ${st}">${ic} ${n}</span>`;
+  }).join('<span class="step-arrow">→</span>');
+  const detail=cov.verify_running?cov.verify_detail:cov.merge_running?cov.merge_detail:null;
+  return `<div class="steps">${steps}</div>`
+    +(detail?`<div class="said" style="margin-top:8px">⏳ ${esc(detail)}</div>`:'');
+}
+
+function renderReembed(r){
+  const d = r.delta, o = r.orch;
+  if (d){
+    const cls = /complete/.test(d.stage) ? 'ok' : (/gone/.test(d.stage) ? 'bad' : 'warn');
+    $('deltacard').innerHTML =
+      `<div><b>GPU delta · complete live (4,370 missing docs)</b> <span class="chip ${cls}">${esc(d.stage)}</span></div>
+       ${d.cost?`<div class="muted" style="margin-top:4px;font-size:12px">cost: ${esc(d.cost)}</div>`:''}
+       <div class="muted" style="margin-top:7px;font-size:12px">${esc(d.tail||'')}</div>`;
+  }
+  if (o){
+    const v = o.verdict;
+    const cls = /complete|PASS|restored/.test(o.stage) ? 'ok' : (/FAIL|gone/.test(o.stage) ? 'bad' : 'warn');
+    let vhtml = '';
+    const p = o.progress;
+    if (p && p.embedded != null){
+      const pct = p.pct || 0;
+      vhtml += `<div style="margin-top:8px">
+        <div style="display:flex;justify-content:space-between;font-size:12px;color:#c9d4e0">
+          <span><b>${p.embedded.toLocaleString()}</b> / ${p.total.toLocaleString()} embedded</span>
+          <span>${p.remaining.toLocaleString()} remaining · ${pct}%</span></div>
+        <div style="height:9px;background:var(--panel2);border:1px solid var(--border);border-radius:5px;overflow:hidden;margin-top:3px">
+          <div style="height:100%;width:${pct}%;background:var(--green)"></div></div></div>`;
+    }
+    if (v && v.rerank){
+      vhtml = `<div style="margin-top:6px;font-size:12.5px">gate: <b class="${v.pass?'ok':'bad'}">${v.pass?'PASS':'FAIL'}</b>
+        · rerank nDCG@10 <b>${(v.rerank.ndcg10||0).toFixed(3)}</b> (v1: 0.320)
+        · R@10 <b>${(v.rerank.recall10||0).toFixed(3)}</b></div>`;
+    }
+    $('reembedcard').innerHTML =
+      `<div><b>I6 orchestrator (v2 headers, 4-GPU)</b> <span class="chip ${cls}">${esc(o.stage)}</span></div>
+       ${vhtml}
+       ${o.cost?`<div class="muted" style="margin-top:4px;font-size:12px">cost: ${esc(o.cost)}</div>`:''}
+       <div class="muted" style="margin-top:7px;font-size:12px">${esc(o.tail||'')}</div>`;
+  }
+}
+
+function renderCoverage(cov, qd, gpu){
+  const el=$('covcard');
+  const r=cov.report, b2=cov.batch2||{};
+  // badge: live verify > report verdict > nothing
+  let badgeCls='idle', badgeTxt='no report yet';
+  if(cov.verify_running){ badgeCls='working'; badgeTxt='verifying…'; }
+  else if(r && r.total_missing===0){ badgeCls='working'; badgeTxt='all embedded ✓'; }
+  else if(r){ badgeCls='waiting'; badgeTxt=r.total_missing.toLocaleString()+' missing'; }
+  el.className='card '+(cov.verify_running?'working':!r?'idle':r.total_missing===0?'':'waiting');
+
+  const chips=[
+    qd.points!=null?`<span class="chip">${qd.points.toLocaleString()} points</span>`:'',
+    qd.status?`<span class="chip ${qd.status==='green'?'':'warn'}">index ${esc(qd.status)}</span>`:'',
+    qd.delta_points!=null?`<span class="chip">delta collection ${qd.delta_points.toLocaleString()} pts</span>`:'',
+    r?`<span class="chip">verified ${esc(r.generated_at)} @ ${(r.points_count/1e6).toFixed(2)}M pts</span>`:'',
+  ].filter(Boolean).join('');
+
+  const steps = covSteps(cov, gpu);
+  let batch='';
+  if(b2.active){
+    const st=b2.stage||'?';
+    const bc = st==='complete'?'ok':st.startsWith('FAILED')?'bad':'warn';
+    batch=`<div class="said">⚙ batch-2 embed pipeline: <b class="${bc}">${esc(st)}</b>`
+      +(b2.tail_docs!=null?` — ${b2.tail_docs.toLocaleString()} docs queued`:'')
+      +(steps&&r?` · <span class="muted">coverage numbers below are from the last verify — they refresh when the chain's final verify lands</span>`:'')
+      +`</div>`;
+  }
+
+  let rows='';
+  if(r && r.per_source){
+    rows='<div style="margin-top:12px">'+Object.entries(r.per_source).map(([src,v])=>{
+      const pct = v.scraped_docs ? Math.floor(100*v.embedded_docs/v.scraped_docs) : 100;
+      const miss = v.missing ? `<span class="bad">${v.missing.toLocaleString()} missing</span>`
+                             : '<span class="ok">✓</span>';
+      const nt = (v.no_text ? ` · <span class="muted">${v.no_text} no-text</span>` : '')
+        + (v.quarantined ? ` · <span class="muted">${v.quarantined} quarantined</span>` : '');
+      return `<div class="prog" style="margin-top:7px">
+        <div class="plab"><span><b>${esc(src)}</b> — ${v.embedded_docs.toLocaleString()} / ${v.scraped_docs.toLocaleString()} docs</span>
+        <span>${miss}${nt} · ${pct}%</span></div>
+        <div class="bar"><span style="width:${pct}%;background:${v.missing?'var(--amber)':'var(--green)'}"></span></div>
+      </div>`;
+    }).join('')+'</div>';
+  }
+  const total = r?`<div class="meta" style="margin-top:9px"><span>total scraped docs: <b>${r.total_scraped_docs.toLocaleString()}</b></span>
+    <span>embedded: <b>${(r.total_scraped_docs-r.total_missing-(r.total_no_text||0)-(r.total_quarantined||0)).toLocaleString()}</b></span>
+    <span class="${r.total_missing?'bad':'ok'}">missing: <b>${r.total_missing.toLocaleString()}</b></span>
+    ${r.total_no_text?`<span class="muted">empty-body (unembeddable): <b>${r.total_no_text}</b></span>`:''}
+    ${r.total_quarantined?`<span class="muted">quarantined by hygiene: <b>${r.total_quarantined}</b></span>`:''}</div>`:'';
+
+  el.innerHTML=`<div class="chead"><span class="title">Embedding coverage — all sources → georgian_legal</span>
+      <span class="badge ${badgeCls}">${badgeTxt}</span></div>
+    <div class="meta">${chips}</div>${steps}${batch}${total}${rows}`;
+}
+
+function renderScrape(sc){
+  const el=$('scrapecard');
+  if(!sc.active){ el.innerHTML='<div class="empty">no matsne run yet</div>'; return; }
+  const state = sc.alive?'crawling':(sc.finished?'finished':'stopped');
+  el.className='card '+(sc.alive?'working':sc.finished?'':'waiting');
+  const chips=[
+    `<span class="chip">${esc((sc.run||'').slice(0,16))}</span>`,
+    sc.pages!=null?`<span class="chip">${sc.pages.toLocaleString()} pages</span>`:'',
+    sc.pages_min!=null?`<span class="chip">${sc.pages_min} pages/min</span>`:'',
+    sc.items_min!=null?`<span class="chip">${sc.items_min} items/min</span>`:'',
+    `<span class="chip ${sc.errors?'bad':''}">${sc.errors||0} errors</span>`,
+  ].filter(Boolean).join('');
+  const cov = sc.coverage_pct!=null?`<div class="prog">
+      <div class="plab"><span>corpus coverage — seen ${sc.seen_total.toLocaleString()} / ~${sc.advertised.toLocaleString()} advertised</span>
+      <span>${sc.coverage_pct}%</span></div>
+      <div class="bar"><span style="width:${Math.min(100,sc.coverage_pct)}%;background:var(--blue)"></span></div></div>`:'';
+  el.innerHTML=`<div class="chead"><span class="title">Scrape — ${(sc.items||0).toLocaleString()} docs this run</span>
+      <span class="badge ${sc.alive?'working':'idle'}">${state}</span></div>
+    <div class="meta">${chips}</div>${cov}`;
+}
+
+function renderGpu(g){
+  const el=$('gpucard');
+  if(!g.active){ el.innerHTML='<div class="empty">no delta-embed run yet</div>'; return; }
+  const done=!!g.done, failed=(g.phase||'').startsWith('FAILED')||g.phase==='exited';
+  el.className='card '+(done?'':failed?'waiting':'working');
+  const badgeCls=done?'working':failed?'waiting':'working';
+  const badgeTxt=done?'complete':esc(g.phase||'?');
+  // progress bar: upload % while uploading, real pod-side point count while embedding
+  let pct=null, plab='';
+  if(g.upload_pct!=null){ pct=g.upload_pct; plab=`upload ${g.upload_mb||'?'} / ${g.payload_mb} MB`; }
+  else if(g.embed_pct!=null){ pct=g.embed_pct;
+    plab=`embedded ${(g.points_so_far||0).toLocaleString()} / ~${(g.est_total_points||0).toLocaleString()} chunks`; }
+  else if(done){ pct=100; plab='done'; }
+  const bar=pct!=null?`<div class="prog"><div class="plab"><span>${plab}</span><span>${pct}%</span></div>
+    <div class="bar"><span style="width:${pct}%;background:${failed?'var(--amber)':'var(--green)'}"></span></div></div>`:'';
+  const chips=[
+    g.pod?`<span class="chip">pod ${esc(g.pod)}</span>`:'',
+    g.gpu?`<span class="chip">${esc(g.gpu)}</span>`:'',
+    g.price_hr!=null?`<span class="chip">$${g.price_hr}/hr</span>`:'',
+    g.pod_uptime_min!=null?`<span class="chip">⏱ ${g.pod_uptime_min} min</span>`:'',
+    g.cost_so_far!=null?`<span class="chip">≈$${g.cost_so_far}</span>`:'',
+    g.items?`<span class="chip">${g.items.toLocaleString()} docs</span>`:'',
+    g.points?`<span class="chip">${g.points.toLocaleString()} points</span>`:'',
+    g.balance!=null?`<span class="chip">balance $${(+g.balance).toFixed(2)}</span>`:'',
+    g.open_pods!=null?`<span class="chip ${g.open_pods&&(done||g.pod_terminated)?'bad':''}">${g.open_pods} open pod${g.open_pods===1?'':'s'}</span>`:'',
+  ].filter(Boolean).join('');
+  const detail=g.detail?`<div class="said">⚙ ${esc(g.detail)}</div>`:'';
+  const g2=g.g2?`<div class="said">✔ ${esc(g.g2)}</div>`:'';
+  const cost=g.cost_line?`<div class="said">💰 ${esc(g.cost_line)}</div>`:'';
+  const orch=g.orchestrator_alive?'':'<span class="chip">orchestrator not running</span>';
+  el.innerHTML=`<div class="chead"><span class="title">Delta embed → georgian_legal_delta</span>
+      <span class="badge ${badgeCls}">${badgeTxt}</span></div>
+    <div class="meta">${chips}${orch}<span class="chip">${esc(g.log||'')}</span></div>
+    ${bar}${detail}${g2}${cost}`;
+}
+
+let lastProcs=[], procSort='rss_mb', procFilter='';
+function renderProcs(){
+  const cont=document.querySelector('.ptable'); const sc=cont?cont.scrollTop:0;
+  let rows=lastProcs.slice();
+  if(procFilter){ const f=procFilter.toLowerCase();
+    rows=rows.filter(p=>(p.cmd||'').toLowerCase().includes(f)); }
+  rows.sort((a,b)=> procSort==='pid' ? a.pid-b.pid : b[procSort]-a[procSort]);
+  const tot=lastProcs.reduce((s,p)=>s+p.rss_mb,0);
+  $('procount').textContent = `— ${rows.length}/${lastProcs.length} shown · ${(tot/1024).toFixed(1)} GB total RSS`;
+  $('proctable').innerHTML = rows.map(p=>{
+    const cpuC=p.cpu>=50?'hot':'', rssC=p.rss_mb>=1024?'bigrss':'';
+    const mem=p.rss_mb>=1024?(p.rss_mb/1024).toFixed(2)+'G':p.rss_mb+'M';
+    const mine=/ingest|qdrant|runpod|session_monitor|eval\.evaluate/.test(p.cmd||'')?'mine':'';
+    return `<tr class="${mine}"><td>${p.pid}</td><td class="muted">${p.ppid||''}</td>`+
+      `<td class="r ${cpuC}">${p.cpu.toFixed(0)}</td><td class="r ${rssC}">${mem}</td>`+
+      `<td class="muted">${esc(p.etime||'')}</td>`+
+      `<td class="cmd" title="${esc(p.cmd)}">${esc(p.cmd)}</td></tr>`;
+  }).join('') || '<tr><td colspan="6" class="empty">no matching processes</td></tr>';
+  if(cont) cont.scrollTop=sc;
+}
+$('pfilter').addEventListener('input', e=>{ procFilter=e.target.value; renderProcs(); });
+document.querySelectorAll('.sb').forEach(b=>b.addEventListener('click',()=>{
+  procSort=b.dataset.k;
+  document.querySelectorAll('.sb').forEach(x=>x.classList.toggle('on', x===b));
+  renderProcs();
+}));
+
+async function poll(){
+  try{
+    const r = await fetch('/api/state',{cache:'no-store'});
+    const s = await r.json();
+    if(s.error){ throw new Error(s.error); }
+    s.projShort = 'Georgia-Legal-Search';
+    render(s);
+  }catch(e){
+    $('dot').classList.add('off');
+    $('upd').textContent = 'disconnected — is session_monitor.py running?';
+  }
+}
+poll(); setInterval(poll, 3000);
+</script>
+</body>
+</html>

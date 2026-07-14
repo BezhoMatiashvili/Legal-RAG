@@ -149,14 +149,39 @@ def heading_spans(text: str) -> list[tuple[int, int, str]]:
     return out
 
 
+def _split_oversized_run(
+    text: str, start: int, max_tokens: int, count: Callable[[str], int]
+) -> list[tuple[str, int, int, int]]:
+    """Hard-split a single whitespace-free run that itself exceeds the token budget.
+
+    A legal document body occasionally embeds a long run with no internal whitespace
+    (e.g. an inline base64 data URI) — ``_atoms``'s word-window packer otherwise has no
+    smaller unit to fall back to. Binary-searches the split point via ``count()`` so it
+    works for any tokenizer, not just a word counter, and keeps offsets exact. Recursion
+    bottoms out at a single character, which is returned as-is even if `count` still
+    reports it over budget (nothing smaller to split into).
+    """
+    tok = count(text)
+    if tok <= max_tokens or len(text) <= 1:
+        return [(text, tok, start, start + len(text))]
+    mid = len(text) // 2
+    return _split_oversized_run(text[:mid], start, max_tokens, count) + _split_oversized_run(
+        text[mid:], start + mid, max_tokens, count
+    )
+
+
 def _atoms(
     body: str, max_tokens: int, count: Callable[[str], int]
 ) -> list[tuple[str, int, int, int]]:
     """Break a section body into atoms ``(text, tok, start, end)`` (offsets into ``body``).
 
     Paragraphs first; oversized ones split into sentences; pathologically long sentences
-    packed into word windows. Offsets are recovered from match positions so they stay
-    exact through every ``.strip()``/``split`` (which otherwise drop that information).
+    packed into word windows; a single word that itself exceeds the budget (e.g. an inline
+    base64 blob with no whitespace) is hard-split further by :func:`_split_oversized_run`
+    so every atom this function returns fits the budget — callers (``_pack``) can then
+    safely treat "atom over budget" as unreachable rather than a document-killing error.
+    Offsets are recovered from match positions so they stay exact through every
+    ``.strip()``/``split`` (which otherwise drop that information).
     """
     atoms: list[tuple[str, int, int, int]] = []
     for para_raw, p_start, _ in _split_keep_pos(body, _PARA_RE):
@@ -184,6 +209,14 @@ def _atoms(
             wtok = 0
             for w, ws, we in words:
                 wt = count(w) or 1
+                if wt > max_tokens:
+                    if window:
+                        atoms.append(
+                            (" ".join(x[0] for x in window), wtok, window[0][1], window[-1][2])
+                        )
+                        window, wtok = [], 0
+                    atoms.extend(_split_oversized_run(w, ws, max_tokens, count))
+                    continue
                 if window and wtok + wt > max_tokens:
                     atoms.append(
                         (" ".join(x[0] for x in window), wtok, window[0][1], window[-1][2])

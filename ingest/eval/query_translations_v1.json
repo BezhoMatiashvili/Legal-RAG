@@ -1,6 +1,6 @@
 {
   "version": "v1",
-  "note": "Georgian legal-register translations of the 22 EN cross-lingual golden queries (improvement I2, variant A). Authored from the query text alone on 2026-07-10 as a static evaluation artifact; no runtime translation API exists in ingest/eval. Keyed by golden-set id; 'query' must byte-match golden_set_v1.jsonl (the loader fails loud on drift).",
+  "note": "Georgian legal-register translations of the 22 EN cross-lingual golden queries (improvement I2, variant A). Authored in-session by Claude on 2026-07-10 from the query text alone — a static eval artifact; no runtime translation API exists anywhere in ingest/eval. Keyed by golden-set id; 'query' must byte-match golden_set_v1.jsonl (the loader fails loud on drift).",
   "translations": {
     "q002": {
       "query": "Can a preventive measure decided at the pre-trial hearing be appealed to the investigative chamber?",

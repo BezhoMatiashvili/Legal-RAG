@@ -3,6 +3,9 @@
 # See documentation in:
 # https://docs.scrapy.org/en/latest/topics/spider-middleware.html
 
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
+
 from scrapy import signals
 
 from .utils.user_agents import generate_random_user_agent
@@ -11,6 +14,73 @@ from .utils.user_agents import generate_random_user_agent
 class RotateUserAgentMiddleware:
     def process_request(self, request, spider):
         request.headers["User-Agent"] = generate_random_user_agent()
+
+
+def _retry_after_seconds(
+    value: str | bytes | None, *, now: datetime | None = None
+) -> int:
+    """Parse Retry-After delta-seconds or an HTTP date, with a polite one-second floor."""
+    if isinstance(value, bytes):
+        value = value.decode("ascii", errors="ignore")
+    value = (value or "").strip()
+    if value.isdigit():
+        return max(1, int(value))
+    if value:
+        try:
+            target = parsedate_to_datetime(value)
+            if target.tzinfo is None:
+                target = target.replace(tzinfo=UTC)
+            seconds = int((target - (now or datetime.now(UTC))).total_seconds())
+            return max(1, seconds)
+        except TypeError, ValueError, OverflowError:
+            pass
+    return 8
+
+
+class SupremecourtRetryAfterMiddleware:
+    """Retry Supreme Court HTTP 429s after the server-requested delay.
+
+    Scrapy's generic retry middleware includes 429 but retries immediately and ignores the
+    response's ``Retry-After`` header.  This downloader middleware runs before it on the
+    response path and returns a Deferred that yields a fresh, ``dont_filter`` request only
+    after the delay.  Exhausted responses are passed onward with generic retry disabled so the
+    spider errback records one durable unresolved failure instead of a second retry loop.
+    """
+
+    def process_response(self, request, response, spider):
+        if spider.name != "supremecourt" or response.status != 429:
+            return response
+
+        retries = int(request.meta.get("supremecourt_retry_after_times", 0))
+        max_retries = spider.crawler.settings.getint("RETRY_TIMES", 8)
+        if retries >= max_retries:
+            request.meta["dont_retry"] = True
+            spider.crawler.stats.inc_value("retry_after/exhausted")
+            return response
+
+        cap = spider.crawler.settings.getint(
+            "SUPREMECOURT_RETRY_AFTER_MAX_SECONDS", 600
+        )
+        delay = min(_retry_after_seconds(response.headers.get("Retry-After")), cap)
+        retry = request.replace(dont_filter=True, priority=request.priority + 1)
+        retry.meta["supremecourt_retry_after_times"] = retries + 1
+        retry.meta["retry_times"] = retries + 1
+        spider.crawler.stats.inc_value("retry_after/count")
+        spider.crawler.stats.inc_value("retry/count")
+        spider.crawler.stats.max_value("retry_after/max_seconds", delay)
+        spider.logger.warning(
+            "supremecourt: HTTP 429 for %s; honoring Retry-After=%ss (%s/%s)",
+            request.url,
+            delay,
+            retries + 1,
+            max_retries,
+        )
+
+        # Import the installed reactor lazily: importing it at module import time can select
+        # the wrong reactor before Scrapy installs AsyncioSelectorReactor.
+        from twisted.internet import reactor, task
+
+        return task.deferLater(reactor, delay, lambda: retry)
 
 
 class MatsneSpiderMiddleware:

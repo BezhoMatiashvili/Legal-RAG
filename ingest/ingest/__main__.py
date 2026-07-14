@@ -15,15 +15,20 @@ def _resolved_cfg(args):
 
 
 def _cmd_ingest(args) -> None:
-    from . import pipeline
     from . import qdrant_store as store
-    from .embedding import BGEM3Embedder, make_token_counter
-    from .progress import IngestProgress
 
     if args.recreate and args.resume:
         raise SystemExit("--recreate and --resume are mutually exclusive.")
 
     cfg = _resolved_cfg(args)
+    store.validate_generation_write_target(
+        cfg, apply=args.apply, recreate=args.recreate
+    )
+
+    from . import pipeline
+    from .embedding import BGEM3Embedder, make_token_counter
+    from .progress import IngestProgress
+
     sources = pipeline.resolve_sources(args.source)
 
     # Recreating the collection invalidates checkpoints — clear them so a later --resume
@@ -33,11 +38,13 @@ def _cmd_ingest(args) -> None:
             pipeline.delete_checkpoint(cfg, source)
 
     client = store.make_client(cfg)
-    created = store.ensure_collection(client, cfg, recreate=args.recreate)
+    created = store.ensure_collection(
+        client, cfg, recreate=args.recreate, apply=args.apply
+    )
 
     print(f"Loading embedding model {cfg.embed_model} (first run downloads ~2GB)...")
     embedder = BGEM3Embedder(cfg)
-    count_tokens = make_token_counter(cfg.embed_model)
+    count_tokens = make_token_counter(cfg.tokenizer_model, cfg.tokenizer_revision)
 
     grand_docs = grand_chunks = grand_skipped = 0
     # Per-source result lines are collected and printed *after* the live panel closes —
@@ -70,11 +77,16 @@ def _cmd_ingest(args) -> None:
 
 
 def _cmd_watch(args) -> None:
-    from . import pipeline
     from . import qdrant_store as store
-    from .embedding import BGEM3Embedder, make_token_counter
 
     cfg = _resolved_cfg(args)
+    store.validate_generation_write_target(
+        cfg, apply=args.apply, recreate=args.recreate
+    )
+
+    from . import pipeline
+    from .embedding import BGEM3Embedder, make_token_counter
+
     sources = pipeline.resolve_sources(args.source)
 
     # Recreating the collection invalidates the offset state — clear it so the watcher
@@ -84,11 +96,13 @@ def _cmd_watch(args) -> None:
             pipeline.delete_watch_state(cfg, source)
 
     client = store.make_client(cfg)
-    created = store.ensure_collection(client, cfg, recreate=args.recreate)
+    created = store.ensure_collection(
+        client, cfg, recreate=args.recreate, apply=args.apply
+    )
 
     print(f"Loading embedding model {cfg.embed_model} (first run downloads ~2GB)...")
     embedder = BGEM3Embedder(cfg)
-    count_tokens = make_token_counter(cfg.embed_model)
+    count_tokens = make_token_counter(cfg.tokenizer_model, cfg.tokenizer_revision)
 
     pipeline.watch_loop(
         cfg, client, embedder, count_tokens, sources,
@@ -113,11 +127,17 @@ def _cmd_embed(args) -> None:
     import json as _json
     import random
 
-    from . import embed_job
     from . import qdrant_store as store
-    from .embedding import BGEM3Embedder, make_token_counter
 
     cfg = _resolved_cfg(args)
+    if not args.checksum:
+        store.validate_generation_write_target(
+            cfg, apply=args.apply, recreate=args.recreate
+        )
+
+    from . import embed_job
+    from .embedding import BGEM3Embedder, make_token_counter
+
     print(f"Loading embedding model {cfg.embed_model} (device={cfg.embed_device or 'auto/cpu'}, "
           f"fp16={cfg.embed_use_fp16}, batch={cfg.embed_batch_size})...")
     embedder = BGEM3Embedder(cfg)
@@ -131,9 +151,11 @@ def _cmd_embed(args) -> None:
         print(f"  saved CPU reference vector → {ref}")
         return
 
-    count_tokens = make_token_counter(cfg.embed_model)
+    count_tokens = make_token_counter(cfg.tokenizer_model, cfg.tokenizer_revision)
     client = store.make_client(cfg)
-    store.ensure_collection(client, cfg, recreate=args.recreate)
+    store.ensure_collection(
+        client, cfg, recreate=args.recreate, apply=args.apply
+    )
 
     if args.pilot:
         # gold/holdout docs (so the harness resolves) + a distractor sample per source
@@ -227,6 +249,11 @@ def main() -> None:
     p_ing.add_argument("--limit", type=int, default=None, help="cap docs per source (pilot)")
     p_ing.add_argument("--batch-size", type=int, default=256, help="points per upsert batch")
     p_ing.add_argument("--recreate", action="store_true", help="drop & recreate the collection first")
+    p_ing.add_argument(
+        "--apply",
+        action="store_true",
+        help="permit an approved immutable-generation Qdrant write",
+    )
     p_ing.add_argument("--resume", action="store_true", help="resume from the per-source checkpoint")
     p_ing.add_argument("--no-progress", action="store_true",
                        help="disable the live progress panel (use plain tqdm/log output)")
@@ -244,6 +271,11 @@ def main() -> None:
                          help="drop & recreate the collection and clear watch state, then backfill")
     p_watch.add_argument("--limit", type=int, default=None,
                          help="cap docs per source per drain pass (debug)")
+    p_watch.add_argument(
+        "--apply",
+        action="store_true",
+        help="permit an approved immutable-generation Qdrant write",
+    )
     p_watch.set_defaults(func=_cmd_watch)
 
     p_snap = sub.add_parser(
@@ -268,6 +300,11 @@ def main() -> None:
     p_embed.add_argument("--limit", type=int, default=None, help="cap docs/source (full mode)")
     p_embed.add_argument("--batch-size", type=int, default=256, help="points per upsert batch")
     p_embed.add_argument("--recreate", action="store_true", help="drop & recreate the collection")
+    p_embed.add_argument(
+        "--apply",
+        action="store_true",
+        help="permit an approved immutable-generation Qdrant write",
+    )
     p_embed.add_argument("--shard", default=None, metavar="i/n",
                          help="embed only shard i of n (0-indexed) — one process per GPU into "
                               "the same Qdrant; each shard has its own resumable checkpoint")

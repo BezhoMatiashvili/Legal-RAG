@@ -4,7 +4,7 @@
 # scale in the in-memory harness — handled separately). Runs unattended.
 set -uo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-cd "$(dirname "$SCRIPT_DIR")"
+cd "$(dirname "$SCRIPT_DIR")" || exit 1
 PY=.venv/bin/python
 CLEAN='grep -vE Fetching|Loading|it/s|Warning|httpx|resolve|colbert'
 log() { echo "[$(date +%T)] $*"; }

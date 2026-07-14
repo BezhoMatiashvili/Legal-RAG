@@ -6,6 +6,11 @@
 # checkpoints inside $WORK/rows).
 set -uo pipefail
 
+if [ "${RUNPOD_EPHEMERAL_QDRANT:-0}" != "1" ]; then
+  echo "refusing legacy re-embed outside an explicitly attested ephemeral RunPod Qdrant" >&2
+  exit 78
+fi
+
 WORK="${WORK:-/workspace}"
 OUT="$WORK/out"
 COLLECTION="${COLLECTION_NAME:-georgian_legal_v2}"

@@ -2,6 +2,7 @@
 name = "legal-ingest"
 version = "0.1.0"
 description = "Ingest scraped Georgian legal documents into Qdrant (hybrid dense+sparse RAG)"
+readme = "README.md"
 # BGE-M3 needs torch, which has no Python 3.14 wheels yet, so this ingestion tool is a
 # standalone project pinned below 3.14 (the scraper stays on 3.14).
 requires-python = ">=3.11,<3.14"

@@ -39,6 +39,30 @@ class MatsneSpiderDateTests(unittest.TestCase):
 
 
 class MatsneSpiderOutputTests(unittest.TestCase):
+    def test_existing_artifact_directory_modes_are_not_normalized(self):
+        original_artifacts_root = MatsneSpider.ARTIFACTS_ROOT
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            try:
+                root = Path(tmp_dir) / "artifacts"
+                latest = root / "matsne" / "latest"
+                latest.mkdir(parents=True)
+                root.chmod(0o755)
+                (root / "matsne").chmod(0o751)
+                latest.chmod(0o750)
+                MatsneSpider.ARTIFACTS_ROOT = root
+                crawler = Crawler(MatsneSpider, Settings())
+
+                spider = MatsneSpider.from_crawler(crawler)
+
+                self.assertEqual(stat.S_IMODE(root.stat().st_mode), 0o755)
+                self.assertEqual(
+                    stat.S_IMODE((root / "matsne").stat().st_mode), 0o751
+                )
+                self.assertEqual(stat.S_IMODE(latest.stat().st_mode), 0o750)
+                self.assertEqual(stat.S_IMODE(spider.run_dir.stat().st_mode), 0o700)
+            finally:
+                MatsneSpider.ARTIFACTS_ROOT = original_artifacts_root
+
     def test_from_crawler_configures_run_outputs(self):
         original_artifacts_root = MatsneSpider.ARTIFACTS_ROOT
 
@@ -58,7 +82,9 @@ class MatsneSpiderOutputTests(unittest.TestCase):
 
                 self.assertIn(str(spider.items_path), feed_paths)
                 self.assertIn(str(spider.latest_items_path), feed_paths)
-                self.assertEqual(crawler.settings.get("LOG_FILE"), str(spider.log_path))
+                # RotatingSpiderLogExtension owns the file; Scrapy's unbounded
+                # built-in LOG_FILE handler must remain disabled.
+                self.assertIsNone(crawler.settings.get("LOG_FILE"))
                 self.assertTrue(all(options["store_empty"] for options in feeds.values()))
                 self.assertTrue(spider.run_metadata_path.exists())
                 self.assertTrue(spider.latest_metadata_path.exists())

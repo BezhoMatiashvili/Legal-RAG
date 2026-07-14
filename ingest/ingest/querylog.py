@@ -9,6 +9,7 @@ chunk text. Logging is best-effort: a caller must never let a log failure break 
 
 import json
 import os
+import stat
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -45,12 +46,24 @@ def append_query_log(record: dict, path: Path) -> None:
     """Append one record as a JSON line (atomic per-line; local file only)."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    path.parent.chmod(0o700)
-    line = (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     try:
-        os.write(fd, line)
+        current = path.lstat()
+    except FileNotFoundError:
+        current = None
+    if current is not None and (
+        not stat.S_ISREG(current.st_mode) or stat.S_IMODE(current.st_mode) & 0o077
+    ):
+        raise PermissionError(
+            "query log is not an owner-only regular file; refusing to chmod existing evidence"
+        )
+    line = (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags, 0o600)
+    try:
+        view = memoryview(line)
+        while view:
+            written = os.write(fd, view)
+            view = view[written:]
     finally:
         os.close(fd)
-    # Correct a pre-existing permissive file too; mode passed to os.open only affects creation.
-    path.chmod(0o600)

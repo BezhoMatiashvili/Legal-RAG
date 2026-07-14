@@ -15,8 +15,8 @@ the current cleaned document-state hash, a complete contiguous chunk generation,
 schema, or vector identity/dimensions. Do not use it alone as a production promotion gate.
 
 Usage (from ingest/):
-    .venv/bin/python scripts/verify_all_embedded.py
-    .venv/bin/python scripts/verify_all_embedded.py --collection georgian_legal --sources matsne,ecd
+    .venv/bin/python scripts/verify_all_embedded.py --coverage-only
+    .venv/bin/python scripts/verify_all_embedded.py --coverage-only --collection georgian_legal --sources matsne,ecd
 """
 from __future__ import annotations
 
@@ -180,7 +180,14 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--collection", default=None)
     ap.add_argument("--sources", default=None, help="comma list; default = every artifacts subdir")
+    ap.add_argument(
+        "--coverage-only",
+        action="store_true",
+        help="explicitly acknowledge this does not verify generation integrity",
+    )
     args = ap.parse_args()
+    if not args.coverage_only:
+        ap.error("ID coverage only; pass --coverage-only, or use scripts/verify_generation.py")
 
     cfg = load_config()
     collection = args.collection or cfg.collection_name

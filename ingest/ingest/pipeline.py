@@ -55,6 +55,12 @@ def _prepare_doc_for_index(doc):
     report = assess(doc.body_markdown)
     if not report.is_usable:
         raise DocumentQuarantined(doc.source, doc.document_id, report.quarantine_reason)
+    if not doc.content_complete:
+        raise DocumentQuarantined(
+            doc.source,
+            doc.document_id,
+            f"incomplete_content:{doc.content_kind}:{doc.extraction_status}",
+        )
     return replace(doc, body_markdown=clean_text(doc.body_markdown))
 
 
@@ -109,6 +115,11 @@ _STATE_FIELDS = (
     "consolidated_count",
     "in_force_date",
     "expiry_date",
+    "content_kind",
+    "content_complete",
+    "extraction_status",
+    "source_binary_url",
+    "article_summary",
 )
 _PROMOTED_FIELDS = tuple(sorted({
     field for spec in SOURCES.values() for field in spec.promote_fields
@@ -153,6 +164,14 @@ def _document_state_hash(cfg: Config, doc=None, payload: dict | None = None) -> 
             "embed_header_v2": cfg.embed_header_v2,
         },
     }
+    # Preserve legacy/default state hashes exactly; only explicit model identity alters
+    # the hash and therefore triggers the required re-embed.
+    if cfg.embedding_revision:
+        material["index_config"]["embedding_revision"] = cfg.embedding_revision
+    if cfg.tokenizer_model != cfg.embed_model:
+        material["index_config"]["tokenizer_model"] = cfg.tokenizer_model
+    if cfg.tokenizer_revision:
+        material["index_config"]["tokenizer_revision"] = cfg.tokenizer_revision
     blob = json.dumps(material, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
@@ -409,6 +428,7 @@ def ingest_source(
                     chunk,
                     document_chunk_count=len(chunks),
                     document_state_hash=state_hash,
+                    cfg=cfg,
                 ),
             ))
 
@@ -570,6 +590,7 @@ def _build_doc_points(cfg: Config, embedder, count_tokens, doc) -> tuple[list, i
                 chunk,
                 document_chunk_count=len(chunks),
                 document_state_hash=state_hash,
+                cfg=cfg,
             ),
         ))
     return points, len(chunks)

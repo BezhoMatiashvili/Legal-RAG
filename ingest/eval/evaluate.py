@@ -20,15 +20,17 @@ Usage (from the ingest/ project root):
 """
 
 import argparse
+import hashlib
 import json
 import random
 from pathlib import Path
 
 from ingest.chunking import chunk_document, default_token_counter
 from ingest.config import load_config
+from ingest.retrieval import EvaluationProvenance
 
 from . import explog, goldset
-from .backend import MODES, ChunkRecord, FakeBackend
+from .backend import MODES, PRODUCTION_MODES, ChunkRecord, FakeBackend, ProductionBackend
 from .metrics import (
     METRIC_NAMES,
     aggregate,
@@ -41,12 +43,12 @@ from .spanmap import graded_relevant_chunks
 from .stats import bootstrap_ci, compare
 
 
-def _token_counter(kind: str, embed_model: str):
+def _token_counter(kind: str, tokenizer_model: str, tokenizer_revision: str | None = None):
     if kind == "word":
         return default_token_counter
     from ingest.embedding import make_token_counter
 
-    return make_token_counter(embed_model)
+    return make_token_counter(tokenizer_model, tokenizer_revision)
 
 
 def build_query_relevance(gold, bodies, chunk_cfg, count_tokens):
@@ -121,11 +123,27 @@ def eval_set_knob(version: str) -> dict[str, str]:
     return {} if version == "v1" else {"eval_set": version}
 
 
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def run_mode(backend, gold, rel, mode, level, k):
     scores = []
-    lat = {"embed": [], "search": [], "rerank": [], "total": []}
+    lat = {"embed": [], "search": [], "rerank": [], "total": [], "degraded": []}
     for q in gold:
         hits, stage = backend.search(q.query, mode, k)
+        outcome = getattr(backend, "last_outcome", None)
+        if outcome is not None and outcome.degraded:
+            lat["degraded"].append({
+                "query_id": q.id,
+                "reason": outcome.degraded_reason,
+                "timings_ms": dict(outcome.timings_ms),
+            })
+            continue
         scores.append(
             query_score(q.id, q.query_type, q.query_language, hits, rel[q.id][level], level)
         )
@@ -133,6 +151,22 @@ def run_mode(backend, gold, rel, mode, level, k):
             lat[s].append(stage[s])
         lat["total"].append(sum(stage.values()))
     return scores, lat
+
+
+def selected_modes(backend_kind: str, requested: str | None, *, has_translations: bool) -> list[str]:
+    """Choose tracks without ever mixing authored translations into direct production."""
+
+    mode = requested or ("production" if backend_kind == "qdrant" else "all")
+    if mode == "all":
+        modes = ["production", *MODES] if backend_kind == "qdrant" else list(MODES)
+        if backend_kind == "qdrant" and has_translations:
+            modes.insert(1, "client_translated")
+        return modes
+    if mode in PRODUCTION_MODES and backend_kind != "qdrant":
+        raise ValueError("production-parity modes require --backend qdrant")
+    if mode == "client_translated" and not has_translations:
+        raise ValueError("client_translated requires --translate-queries PATH")
+    return [mode]
 
 
 def _fmt_ci(ci) -> str:
@@ -174,12 +208,147 @@ def print_stage_latency(results):
         print(row)
 
 
+def print_degraded(results) -> None:
+    print("\n== Degraded executions (excluded from candidate quality metrics) ==")
+    any_degraded = False
+    for mode, (_scores, lat) in results.items():
+        events = lat.get("degraded", [])
+        if not events:
+            continue
+        any_degraded = True
+        print(f"   {mode}: {len(events)} degraded quer{'y' if len(events) == 1 else 'ies'}")
+        for event in events[:5]:
+            print(f"      {event['query_id']}: {event['reason']}")
+    if not any_degraded:
+        print("   none")
+
+
+def _value(value, field):
+    return value.get(field) if isinstance(value, dict) else getattr(value, field, None)
+
+
+def _resolve_physical_collection(client, alias: str, generation_id: str) -> str:
+    """Resolve one stable alias to the only permitted generation collection."""
+    expected = f"georgian_legal__gen_{generation_id}"
+    response = client.get_aliases()
+    aliases = _value(response, "aliases")
+    if not isinstance(aliases, list):
+        raise RuntimeError("Qdrant alias inventory is unavailable")
+    targets = [
+        _value(item, "collection_name")
+        for item in aliases
+        if _value(item, "alias_name") == alias
+    ]
+    if targets != [expected]:
+        raise RuntimeError(
+            f"serving alias {alias!r} must resolve exactly to {expected!r}; got {targets!r}"
+        )
+    return expected
+
+
+def _header_identity(document_header: bool) -> str:
+    material = json.dumps(
+        {"document_header": document_header}, sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(material.encode()).hexdigest()
+
+
+def build_evaluation_provenance(
+    index_info: dict,
+    frozen_set_hashes: dict[str, str],
+    execution_mode: str,
+) -> EvaluationProvenance:
+    """Build and validate a quality-claim identity from verified index metadata."""
+    empty_patch_hash = hashlib.sha256(b"").hexdigest()
+    provenance = EvaluationProvenance(
+        collection_alias=index_info["collection_alias"],
+        physical_collection=index_info["physical_collection"],
+        generation_id=index_info["generation_id"],
+        points_count=index_info["n_points"],
+        corpus_hash=index_info["corpus_hash"],
+        snapshot_hash=index_info["snapshot_hash"],
+        embedding_model=index_info["embedding_model"],
+        embedding_revision=index_info["embedding_revision"],
+        tokenizer_model=index_info["tokenizer_model"],
+        tokenizer_revision=index_info["tokenizer_revision"],
+        reranker_model=index_info["reranker_model"],
+        reranker_revision=index_info["reranker_revision"],
+        vector_space_id=index_info["vector_space_id"],
+        chunk_config_id=index_info["chunk_config_id"],
+        header_config_id=index_info["header_config_id"],
+        retrieval_fingerprint=index_info["retrieval_fingerprint"],
+        frozen_set_hashes=frozen_set_hashes,
+        dependency_identity=index_info["dependency_identity"],
+        image_identity=index_info["image_identity"],
+        git_sha=index_info["git_sha"],
+        dirty_patch_hash=index_info.get("dirty_patch_hash") or empty_patch_hash,
+        execution_mode=execution_mode,
+    )
+    provenance.validate_complete()
+    return provenance
+
+
 def qdrant_deps(cfg):
     """Build the shared, expensive Qdrant/BGE deps once (so a paired A/B reuses them)."""
-    from ingest.embedding import BGEM3Embedder
+    from ingest.artifacts import load_verified_generation_coverage
+    from ingest.collection_compatibility import (
+        require_collection_compatibility,
+        require_config_manifest_compatibility,
+    )
+    from ingest.generation import load_generation
     from ingest.qdrant_store import make_client
 
     client = make_client(cfg)
+    if cfg.generation_dir is None:
+        raise RuntimeError("production-parity Qdrant evaluation requires GENERATION_DIR")
+    manifest = load_generation(cfg.generation_dir).manifest
+    verified = load_verified_generation_coverage(cfg.generation_dir.parent)
+    if not any(
+        item.generation_id == manifest.generation_id
+        and item.manifest_path == (cfg.generation_dir / "manifest.json").resolve()
+        for item in verified
+    ):
+        raise RuntimeError(
+            "production-parity evaluation requires a matching all-green generation "
+            "verification sidecar"
+        )
+    require_config_manifest_compatibility(cfg, manifest)
+    physical_collection = _resolve_physical_collection(
+        client, cfg.collection_name, manifest.generation_id
+    )
+    compatibility = require_collection_compatibility(
+        client, physical_collection, manifest
+    )
+    index_info = {
+        "kind": "qdrant",
+        "collection_alias": cfg.collection_name,
+        "physical_collection": physical_collection,
+        "generation_id": manifest.generation_id,
+        "n_points": compatibility.points_count,
+        "corpus_hash": manifest.source.state_sha256,
+        "snapshot_hash": manifest.corpus.snapshot_sha256,
+        "retrieval_fingerprint": manifest.retrieval_fingerprint,
+        "embedding_model": manifest.model.embedding_model,
+        "embedding_revision": manifest.model.embedding_revision,
+        "tokenizer_model": manifest.model.tokenizer_model,
+        "tokenizer_revision": manifest.model.tokenizer_revision,
+        "reranker_model": manifest.model.reranker_model,
+        "reranker_revision": manifest.model.reranker_revision,
+        "vector_space_id": manifest.vector_space.id,
+        "chunk_config_id": manifest.chunking.fingerprint,
+        "header_config_id": _header_identity(manifest.chunking.document_header),
+        "dependency_identity": manifest.dependency.lock_sha256,
+        "image_identity": manifest.dependency.image_digest,
+        "git_sha": manifest.code.git_sha,
+        "dirty_patch_hash": manifest.code.dirty_patch_sha256,
+    }
+    # Reject incomplete image/model/runtime identity before heavyweight imports.
+    build_evaluation_provenance(
+        index_info, {"preflight": "0" * 64}, "preflight"
+    )
+
+    from ingest.embedding import BGEM3Embedder
+
     embedder = BGEM3Embedder(cfg)
     reranker = None
     if cfg.rerank_enabled:
@@ -191,10 +360,7 @@ def qdrant_deps(cfg):
         else:
             from ingest.rerank import make_reranker
             reranker = make_reranker(cfg)
-    info = client.get_collection(cfg.collection_name)
-    return client, embedder, reranker, {
-        "kind": "qdrant", "collection": cfg.collection_name, "n_points": info.points_count,
-    }
+    return client, embedder, reranker, index_info
 
 
 def make_backend(kind, cfg, gold, bodies, chunk_cfg, count_tokens, *, knobs=None, deps=None):
@@ -211,7 +377,12 @@ def make_backend(kind, cfg, gold, bodies, chunk_cfg, count_tokens, *, knobs=None
 def main() -> None:
     ap = argparse.ArgumentParser(description="Evaluate legal RAG retrieval quality.")
     ap.add_argument("--backend", choices=("fake", "qdrant"), default="qdrant")
-    ap.add_argument("--mode", choices=(*MODES, "all"), default="all")
+    ap.add_argument(
+        "--mode",
+        choices=(*MODES, *PRODUCTION_MODES, "all"),
+        default=None,
+        help="default: production for qdrant; all ablations for fake",
+    )
     ap.add_argument("--relevance", choices=("chunk", "doc"), default="chunk")
     ap.add_argument("--top-k", type=int, default=10)
     ap.add_argument("--tokenizer", choices=("word", "bge"), default=None,
@@ -248,9 +419,12 @@ def main() -> None:
         "min_tokens": cfg.chunk_min_tokens,
     }
     tok_kind = args.tokenizer or ("word" if args.backend == "fake" else "bge")
-    count_tokens = _token_counter(tok_kind, cfg.embed_model)
+    count_tokens = _token_counter(tok_kind, cfg.tokenizer_model, cfg.tokenizer_revision)
 
     eval_spec = goldset.EVAL_SETS[args.golden_set]
+    eval_hash = goldset.eval_set_hash(eval_spec.gold)
+    eval_file_sha = _file_sha256(eval_spec.gold)
+    holdout_hash = _file_sha256(eval_spec.holdout)
     gold = goldset.load_golden_set(eval_spec.gold)
     holdout = goldset.load_holdout(eval_spec.holdout)
     bodies = goldset.SnapshotBodies(
@@ -270,10 +444,13 @@ def main() -> None:
 
     rescore = {"on": True, "off": False}.get(args.rescore)
     translations, translations_hash = (None, None)
+    translations_file_sha = None
     if args.translate_queries:
         from .translations import load_query_translations
 
-        translations, translations_hash = load_query_translations(Path(args.translate_queries), gold)
+        translations_path = Path(args.translate_queries)
+        translations, translations_hash = load_query_translations(translations_path, gold)
+        translations_file_sha = _file_sha256(translations_path)
         uncovered = {q.query for q in gold if q.query_language == "en"} - set(translations)
         if uncovered:
             print(
@@ -284,14 +461,12 @@ def main() -> None:
         "rerank_candidates": args.rerank_candidates, "fusion": args.fusion,
         "prefetch_limit": args.prefetch_limit, "hnsw_ef": args.hnsw_ef, "rescore": rescore,
         "sparse_weight": args.sparse_weight, "max_per_doc": args.max_per_doc,
-        "mmr_lambda": args.mmr_lambda, "translations": translations,
+        "mmr_lambda": args.mmr_lambda, "translations": None,
         "citation_route": args.citation_route,
     }
     # The raw translation dict never enters config_hash/logs — its file content hash does.
     active_knobs = {k: v for k, v in knobs.items()
                     if v not in (None, "rrf") and k != "translations"}
-    if translations_hash:
-        active_knobs["translate_queries"] = translations_hash
     # I5: non-default eval set is eval config too — v1 folds nothing, so history is stable.
     active_knobs.update(eval_set_knob(args.golden_set))
     # Env-selected reranker backend (I7) is eval config too — fold non-default into the hash.
@@ -301,10 +476,20 @@ def main() -> None:
     deps = qdrant_deps(cfg) if args.backend == "qdrant" else None
     backend, index_info = make_backend(
         args.backend, cfg, gold, bodies, chunk_cfg, count_tokens, knobs=knobs, deps=deps)
+    production_backend = None
+    if deps is not None:
+        client, embedder, reranker, _info = deps
+        production_backend = ProductionBackend(
+            cfg, client, embedder, reranker=reranker, translations=translations
+        )
     print(f"Backend: {index_info}  knobs={active_knobs or 'defaults'}")
 
     if args.ab:
-        m = args.mode if args.mode != "all" else "rerank"
+        m = args.mode if args.mode not in (None, "all") else "rerank"
+        if m in PRODUCTION_MODES:
+            raise SystemExit(
+                "--ab tuning knobs are ablations; compare production tracks with --compare"
+            )
         base, _ = make_backend(
             args.backend, cfg, gold, bodies, chunk_cfg, count_tokens, knobs=None, deps=deps)
         results = {
@@ -313,17 +498,56 @@ def main() -> None:
         }
         args.compare = [m, f"{m}+knobs"]  # drive the paired-compare + logging paths below
     else:
-        modes = list(MODES) if args.mode == "all" else [args.mode]
+        try:
+            modes = selected_modes(
+                args.backend, args.mode, has_translations=translations is not None
+            )
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
         if args.compare:
             modes = list(dict.fromkeys(args.compare))
-        results = {m: run_mode(backend, gold, rel, m, args.relevance, args.top_k) for m in modes}
+        unknown = set(modes) - set(MODES) - set(PRODUCTION_MODES)
+        if unknown:
+            raise SystemExit(f"unknown comparison mode(s): {sorted(unknown)}")
+        results = {}
+        for mode in modes:
+            selected_backend = production_backend if mode in PRODUCTION_MODES else backend
+            if selected_backend is None:
+                raise SystemExit(f"{mode} requires --backend qdrant")
+            results[mode] = run_mode(
+                selected_backend, gold, rel, mode, args.relevance, args.top_k
+            )
+
+    provenances: dict[str, EvaluationProvenance] = {}
+    if args.backend == "qdrant":
+        for label in results:
+            frozen_hashes = {
+                f"golden_{eval_spec.version}": eval_file_sha,
+                f"holdout_{eval_spec.version}": holdout_hash,
+            }
+            if label.split("+")[0] == "client_translated" and translations_file_sha:
+                frozen_hashes["authored_query_translations"] = translations_file_sha
+            provenances[label] = build_evaluation_provenance(
+                index_info, frozen_hashes, label
+            )
+        print(
+            "Evaluation provenance: "
+            + json.dumps(
+                {label: value.to_dict() for label, value in provenances.items()},
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
 
     print_table(results, args.relevance, args.top_k)
     print_stage_latency(results)
+    print_degraded(results)
     print_breakdowns(results)
 
     if args.compare:
         a, b = args.compare
+        if results[a][1].get("degraded") or results[b][1].get("degraded"):
+            raise SystemExit("paired comparison invalid: a compared track degraded")
         print(f"\n== Paired A/B: {a} (A) vs {b} (B), relevance={args.relevance} ==")
         for m in METRIC_NAMES:
             c = compare(m, values(results[a][0], m), values(results[b][0], m))
@@ -331,13 +555,23 @@ def main() -> None:
                   f"p={c.p_value:.4f} → {c.verdict}")
 
     if args.log:
-        eval_hash = goldset.eval_set_hash(eval_spec.gold)
         for label, (scores, lat) in results.items():
             base_mode = label.split("+")[0]
             # In --ab, the base label logs with knobs OFF; every other run logs the active
             # knobs. Plain runs (no knobs) hash exactly as before → historical rows comparable.
             # The eval set is not a knob you can switch off — the --ab base keeps it.
-            eff = dict(eval_set_knob(args.golden_set)) if (args.ab and label == base_mode) else active_knobs
+            if base_mode in PRODUCTION_MODES:
+                eff = dict(eval_set_knob(args.golden_set))
+                if cfg.rerank_enabled and cfg.rerank_backend != "torch":
+                    eff["rerank_backend"] = cfg.rerank_backend
+                if base_mode == "client_translated" and translations_hash:
+                    eff["translate_queries"] = translations_hash
+            else:
+                eff = (
+                    dict(eval_set_knob(args.golden_set))
+                    if (args.ab and label == base_mode)
+                    else active_knobs
+                )
             eff_rc = eff.get("rerank_candidates") or cfg.rerank_candidates
             ch = explog.config_hash({
                 "mode": base_mode, "relevance": args.relevance, "top_k": args.top_k,
@@ -357,7 +591,15 @@ def main() -> None:
                 # experiment log is self-describing for ablation tables (does NOT affect the hash).
                 "knobs": {"rerank_candidates": eff_rc,
                           **{k: v for k, v in eff.items() if k != "rerank_candidates"}},
-                "backend": index_info,
+                "backend": {
+                    **index_info,
+                    "execution_mode": label,
+                    "evaluated_queries": len(scores),
+                    "degraded_queries": len(lat.get("degraded", [])),
+                },
+                "evaluation_provenance": (
+                    provenances[label].to_dict() if label in provenances else None
+                ),
                 "metrics": aggregate(scores),
                 "cis": {m: bootstrap_ci(values(scores, m)).__dict__ for m in METRIC_NAMES},
                 "latency_ms": {
@@ -369,6 +611,16 @@ def main() -> None:
             }
             explog.append_run(record, Path(args.log_path))
         print(f"\nAppended {len(results)} run(s) to {args.log_path}")
+
+    degraded_production = sum(
+        len(lat.get("degraded", []))
+        for label, (_scores, lat) in results.items()
+        if label.split("+")[0] in PRODUCTION_MODES
+    )
+    if degraded_production:
+        raise SystemExit(
+            f"production quality gate invalid: {degraded_production} degraded execution(s)"
+        )
 
 
 if __name__ == "__main__":

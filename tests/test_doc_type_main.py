@@ -169,8 +169,19 @@ class MainListedIdsSidecarTests(unittest.TestCase):
     def test_listed_ids_deduped_across_listings(self):
         with tempfile.TemporaryDirectory() as tmp:
             spider = self._spider(tmp)
-            list(spider.parse(_html(self.LISTING_URL, LISTING)))
-            list(spider.parse(_html(self.LISTING_URL + "&page=2", LISTING)))
+            page_two_url = self.LISTING_URL.replace("&page=1&", "&page=2&")
+            first_page = LISTING.replace(
+                "</body>",
+                '<ul class="pagination">'
+                f'<li><a href="{page_two_url}">შემდეგი</a></li>'
+                '<li><a href="?page=2">ბოლო</a></li></ul></body>',
+            )
+            final_page = LISTING.replace(
+                "</body>",
+                '<ul class="pagination"><li><a href="?page=2">ბოლო</a></li></ul></body>',
+            )
+            list(spider.parse(_html(self.LISTING_URL, first_page)))
+            list(spider.parse(_html(page_two_url, final_page)))
             ids = (Path(tmp) / "main_listed_ids.txt").read_text(encoding="utf-8").split()
             self.assertEqual(ids, ["111", "222"])
 

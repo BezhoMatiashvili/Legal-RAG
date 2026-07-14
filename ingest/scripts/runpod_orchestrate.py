@@ -37,9 +37,16 @@ from pathlib import Path
 # --- paths / constants --------------------------------------------------------
 INGEST = Path(__file__).resolve().parents[1]                 # .../Georgia-Legal-Search/ingest
 REPO = INGEST.parent
-WORKDIR = Path.home() / "gpu_embed_work"                     # under /home (not tmpfs): holds keys, enc payload, OUT snapshot
+_workdir_value = os.environ.get("GPU_WORKDIR")
+WORKDIR = (
+    (INGEST / _workdir_value if not Path(_workdir_value).is_absolute() else Path(_workdir_value))
+    if _workdir_value
+    else INGEST / ".state" / "gpu-work"
+)
 CPU_REF = INGEST / "snapshots" / "v1" / "checksum_cpu.json"
 sys.path.insert(0, str(INGEST))                              # import the local `ingest` package
+
+from ingest.operational import refuse_legacy_operation  # noqa: E402
 
 UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
       "Chrome/125.0.0.0 Safari/537.36")
@@ -77,9 +84,11 @@ def log(msg: str) -> None:
 
 def _api_key() -> str:
     from dotenv import dotenv_values
-    key = dotenv_values(INGEST / ".env").get("RUNPOD_API_KEY") or os.environ.get("RUNPOD_API_KEY")
+    key = os.environ.get("RUNPOD_API_KEY") or dotenv_values(INGEST / ".env").get(
+        "RUNPOD_API_KEY"
+    )
     if not key:
-        sys.exit("RUNPOD_API_KEY not found in ingest/.env")
+        sys.exit("RUNPOD_API_KEY is required")
     return key
 
 
@@ -210,9 +219,9 @@ def pull_file(remote_path: str, local: Path, ip: str, port: int, timeout: int = 
 # --- steps --------------------------------------------------------------------
 def step_checksum_ref() -> None:
     if not CPU_REF.exists():
-        log("CPU checksum reference missing — generating (CPU embed of the pin sentence)...")
-        run([str(INGEST / ".venv/bin/python"), "-m", "ingest", "embed", "--checksum"],
-            timeout=1200)
+        raise RuntimeError(
+            f"immutable CPU checksum reference missing at {CPU_REF}; refusing to regenerate it"
+        )
     ref = json.loads(CPU_REF.read_text())
     assert len(ref["dense"]) == 1024, "checksum_cpu.json dense dim != 1024"
     log(f"CPU checksum ref ok: sha={ref['sha']} dims={len(ref['dense'])}")
@@ -504,6 +513,7 @@ def _sig(signum, frame):  # noqa: ANN001
 
 
 def step_restore(expected_points: int) -> None:
+    refuse_legacy_operation("direct snapshot restore into georgian_legal")
     snap = WORKDIR / "out" / f"{COLLECTION}.snapshot"
     log(f"restoring snapshot into LOCAL Qdrant as `{COLLECTION}` (may take minutes)...")
     run(["curl", "-sf", "-X", "POST",
@@ -518,6 +528,7 @@ def step_restore(expected_points: int) -> None:
 
 
 def main() -> None:
+    refuse_legacy_operation("full-corpus v1 embed and direct restore")
     global _pod_id, _provisioned_at, _price, _ip, _port
     atexit.register(_cleanup)
     signal.signal(signal.SIGINT, _sig)

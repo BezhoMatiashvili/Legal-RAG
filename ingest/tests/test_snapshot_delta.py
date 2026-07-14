@@ -26,7 +26,9 @@ BODY_NEW = "მუხლი 1. ეს კანონი განსაზღ�
 
 def item(slug, body):
     return {"slug": slug, "title": f"title {slug}", "date": "2020-01-01",
-            "body_markdown": body, "source_url": f"http://x/{slug}"}
+            "body_markdown": body, "source_url": f"http://x/{slug}",
+            "content_kind": "ruling_full_text", "content_complete": True,
+            "extraction_status": "full_text", "source_binary_url": f"http://x/{slug}.pdf"}
 
 
 def write_run(artifacts, source, run, items):

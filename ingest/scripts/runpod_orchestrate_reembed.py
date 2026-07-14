@@ -16,7 +16,7 @@ atexit + signals + poll deadline):
   5. always terminate + cost-report.
 
 Usage (from ingest/):
-    nohup .venv/bin/python scripts/runpod_orchestrate_reembed.py > ~/gpu_embed_work/reembed_v2.log 2>&1 &
+    nohup .venv/bin/python scripts/runpod_orchestrate_reembed.py > "$GPU_WORKDIR/reembed_v2.log" 2>&1 &
     .venv/bin/python scripts/runpod_orchestrate_reembed.py terminate   # emergency
 """
 from __future__ import annotations
@@ -34,6 +34,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import runpod_orchestrate as O  # noqa: E402 — gql/ssh/provision/terminate helpers
+from ingest.operational import refuse_legacy_operation  # noqa: E402
 
 V2_COLLECTION = "georgian_legal_v2"
 ROWS_SRC = O.INGEST / ".state" / "reembed_v2" / "rows"
@@ -349,6 +350,7 @@ def step_gate(hyb: dict, rr: dict) -> bool:
 
 
 def step_pull_and_restore(ip: str, port: int, expected_points: int) -> None:
+    refuse_legacy_operation("non-generation re-embed snapshot restore")
     snap = OUT / f"{V2_COLLECTION}.snapshot"
     _retry(lambda: O.pull_file(f"/workspace/out/{V2_COLLECTION}.snapshot", snap, ip, port,
                                timeout=1800),
@@ -370,6 +372,7 @@ def step_pull_and_restore(ip: str, port: int, expected_points: int) -> None:
 
 
 def main() -> None:
+    refuse_legacy_operation("v2 re-embed and non-generation restore")
     OUT.mkdir(parents=True, exist_ok=True)
     if not REF_FILE.exists():  # fail before spending pod money
         raise SystemExit(f"reference file {REF_FILE} missing — run ref_v2_driver.sh first")

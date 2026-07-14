@@ -62,6 +62,8 @@ DOWNLOADER_MIDDLEWARES = {
 # Enable or disable extensions
 # See https://docs.scrapy.org/en/latest/topics/extensions.html
 EXTENSIONS = {
+    "legal_scrapers.extensions.DurableDedupCommitExtension": 10,
+    "legal_scrapers.extensions.RotatingSpiderLogExtension": 20,
     "legal_scrapers.extensions.LiveProgressExtension": 100,
 }
 
@@ -79,6 +81,10 @@ ITEM_PIPELINES = {
 # artifacts/<spider>/seen.sqlite and skips already-seen documents (no detail
 # fetch, no re-emit). Force a full re-scrape with `-s DEDUP_ENABLED=False`.
 DEDUP_ENABLED = True
+DEDUP_REFRESH_DEFAULT_DAYS = 30
+DEDUP_REFRESH_TAS_DAYS = 7
+DEDUP_REFRESH_PENDING_DAYS = 1
+DEDUP_REFRESH_LIMIT = 2000
 
 # Use the asyncio reactor process-wide. Required so scrapy-playwright (the tas
 # spider) works under the single shared reactor when all spiders run together

@@ -3,6 +3,7 @@ import sys
 import unittest
 from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
 
 from scrapy import Request
@@ -66,6 +67,52 @@ class SeedUrlLoadingTests(unittest.TestCase):
 
 
 class SeedStartModeTests(unittest.TestCase):
+    def test_due_refresh_is_scheduled_before_and_independent_of_listing_window(self):
+        spider = MatsneSpider(start_date="2026-07-01", end_date="2026-07-13")
+        spider.catch_all_only = "1"
+        spider._refresh_keys = {"42"}
+        spider.dedup_refresh_context = lambda _key: {"is_consolidated": True}
+        spider.crawler = SimpleNamespace(
+            stats=SimpleNamespace(inc_value=lambda *_args, **_kwargs: None)
+        )
+
+        async def collect():
+            return [request async for request in spider.start()]
+
+        requests = asyncio.run(collect())
+
+        self.assertEqual(requests[0].url, "https://matsne.gov.ge/ka/document/view/42")
+        self.assertEqual(requests[0].callback, spider.parse_document)
+        self.assertTrue(requests[0].meta["refresh_due"])
+        self.assertTrue(requests[0].meta["known_is_consolidated"])
+        self.assertTrue(any(request.callback == spider.parse for request in requests[1:]))
+
+    def test_due_refresh_with_unknown_legacy_classifier_fails_closed(self):
+        counters = {}
+        spider = MatsneSpider(start_date="2026-07-01", end_date="2026-07-13")
+        spider.catch_all_only = "1"
+        spider._refresh_keys = {"42"}
+        spider.dedup_refresh_context = lambda _key: {"is_consolidated": None}
+        spider.crawler = SimpleNamespace(
+            stats=SimpleNamespace(
+                inc_value=lambda key, count=1: counters.__setitem__(
+                    key, counters.get(key, 0) + count
+                )
+            )
+        )
+
+        async def collect():
+            return [request async for request in spider.start()]
+
+        requests = asyncio.run(collect())
+
+        self.assertNotIn(
+            "https://matsne.gov.ge/ka/document/view/42",
+            {request.url for request in requests},
+        )
+        self.assertEqual(counters["quality/failures"], 1)
+        self.assertEqual(counters["quality/refresh_context_missing"], 1)
+
     def test_start_yields_detail_requests_for_seeds(self):
         spider = MatsneSpider()
         spider.seed_urls = "18070, https://matsne.gov.ge/ka/document/view/14944"
@@ -131,6 +178,34 @@ class ParseDocumentConsolidationTests(unittest.TestCase):
         self.assertEqual(doc["consolidated_count"], 0)
         self.assertEqual(doc["consolidated_dates"], [])
         self.assertEqual(doc["status"], "ძალაში მყოფი აქტები")  # no expiry → in force
+
+    def test_direct_refresh_preserves_known_main_classifier_without_switcher(self):
+        spider = MatsneSpider()
+        item = MatsneItem()
+        item["document_url"] = "https://matsne.gov.ge/ka/document/view/55"
+        meta = {"item": item, "known_is_consolidated": True}
+
+        doc = list(
+            spider.parse_document(_html(item["document_url"], DETAIL_PLAIN, meta))
+        )[0]
+
+        self.assertTrue(doc["is_consolidated"])
+        self.assertEqual(doc["consolidated_count"], 0)
+
+    def test_current_switcher_upgrades_stale_direct_refresh_classifier(self):
+        spider = MatsneSpider()
+        item = MatsneItem()
+        item["document_url"] = "https://matsne.gov.ge/ka/document/view/18070"
+        meta = {"item": item, "known_is_consolidated": False}
+
+        doc = list(
+            spider.parse_document(
+                _html(item["document_url"], DETAIL_CONSOLIDATED, meta)
+            )
+        )[0]
+
+        self.assertTrue(doc["is_consolidated"])
+        self.assertEqual(doc["consolidated_count"], 2)
 
     def test_existing_status_not_overwritten(self):
         spider = MatsneSpider()

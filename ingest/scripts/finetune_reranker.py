@@ -57,6 +57,15 @@ def _excluded_docs(test_golden: Path, holdout: Path) -> set[tuple[str, str]]:
     return ex
 
 
+def _load_cross_encoder(model_name: str, revision: str | None):
+    from sentence_transformers.cross_encoder import CrossEncoder
+
+    revision_kwargs = {"revision": revision} if revision is not None else {}
+    return CrossEncoder(
+        model_name, num_labels=1, max_length=512, **revision_kwargs
+    )
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Fine-tune the bge cross-encoder reranker (P5).")
     ap.add_argument("--pairs", nargs="+", required=True, help="golden-pair JSONL glob(s) for training")
@@ -132,9 +141,7 @@ def main() -> None:
 
     from torch.utils.data import DataLoader
 
-    from sentence_transformers.cross_encoder import CrossEncoder
-
-    model = CrossEncoder(cfg.rerank_model, num_labels=1, max_length=512)
+    model = _load_cross_encoder(cfg.rerank_model, cfg.reranker_revision)
     loader = DataLoader(examples, shuffle=True, batch_size=args.batch_size)
     args.out.mkdir(parents=True, exist_ok=True)
     model.fit(train_dataloader=loader, epochs=args.epochs, warmup_steps=max(10, len(loader) // 10),

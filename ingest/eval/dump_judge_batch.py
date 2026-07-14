@@ -30,14 +30,14 @@ from . import goldset
 from .evaluate import make_backend
 
 
-def _token_counter(kind: str, embed_model: str):
+def _token_counter(kind: str, tokenizer_model: str, tokenizer_revision: str | None = None):
     if kind == "word":
         from ingest.chunking import default_token_counter
 
         return default_token_counter
     from ingest.embedding import make_token_counter
 
-    return make_token_counter(embed_model)
+    return make_token_counter(tokenizer_model, tokenizer_revision)
 
 
 def _stratified_sample(gold, n, seed):
@@ -74,7 +74,9 @@ def main() -> None:
     cfg = load_config()
     chunk_cfg = {"max_tokens": cfg.chunk_tokens, "overlap": cfg.chunk_overlap,
                  "min_tokens": cfg.chunk_min_tokens}
-    count_tokens = _token_counter(args.tokenizer, cfg.embed_model)
+    count_tokens = _token_counter(
+        args.tokenizer, cfg.tokenizer_model, cfg.tokenizer_revision
+    )
 
     spec = goldset.EVAL_SETS[args.golden_set]
     gold = goldset.load_golden_set(spec.gold)

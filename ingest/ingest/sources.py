@@ -143,6 +143,13 @@ class CanonicalDoc:
     # by scripts/reconcile_consolidated.py. None for sources/documents without the concept.
     is_consolidated: bool | None = None
     consolidated_count: int | None = None
+    # Source completeness lineage. New binary-backed items set these explicitly;
+    # unlabeled legacy Tbilisi articles fail closed because they are known summaries.
+    content_kind: str = "full_text"
+    content_complete: bool = True
+    extraction_status: str = "full_text"
+    source_binary_url: str | None = None
+    article_summary: str | None = None
 
 
 @dataclass(frozen=True)
@@ -170,7 +177,16 @@ class SourceSpec:
 
     def declared_keys(self) -> set[str]:
         """Every raw item key this spec reads — the schema-drift baseline of handled fields."""
-        keys: set[str] = {"body_markdown"}
+        keys: set[str] = {
+            "body_markdown",
+            "content_kind",
+            "content_complete",
+            "extraction_status",
+            "source_binary_url",
+            "article_summary",
+            "pdf_url",
+            "docx_url",
+        }
         for group in (self.id_fields, self.date_fields, self.title_fields, self.number_fields,
                       self.registration_fields, self.parties_fields, self.in_force_fields,
                       self.expiry_fields, self.url_fields, self.promote_fields):
@@ -241,6 +257,33 @@ class SourceSpec:
                 except (TypeError, ValueError):
                     consolidated_count = None
 
+        body_markdown = item.get("body_markdown") or ""
+        raw_complete = item.get("content_complete")
+        if isinstance(raw_complete, bool):
+            content_complete = raw_complete
+        elif isinstance(raw_complete, (int, float)):
+            content_complete = bool(raw_complete)
+        elif isinstance(raw_complete, str):
+            content_complete = raw_complete.strip().lower() in {"1", "true", "yes"}
+        elif self.source in {"tas", "tbappeal"}:
+            # Pre-hardening TB Appeals records contain only article text. Pre-hardening
+            # TAS records do not distinguish a full decision response from list/detail
+            # metadata. Neither can be promoted as complete without an explicit recrawl.
+            content_complete = False
+        else:
+            content_complete = bool(body_markdown.strip())
+        if self.source == "tbappeal" and raw_complete is None:
+            default_kind = "article_summary"
+        elif self.source == "tas" and raw_complete is None:
+            default_kind = "legacy_unlabeled"
+        else:
+            default_kind = "full_text" if content_complete else "metadata_only"
+        content_kind = str(item.get("content_kind") or default_kind).strip()
+        extraction_status = str(
+            item.get("extraction_status")
+            or ("full_text" if content_complete else "malformed")
+        ).strip()
+
         return CanonicalDoc(
             source=self.source,
             document_id=document_id,
@@ -258,11 +301,22 @@ class SourceSpec:
             status_raw=status_raw,
             in_force_date=_parse_date(self._first(item, self.in_force_fields)),
             expiry_date=_parse_date(self._first(item, self.expiry_fields)),
-            body_markdown=item.get("body_markdown") or "",
+            body_markdown=body_markdown,
             extra=item,
             promoted=promoted,
             is_consolidated=is_consolidated,
             consolidated_count=consolidated_count,
+            content_kind=content_kind,
+            content_complete=content_complete,
+            extraction_status=extraction_status,
+            source_binary_url=self._first(
+                item, ("source_binary_url", "pdf_url", "docx_url")
+            ),
+            article_summary=(
+                str(item["article_summary"])
+                if item.get("article_summary") not in (None, "")
+                else None
+            ),
         )
 
 

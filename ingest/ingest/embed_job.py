@@ -58,6 +58,19 @@ def snapshot_doc_to_canonical(d: dict) -> CanonicalDoc:
         promoted=d.get("promoted") or {},
         is_consolidated=d.get("is_consolidated"),
         consolidated_count=d.get("consolidated_count"),
+        content_kind=d.get("content_kind") or (
+            "article_summary" if d.get("source") == "tbappeal" else "full_text"
+        ),
+        content_complete=(
+            bool(d.get("content_complete"))
+            if "content_complete" in d
+            else d.get("source") != "tbappeal"
+        ),
+        extraction_status=d.get("extraction_status") or (
+            "malformed" if d.get("source") == "tbappeal" else "full_text"
+        ),
+        source_binary_url=d.get("source_binary_url"),
+        article_summary=d.get("article_summary"),
     )
 
 

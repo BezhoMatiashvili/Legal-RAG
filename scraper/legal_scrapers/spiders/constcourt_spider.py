@@ -21,7 +21,7 @@ from scrapy.loader import ItemLoader
 
 from ..items import ConstcourtItem
 from ..utils.dates import iso_to_dotted
-from ..utils.documents import docx_to_markdown
+from ..utils.documents import ExtractionStatus, docx_to_markdown
 from ..utils.markdown import safe_html_to_markdown
 from .base import BaseLegalSpider
 
@@ -148,12 +148,22 @@ class ConstcourtSpider(BaseLegalSpider):
                 meta={"data": data},
             )
         else:
+            data.update(
+                {
+                    "content_kind": "full_text",
+                    "content_complete": True,
+                    "extraction_status": ExtractionStatus.FULL_TEXT.value,
+                }
+            )
             yield self.load_item(data)
 
     def parse_docx_body(self, response):
         data = response.meta["data"]
         try:
-            data["body_markdown"] = docx_to_markdown(response.body) or data["body_markdown"]
+            result = docx_to_markdown(
+                response.body,
+                declared_mime=response.headers.get(b"Content-Type"),
+            )
         except Exception as exc:
             self.logger.warning("DOCX parse failed for %s: %s", response.url, exc)
             self.record_quality_failure(
@@ -163,6 +173,19 @@ class ConstcourtSpider(BaseLegalSpider):
                 context={"legal_id": data.get("legal_id")},
             )
             return
+        if result.status is not ExtractionStatus.FULL_TEXT:
+            self.record_quality_failure(
+                f"document_{result.status.value}",
+                response.url,
+                detail=result.detail,
+                context={"legal_id": data.get("legal_id")},
+            )
+            return
+        data["body_markdown"] = result.text
+        data["content_kind"] = result.content_kind
+        data["content_complete"] = result.content_complete
+        data["extraction_status"] = result.status.value
+        data["source_binary_url"] = response.url
         yield self.load_item(data)
 
     @staticmethod

@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # ingest/ root →
 from qdrant_client import models  # noqa: E402
 
 from ingest.config import load_config  # noqa: E402
+from ingest.operational import refuse_legacy_operation  # noqa: E402
 from ingest.pipeline import items_path  # noqa: E402
 
 
@@ -50,6 +51,7 @@ def _flush(client, collection: str, ids: list[str], value: bool) -> int:
 
 
 def main() -> None:
+    refuse_legacy_operation("in-place consolidation payload backfill")
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--run", default="latest", help="matsne run to read items from (default: latest)")
     ap.add_argument("--batch", type=int, default=300,

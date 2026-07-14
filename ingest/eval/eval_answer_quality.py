@@ -39,14 +39,14 @@ from .backend import MODES
 from .evaluate import build_query_relevance, make_backend
 
 
-def _token_counter(kind: str, embed_model: str):
+def _token_counter(kind: str, tokenizer_model: str, tokenizer_revision: str | None = None):
     if kind == "word":
         from ingest.chunking import default_token_counter
 
         return default_token_counter
     from ingest.embedding import make_token_counter
 
-    return make_token_counter(embed_model)
+    return make_token_counter(tokenizer_model, tokenizer_revision)
 
 
 def _load_unanswerable(path: Path) -> list[str]:
@@ -99,7 +99,7 @@ def main() -> None:
     chunk_cfg = {"max_tokens": cfg.chunk_tokens, "overlap": cfg.chunk_overlap,
                  "min_tokens": cfg.chunk_min_tokens}
     tok_kind = args.tokenizer or ("word" if args.backend == "fake" else "bge")
-    count_tokens = _token_counter(tok_kind, cfg.embed_model)
+    count_tokens = _token_counter(tok_kind, cfg.tokenizer_model, cfg.tokenizer_revision)
 
     spec = goldset.EVAL_SETS[args.golden_set]
     gold_all = goldset.load_golden_set(spec.gold)          # full set (translations validate vs this)

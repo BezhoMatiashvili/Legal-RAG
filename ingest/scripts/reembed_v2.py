@@ -31,6 +31,7 @@ import os  # noqa: E402
 
 from ingest.config import load_config  # noqa: E402
 from ingest.embedding import BGEM3Embedder  # noqa: E402
+from ingest.operational import refuse_legacy_operation  # noqa: E402
 from ingest.qdrant_store import ensure_collection, make_client, sparse_vector  # noqa: E402
 
 # Batch fed to the GPU per encode+upsert. 64 badly underutilizes a 4090 (measured ~47/s;
@@ -68,6 +69,7 @@ def iter_rows(rows_dir: Path):
 
 
 def main() -> None:
+    refuse_legacy_operation("non-generation re-embed writer")
     ap = argparse.ArgumentParser()
     ap.add_argument("--rows", required=True)
     ap.add_argument("--collection", required=True)

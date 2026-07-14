@@ -3,6 +3,8 @@
 # in ingest/docs/deployment.md passes (ingest also yellows the index during writes):
 #   mkdir -p ~/.config/systemd/user
 #   cp ingest/systemd/legal-ingest.{service,timer} ~/.config/systemd/user/
+#   printf 'LEGAL_SEARCH_REPO=%s\n' "$PWD" > ~/.config/georgia-legal-search.env
+#   chmod 600 ~/.config/georgia-legal-search.env
 #   systemctl --user daemon-reload
 #   # After approval: uncomment DAILY_INGEST_APPROVED below, then enable the timer.
 #   # systemctl --user enable --now legal-ingest.timer
@@ -15,10 +17,10 @@ Description=Georgian Legal RAG daily ingest (scrape, embed delta, verify coverag
 [Service]
 Type=oneshot
 # Fail closed until the deployment runbook's integrity/migration gate is complete.
-Environment=DAILY_INGEST_REQUIRE_APPROVAL=1
+EnvironmentFile=-%h/.config/georgia-legal-search.env
 #Environment=DAILY_INGEST_APPROVED=1
-ExecStart=%h/Desktop/Projects/Georgia-Legal-Search/ingest/scripts/daily_ingest.sh
-WorkingDirectory=%h/Desktop/Projects/Georgia-Legal-Search
+# bash performs the required-variable check before it resolves or executes a repository path.
+ExecStart=/usr/bin/bash -lc ': "${LEGAL_SEARCH_REPO:?set LEGAL_SEARCH_REPO in ~/.config/georgia-legal-search.env}"; exec "$LEGAL_SEARCH_REPO/ingest/scripts/daily_ingest.sh"'
 # Stay polite on the shared 30 GB desktop box: low CPU/IO priority, hard runtime cap
 # (TimeoutStartSec is the runtime cap for Type=oneshot; RuntimeMaxSec is ignored).
 Nice=10

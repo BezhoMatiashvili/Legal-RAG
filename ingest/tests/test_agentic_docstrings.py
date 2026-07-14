@@ -1,6 +1,6 @@
 """Drift guards for the agentic-retrieval contract in the MCP tool docstrings (I4).
 
-The MCP client is the answer composer; the docstrings ARE the serving-layer
+The MCP client (Claude) is the answer composer; the docstrings ARE the serving-layer
 behavior contract, so these tests pin their load-bearing markers. The retrieval code
 path is untouched by I4 — that invariant is covered by the fingerprint test below.
 """

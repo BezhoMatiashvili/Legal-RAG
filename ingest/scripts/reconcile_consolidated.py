@@ -51,6 +51,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # ingest/ root →
 from qdrant_client import models  # noqa: E402
 
 from ingest.config import load_config  # noqa: E402
+from ingest.operational import refuse_legacy_operation  # noqa: E402
 
 SIDECAR_NAME = "main_listed_ids.txt"
 
@@ -185,6 +186,7 @@ def set_consolidated(
 
 
 def main() -> None:
+    refuse_legacy_operation("in-place consolidation payload reconciliation")
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--run", help="matsne run id whose main_listed_ids.txt to use (default: newest)")
     ap.add_argument("--ids-file", help="explicit path to a listed-ids file (overrides --run)")

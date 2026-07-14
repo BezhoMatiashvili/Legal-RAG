@@ -8,6 +8,7 @@ The source pod (SRC_*) is left running as a fallback; terminate it manually once
 from __future__ import annotations
 
 import atexit
+import ipaddress
 import json
 import os
 import re
@@ -22,11 +23,19 @@ from pathlib import Path
 
 INGEST = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(INGEST))
-WORKDIR = Path.home() / "gpu_embed_work"
-KEY = str(WORKDIR / "id_ed25519")
+from ingest.operational import refuse_legacy_operation  # noqa: E402
+
+_workdir_value = os.environ.get("GPU_WORKDIR")
+WORKDIR = (
+    (INGEST / _workdir_value if not Path(_workdir_value).is_absolute() else Path(_workdir_value))
+    if _workdir_value
+    else INGEST / ".state" / "gpu-work"
+)
+KEY = str(Path(os.environ.get("GPU_SSH_KEY", WORKDIR / "id_ed25519")))
+KNOWN_HOSTS = str(Path(os.environ.get("GPU_KNOWN_HOSTS", WORKDIR / "known_hosts")))
 CPU_REF = INGEST / "snapshots" / "v1" / "checksum_cpu.json"
 
-# Source pod (has the unpacked corpus + corpus.tgz); supplied per run, never committed.
+# Source pod (has the unpacked corpus + a corpus.tgz). Required for provisioning only.
 SRC_IP = os.environ.get("RUNPOD_SOURCE_IP", "")
 SRC_PORT = os.environ.get("RUNPOD_SOURCE_PORT", "")
 
@@ -67,7 +76,11 @@ def gql(query: str, variables: dict | None = None) -> dict:
     global _KEY
     if _KEY is None:
         from dotenv import dotenv_values
-        _KEY = dotenv_values(INGEST / ".env").get("RUNPOD_API_KEY")
+        _KEY = os.environ.get("RUNPOD_API_KEY") or dotenv_values(INGEST / ".env").get(
+            "RUNPOD_API_KEY"
+        )
+        if not _KEY:
+            raise RuntimeError("RUNPOD_API_KEY is required")
     # Auth via `Authorization: Bearer` header, not a `?api_key=` query string (a URL secret is
     # logged verbatim by CDN/proxy access logs; a header is not). RunPod's GraphQL accepts it.
     req = urllib.request.Request(
@@ -93,7 +106,7 @@ def run(cmd, *, input=None, timeout=None, check=True, ok=(0,)):
 def _ssh(ip, port):
     return ["ssh", "-p", str(port), "-i", KEY, "-o", "IdentitiesOnly=yes",
             "-o", "StrictHostKeyChecking=accept-new",
-            "-o", f"UserKnownHostsFile={WORKDIR / 'known_hosts'}",
+            "-o", f"UserKnownHostsFile={KNOWN_HOSTS}",
             "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=20"]
 
 
@@ -177,11 +190,25 @@ def wait_ssh(pod_id):
     raise TimeoutError("SSH not ready")
 
 
+def validated_source_endpoint(ip: str, port: str) -> tuple[str, int]:
+    """Return a normalized RunPod source endpoint or reject unsafe shell input."""
+
+    try:
+        address = ipaddress.IPv4Address(ip)
+        number = int(port)
+    except (ipaddress.AddressValueError, TypeError, ValueError) as exc:
+        raise ValueError("RUNPOD_SOURCE_IP must be IPv4 and RUNPOD_SOURCE_PORT numeric") from exc
+    if not 1 <= number <= 65535:
+        raise ValueError("RUNPOD_SOURCE_PORT must be in 1..65535")
+    return str(address), number
+
+
 def wait_corpus_ready():
+    source_ip, source_port = validated_source_endpoint(SRC_IP, SRC_PORT)
     log("waiting for corpus.tgz on the source pod...")
     for _ in range(60):
-        if ssh_ok(SRC_IP, SRC_PORT, "test -f /workspace/out/tar.done && test -f /workspace/corpus.tgz", 30):
-            sz = ssh_cap(SRC_IP, SRC_PORT, "stat -c%s /workspace/corpus.tgz 2>/dev/null").strip()
+        if ssh_ok(source_ip, source_port, "test -f /workspace/out/tar.done && test -f /workspace/corpus.tgz", 30):
+            sz = ssh_cap(source_ip, source_port, "stat -c%s /workspace/corpus.tgz 2>/dev/null").strip()
             log(f"corpus.tgz ready ({int(sz)/1e9:.2f} GB) on source pod")
             return
         time.sleep(15)
@@ -189,13 +216,15 @@ def wait_corpus_ready():
 
 
 def transfer_corpus(ip, port):
+    source_ip, source_port = validated_source_endpoint(SRC_IP, SRC_PORT)
     log("delivering corpus pod-to-pod (source pod → new pod, datacenter speed)...")
     push_content(ip, port, "/root/.ssh/srckey", Path(KEY).read_text(), mode="600")
     ensure_pod_tools(ip, port)
     ssh_ok(ip, port, "command -v scp >/dev/null || (apt-get install -y -qq openssh-client)", 180)
-    remote = (f"scp -i /root/.ssh/srckey -P {SRC_PORT} -o StrictHostKeyChecking=accept-new "
+    source = shlex.quote(f"root@{source_ip}:/workspace/corpus.tgz")
+    remote = (f"scp -i /root/.ssh/srckey -P {source_port} -o StrictHostKeyChecking=accept-new "
               f"-o UserKnownHostsFile=/root/.ssh/known_hosts "
-              f"root@{SRC_IP}:/workspace/corpus.tgz /workspace/corpus.tgz && "
+              f"{source} /workspace/corpus.tgz && "
               f"cd /workspace && tar xzf corpus.tgz --no-same-owner --no-same-permissions && "
               f"rm -f corpus.tgz /root/.ssh/srckey && echo TRANSFER_OK")
     out = ssh_cap(ip, port, remote, timeout=1800)
@@ -281,6 +310,7 @@ def _cleanup():
 
 
 def restore(points):
+    refuse_legacy_operation("direct multi-GPU snapshot restore into georgian_legal")
     snap = WORKDIR / "out_multi" / f"{COLLECTION}.snapshot"
     log("restoring snapshot into LOCAL Qdrant...")
     run(["curl", "-sf", "-X", "POST",
@@ -292,9 +322,10 @@ def restore(points):
 
 
 def main():
+    refuse_legacy_operation("multi-GPU v1 embed and direct restore")
     global _pod_id, _ip, _port, _provisioned_at, _price
     if not SRC_IP or not SRC_PORT:
-        raise SystemExit("Set RUNPOD_SOURCE_IP and RUNPOD_SOURCE_PORT before starting")
+        raise SystemExit("RUNPOD_SOURCE_IP and RUNPOD_SOURCE_PORT are required")
     atexit.register(_cleanup)
     signal.signal(signal.SIGINT, lambda *a: (_cleanup(), sys.exit(1)))
     signal.signal(signal.SIGTERM, lambda *a: (_cleanup(), sys.exit(1)))

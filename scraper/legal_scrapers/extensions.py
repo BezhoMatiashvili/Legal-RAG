@@ -13,15 +13,23 @@ legal_scrapers.run``) it draws one compact table with a row per spider. Routing 
 spider through one ``Live`` is what makes the multi-spider view possible — two
 concurrent ``Live`` instances on the same stdout would corrupt the terminal.
 
-It is purely additive and read-only against the crawl — no items, feeds, or
-pipelines are touched. Totals are unknown up front (the ``matsne`` spider is
+The live display is purely additive and read-only against the crawl. A separate
+``DurableDedupCommitExtension`` waits for Scrapy's feed-exporter-closed signal,
+fsyncs local feeds, and only then commits generic staged dedup outcomes. Totals
+are unknown up front (the ``matsne`` spider is
 two-phase and ``spider_idle``-driven), so the display shows spinners plus
 running counters and rates rather than a misleading "X% complete" bar.
 """
 
+import logging
+import os
+import stat
 import sys
 import time
 from dataclasses import dataclass, field
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 from scrapy import signals
 from scrapy.exceptions import NotConfigured
@@ -50,6 +58,184 @@ _TITLE_KEYS = (
 
 _SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 _MAX_TITLE_LEN = 48
+_LOG_MAX_BYTES = 50 * 1024 * 1024
+_LOG_BACKUPS = 10
+
+
+class _PrivateRotatingFileHandler(RotatingFileHandler):
+    def _open(self):
+        descriptor = os.open(
+            self.baseFilename,
+            os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+        )
+        return os.fdopen(
+            descriptor,
+            "a",
+            encoding=self.encoding,
+            errors=self.errors,
+        )
+
+
+class _OnlySpider(logging.Filter):
+    def __init__(self, spider):
+        super().__init__()
+        self.spider = spider
+
+    def filter(self, record):
+        bound = getattr(record, "spider", None)
+        return bound is self.spider or (
+            bound is not None
+            and getattr(bound, "name", None) == getattr(self.spider, "name", None)
+        )
+
+
+class RotatingSpiderLogExtension:
+    """Write each spider's own records to a bounded 50 MiB × 10 private log."""
+
+    def __init__(self, crawler):
+        self.crawler = crawler
+        self.handler = None
+
+    @classmethod
+    def from_crawler(cls, crawler):
+        extension = cls(crawler)
+        crawler.signals.connect(extension.spider_opened, signal=signals.spider_opened)
+        crawler.signals.connect(extension.spider_closed, signal=signals.spider_closed)
+        return extension
+
+    def spider_opened(self, spider):
+        path = Path(spider.log_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            if not path.is_file() or stat.S_IMODE(path.stat().st_mode) & 0o077:
+                raise PermissionError(
+                    f"spider log is not a private regular file: {path}"
+                )
+        else:
+            descriptor = os.open(
+                path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
+                0o600,
+            )
+            os.close(descriptor)
+        handler = _PrivateRotatingFileHandler(
+            path,
+            maxBytes=_LOG_MAX_BYTES,
+            backupCount=_LOG_BACKUPS,
+            encoding="utf-8",
+        )
+        handler.addFilter(_OnlySpider(spider))
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s [%(name)s] %(levelname)s: %(message)s")
+        )
+        logging.getLogger().addHandler(handler)
+        self.handler = handler
+
+    def spider_closed(self, spider, reason):
+        if self.handler is None:
+            return
+        logging.getLogger().removeHandler(self.handler)
+        self.handler.close()
+        self.handler = None
+
+
+class DurableDedupCommitExtension:
+    """Commit generic dedup outcomes only after every feed is durably closed."""
+
+    def __init__(self, crawler):
+        self.crawler = crawler
+
+    @classmethod
+    def from_crawler(cls, crawler):
+        extension = cls(crawler)
+        crawler.signals.connect(
+            extension.feed_exporter_closed, signal=signals.feed_exporter_closed
+        )
+        return extension
+
+    @staticmethod
+    def _local_feed_path(uri) -> Path | None:
+        text = str(uri)
+        parsed = urlparse(text)
+        if parsed.scheme == "file":
+            return Path(unquote(parsed.path))
+        if not parsed.scheme:
+            return Path(text)
+        return None
+
+    @staticmethod
+    def _fsync_local_feed(path: Path) -> None:
+        if not path.is_file():
+            raise FileNotFoundError(f"configured feed was not materialized: {path}")
+        if stat.S_IMODE(path.stat().st_mode) & 0o077:
+            raise PermissionError(
+                f"configured feed is not owner-only; refusing to chmod existing file: {path}"
+            )
+        with path.open("rb") as handle:
+            os.fsync(handle.fileno())
+        directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+
+    def feed_exporter_closed(self):
+        spider = getattr(self.crawler, "spider", None)
+        if spider is None or getattr(spider, "name", "") == "supremecourt":
+            return
+        staged = getattr(spider, "_staged_dedup_records", None)
+        if not staged:
+            return
+
+        feeds = self.crawler.settings.getdict("FEEDS")
+        stats = self.crawler.stats
+        feed_stats = stats.get_stats()
+        successes = sum(
+            int(value or 0)
+            for key, value in feed_stats.items()
+            if key.startswith("feedexport/success_count/")
+        )
+        failures = sum(
+            int(value or 0)
+            for key, value in feed_stats.items()
+            if key.startswith("feedexport/failed_count/")
+        )
+        if not feeds or failures or successes < len(feeds):
+            spider.discard_staged_seen()
+            stats.inc_value("dedup/feed_commit_refused")
+            spider.record_quality_failure(
+                "durable_feed_commit_refused",
+                "feed-export://configured-outputs",
+                detail=(
+                    f"feeds={len(feeds)} successes={successes} failures={failures}"
+                ),
+            )
+            spider.logger.error(
+                "dedup: refusing staged commit; feeds=%d successes=%d failures=%d",
+                len(feeds),
+                successes,
+                failures,
+            )
+            return
+
+        try:
+            for uri in feeds:
+                path = self._local_feed_path(uri)
+                if path is not None:
+                    self._fsync_local_feed(path)
+            committed = spider.commit_staged_seen()
+        except Exception as exc:  # noqa: BLE001 - storage failure must fail closed
+            spider.discard_staged_seen()
+            stats.inc_value("dedup/feed_commit_refused")
+            spider.record_quality_failure(
+                "durable_feed_commit_refused",
+                "feed-export://configured-outputs",
+                detail=f"{type(exc).__name__}: {exc}",
+            )
+            spider.logger.error("dedup: staged commit failed closed: %s", exc)
+            return
+        stats.inc_value("dedup/committed_after_feeds", committed)
 
 
 def extract_title(item) -> str | None:
@@ -183,7 +369,9 @@ def render_panel(snap: ProgressSnapshot, spinner_frame: str) -> Panel:
         title_align="left",
         subtitle=subtitle,
         subtitle_align="right",
-        border_style="green" if snap.done and snap.finish_reason == "finished" else "cyan",
+        border_style="green"
+        if snap.done and snap.finish_reason == "finished"
+        else "cyan",
         padding=(0, 1),
     )
 
@@ -191,13 +379,13 @@ def render_panel(snap: ProgressSnapshot, spinner_frame: str) -> Panel:
 def render_table(snapshots, spinner_frame: str, elapsed_s: float):
     """Compact multi-spider view: one row per spider plus a totals footer. Pure."""
     table = Table.grid(padding=(0, 2))
-    table.add_column(no_wrap=True)                      # status glyph
-    table.add_column(style="bold", no_wrap=True)        # spider name
-    table.add_column(justify="right", no_wrap=True)     # run items
-    table.add_column(justify="right", no_wrap=True)     # total items
+    table.add_column(no_wrap=True)  # status glyph
+    table.add_column(style="bold", no_wrap=True)  # spider name
+    table.add_column(justify="right", no_wrap=True)  # run items
+    table.add_column(justify="right", no_wrap=True)  # total items
     table.add_column(justify="right", style="dim", no_wrap=True)  # requests
-    table.add_column(justify="right", no_wrap=True)     # errors
-    table.add_column()                                  # status / state
+    table.add_column(justify="right", no_wrap=True)  # errors
+    table.add_column()  # status / state
 
     header = ("", "SPIDER", "RUN", "TOTAL", "REQS", "ERR", "STATUS")
     table.add_row(*(Text(h, style="bold dim") for h in header))
@@ -266,8 +454,8 @@ class _ProgressDashboard:
     def reset(self):
         self.live = None
         self.loop = None
-        self.exts = []          # registered LiveProgressExtension instances
-        self.declared = []      # spider names pre-declared by the runner
+        self.exts = []  # registered LiveProgressExtension instances
+        self.declared = []  # spider names pre-declared by the runner
         self.force_table = False
         self.started_monotonic = 0.0
         self.spinner_index = 0
@@ -302,9 +490,7 @@ class _ProgressDashboard:
         for ext in self.exts:
             snap = ext.current_snapshot()
             total = (
-                f" · {snap.total_items} total"
-                if snap.total_items is not None
-                else ""
+                f" · {snap.total_items} total" if snap.total_items is not None else ""
             )
             print(
                 f"✓ {snap.spider}: {snap.items} items this run{total}"
@@ -322,9 +508,7 @@ class _ProgressDashboard:
     def on_spider_closed(self, ext):
         # In multi-spider mode the runner calls finish() once the reactor stops.
         # In single-spider mode there is no runner, so finish when all done.
-        if not self.declared and all(
-            e.final_snapshot is not None for e in self.exts
-        ):
+        if not self.declared and all(e.final_snapshot is not None for e in self.exts):
             self.finish()
 
     # --- internals ---------------------------------------------------------
@@ -457,7 +641,7 @@ class LiveProgressExtension:
         for key, value in self.stats.get_stats().items():
             if key.startswith(prefix):
                 try:
-                    status_counts[int(key[len(prefix):])] = value
+                    status_counts[int(key[len(prefix) :])] = value
                 except ValueError:
                     continue
 
@@ -484,7 +668,7 @@ class LiveProgressExtension:
     def _total_items(spider) -> int | None:
         if not getattr(spider, "dedup_enabled", False):
             return None
-        seen_keys = getattr(spider, "_seen_keys", None)
-        if seen_keys is None:
+        counter = getattr(spider, "dedup_seen_count", None)
+        if not callable(counter):
             return None
-        return len(seen_keys)
+        return counter()

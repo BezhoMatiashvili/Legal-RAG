@@ -404,6 +404,9 @@ class TasDetailTests(unittest.TestCase):
         # Decision text: converted, no code fences from the <pre> wrappers.
         self.assertIn("ადასტურებს", item["response_markdown"])
         self.assertNotIn("```", item["response_markdown"])
+        self.assertEqual(item["content_kind"], "decision_full_text")
+        self.assertTrue(item["content_complete"])
+        self.assertEqual(item["extraction_status"], "full_text")
 
         # Body weaves the title info + decision together.
         self.assertIn("**გადაწყვეტილება:** თანხმობა", item["body_markdown"])
@@ -421,6 +424,9 @@ class TasDetailTests(unittest.TestCase):
         self.assertNotIn("decision", item)
         self.assertNotIn("applicant_name", item)
         self.assertNotIn("parcels", item)
+        self.assertEqual(item["content_kind"], "list_metadata")
+        self.assertFalse(item["content_complete"])
+        self.assertEqual(item["extraction_status"], "malformed")
 
     def test_unsubmitted_draft_is_not_enriched(self):
         spider = TasSpider()
@@ -431,6 +437,20 @@ class TasDetailTests(unittest.TestCase):
         self.assertEqual(item["document_no"], "AR125755")
         self.assertNotIn("decision", item)
         self.assertNotIn("applicant_name", item)
+        self.assertEqual(item["content_kind"], "draft_metadata")
+        self.assertFalse(item["content_complete"])
+        self.assertEqual(item["extraction_status"], "malformed")
+
+    def test_detail_without_decision_text_remains_incomplete(self):
+        spider = TasSpider()
+        detail = _tas_detail()
+        detail["document"]["responseText"] = ""
+
+        item = spider.build_item(_tas_list_record(), detail)
+
+        self.assertEqual(item["content_kind"], "detail_metadata")
+        self.assertFalse(item["content_complete"])
+        self.assertEqual(item["extraction_status"], "malformed")
 
 
 if __name__ == "__main__":

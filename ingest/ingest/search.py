@@ -5,6 +5,7 @@ Used to verify ingestion quality and as a reusable retrieval helper.
 
 import math
 import re
+import time
 
 from qdrant_client import models
 
@@ -113,6 +114,7 @@ def hybrid_search(
     route: bool = True,
     max_per_doc: int | None = None,
     mmr_lambda: float | None = None,
+    timings_ms: dict[str, float] | None = None,
     **filters,
 ):
     """Two-stage retrieval: hybrid (dense+sparse, RRF-fused) recall → optional rerank.
@@ -129,7 +131,10 @@ def hybrid_search(
     Georgian sub-words and only add noise. Georgian queries use the full hybrid. Pass
     ``route=False`` to force hybrid regardless (e.g. for an A/B in the eval harness).
     """
+    t0 = time.perf_counter()
     emb = embedder.encode_query(query)
+    if timings_ms is not None:
+        timings_ms["embed"] = timings_ms.get("embed", 0.0) + (time.perf_counter() - t0) * 1000
     flt = build_filter(**filters)
 
     # Citation exact-match routing (CITATION_ROUTE, I1): resolve an explicit citation through
@@ -139,7 +144,12 @@ def hybrid_search(
     if getattr(cfg, "citation_route", None) and flt is None:
         ref = extract_citation(query, mode=cfg.citation_route)
         if ref is not None:
+            t0 = time.perf_counter()
             pinned = citation_lookup(client, cfg.collection_name, emb.dense, ref)
+            if timings_ms is not None:
+                timings_ms["search"] = (
+                    timings_ms.get("search", 0.0) + (time.perf_counter() - t0) * 1000
+                )
 
     # How many candidates to fuse before reranking. With a reranker we want a deep pool
     # so the cross-encoder has real recall to work with; without one, the old top_k*5/50.
@@ -173,6 +183,7 @@ def hybrid_search(
             )
         )
 
+    t0 = time.perf_counter()
     result = client.query_points(
         collection_name=cfg.collection_name,
         prefetch=prefetch,
@@ -181,13 +192,20 @@ def hybrid_search(
         with_payload=True,
         with_vectors=want_vec,
     )
+    if timings_ms is not None:
+        timings_ms["search"] = timings_ms.get("search", 0.0) + (time.perf_counter() - t0) * 1000
     points = result.points
     if reranker is not None and points:
         # Rerank the whole pool when diversifying so MMR/cap choose the final top_k.
+        t0 = time.perf_counter()
         points = rerank_points(
             reranker, query, points,
             top_k=len(points) if diversity_on else top_k, min_score=rerank_min_score,
         )
+        if timings_ms is not None:
+            timings_ms["rerank"] = (
+                timings_ms.get("rerank", 0.0) + (time.perf_counter() - t0) * 1000
+            )
     if diversity_on:
         points = diversify(points, top_k=top_k, max_per_doc=max_per_doc,
                            mmr_lambda=mmr_lambda, query_vec=emb.dense)

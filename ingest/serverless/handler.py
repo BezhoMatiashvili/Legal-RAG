@@ -41,14 +41,120 @@ import qdrant_boot  # noqa: E402  (sibling module; script dir is on sys.path)
 
 _BOOT_ERROR: str | None = None
 _RESTORE: dict = {"status": "not_checked"}
+_RUNTIME_MANIFEST: dict | None = None
+_RUNTIME_CFG = None
 
 
-def _boot() -> None:
+def _configure_runtime_environment(manifest: dict):
+    """Bind immutable worker config and prove its fingerprints before MCP import."""
+    identity = manifest["point_identity"]
+    vector = manifest["vector_space"]
+    forced = {
+        "SEARCH_BACKEND": "local",
+        "QUERY_LOG_ENABLED": "false",
+        "QDRANT_URL": qdrant_boot.QDRANT_URL,
+        "COLLECTION_NAME": manifest["collection"],
+        "GENERATION_ID": manifest["generation_id"],
+        "EMBED_MODEL": identity["embedding_model"],
+        "EMBED_REVISION": identity["embedding_revision"],
+        "TOKENIZER_MODEL": identity["tokenizer_model"],
+        "TOKENIZER_REVISION": identity["tokenizer_revision"],
+        "RERANK_MODEL": identity["reranker_model"],
+        "RERANK_REVISION": identity["reranker_revision"],
+        # The worker owns the pinned local reranker; an ambient URL could silently route
+        # production scoring to an unverified external model with the same display name.
+        "RERANK_REMOTE_URL": "",
+        "DENSE_DIM": str(vector["dense_dimension"]),
+        "EMBED_HEADER_V2": "true" if identity["document_header"] else "false",
+        # Load the environment config in development mode, then elevate the frozen
+        # instance only after the handler has verified every generation identity below.
+        "PRODUCTION_MODE": "false",
+    }
+    os.environ.update(forced)
+    # A machine/image path cannot substitute for the verified serverless boot protocol.
+    # The in-process MCP readiness probe installed below is the only permitted exception
+    # to the normal full GENERATION_DIR artifact requirement.
+    os.environ.pop("GENERATION_DIR", None)
+    os.environ.pop("VERIFIED_WORKER_BINDING", None)
+
+    from dataclasses import replace
+
+    from ingest.config import load_config, validate_production_config
+    from ingest.qdrant_store import generation_point_identity
+
+    cfg = replace(
+        load_config(), production_mode=True, verified_worker_binding=True
+    )
+    validate_production_config(cfg)
+    actual_identity = generation_point_identity(cfg)
+    if actual_identity is None:
+        raise RuntimeError("bound worker configuration has no generation identity")
+    actual_payload = actual_identity.as_payload()
+    identity_mismatches = sorted(
+        key
+        for key, expected in identity.items()
+        if actual_payload.get(key) != expected
+    )
+    worker_vector = {
+        "dense_name": "dense",
+        "dense_dimension": cfg.dense_dim,
+        "distance": "cosine",
+        "sparse_name": "sparse",
+    }
+    vector_mismatches = sorted(
+        key for key, expected in vector.items() if worker_vector.get(key) != expected
+    )
+    if identity_mismatches or vector_mismatches:
+        fields = [
+            *(f"point_identity.{key}" for key in identity_mismatches),
+            *(f"vector_space.{key}" for key in vector_mismatches),
+        ]
+        raise RuntimeError(
+            "worker search configuration does not match restored generation: "
+            + ", ".join(fields)
+        )
+    # Any accidental later load_config() call now fails closed without GENERATION_DIR;
+    # mcp_server receives the already-validated frozen cfg through its installer.
+    os.environ["PRODUCTION_MODE"] = "true"
+    return cfg
+
+
+def _accept_restore(candidate: dict, *, allow_initial_bind: bool) -> None:
+    """Accept only the cold-bound identity; warm generation changes need a restart."""
+    global _RESTORE, _RUNTIME_CFG, _RUNTIME_MANIFEST
+    _RESTORE = candidate
+    manifest = qdrant_boot.verified_runtime_manifest(candidate)
+    if allow_initial_bind:
+        _RUNTIME_CFG = _configure_runtime_environment(manifest)
+        _RUNTIME_MANIFEST = manifest
+        return
+    if _RUNTIME_MANIFEST is None:
+        raise RuntimeError(
+            "generation became ready after MCP import; cold restart required before serving"
+        )
+    if (
+        qdrant_boot.runtime_manifest_identity(manifest)
+        != qdrant_boot.runtime_manifest_identity(_RUNTIME_MANIFEST)
+    ):
+        raise RuntimeError(
+            "published generation changed after MCP import; cold restart required before serving"
+        )
+
+
+def _boot(*, allow_initial_bind: bool = False) -> None:
     """Cold-start boot: qdrant up + apply any pending publish. Sets globals, never raises."""
     global _BOOT_ERROR, _RESTORE
     try:
         qdrant_boot.ensure_running()
-        _RESTORE = qdrant_boot.maybe_restore()
+        candidate = qdrant_boot.maybe_restore()
+        if candidate.get("status") == "no_manifest":
+            # A newly provisioned worker may be probed before any approved generation is
+            # published. Keep liveness/health available, but bind nothing and serve no ops.
+            _RESTORE = candidate
+            _BOOT_ERROR = None
+            logger.info("boot restore check: %s", _RESTORE)
+            return
+        _accept_restore(candidate, allow_initial_bind=allow_initial_bind)
         logger.info("boot restore check: %s", _RESTORE)
         _BOOT_ERROR = None
     except Exception as e:  # noqa: BLE001 - see module docstring: no billed crash-loops
@@ -56,9 +162,21 @@ def _boot() -> None:
         logger.error("worker boot failed: %s\n%s", _BOOT_ERROR, traceback.format_exc())
 
 
-_boot()
+_boot(allow_initial_bind=True)
 
 from ingest import mcp_server as srv  # noqa: E402  (import is side-effect-free)
+
+
+def _worker_readiness() -> dict:
+    return qdrant_boot.runtime_readiness(_RESTORE, _RUNTIME_MANIFEST)
+
+
+if _RUNTIME_CFG is not None:
+    try:
+        srv._install_verified_worker_runtime(_RUNTIME_CFG, _worker_readiness)
+    except Exception as e:  # noqa: BLE001 - keep fail-soft boot, but never serve unbound
+        _BOOT_ERROR = f"{type(e).__name__}: {e}"
+        logger.error("worker runtime binding install failed: %s", _BOOT_ERROR)
 
 OPS: dict[str, tuple] = {
     "search": (srv.legal_search, srv.SearchInput),
@@ -106,12 +224,18 @@ async def _warmup() -> None:
     """Load both models eagerly. Init time is billed either way, and FlashBoot then
     snapshots a worker with everything resident, so warm revivals answer instantly and
     the first search never pays the model load inside its own request."""
+    readiness = _worker_readiness()
+    if not readiness.get("ok"):
+        raise RuntimeError(
+            "refusing model warmup without exact generation readiness: "
+            f"{readiness.get('code', 'unknown')}"
+        )
     await srv._get_embedder()
     await srv._get_reranker()
 
 
 async def handler(job: dict) -> dict:
-    global _RESTORE
+    global _BOOT_ERROR, _RESTORE
     inp = job.get("input") or {}
     op = inp.get("op") or "health"
     params = inp.get("params") or {}
@@ -122,10 +246,22 @@ async def handler(job: dict) -> dict:
             if _BOOT_ERROR is not None:
                 await asyncio.to_thread(_boot)
                 if _BOOT_ERROR is not None:
-                    return {"error": f"worker boot failed: {_BOOT_ERROR}"}
+                    return {
+                        "error": f"worker boot failed: {_BOOT_ERROR}",
+                        "restore": _RESTORE,
+                    }
             else:
-                _RESTORE = await asyncio.to_thread(
-                    qdrant_boot.maybe_restore, bool(params.get("force")))
+                candidate = await asyncio.to_thread(
+                    qdrant_boot.maybe_restore, bool(params.get("force"))
+                )
+                try:
+                    _accept_restore(candidate, allow_initial_bind=False)
+                except Exception as e:  # noqa: BLE001 - warm identity changes fail closed
+                    _BOOT_ERROR = f"{type(e).__name__}: {e}"
+                    return {
+                        "error": f"worker boot failed: {_BOOT_ERROR}",
+                        "restore": _RESTORE,
+                    }
             if _RESTORE.get("status") == "restored":
                 srv._result_cache.clear()
             return {"result": json.dumps(_RESTORE, ensure_ascii=False), "restore": _RESTORE}
@@ -139,9 +275,42 @@ async def handler(job: dict) -> dict:
         # stale-data warning until an empty cold worker (or blue/green promotion) is used.
         if await asyncio.to_thread(qdrant_boot.restore_pending):
             logger.info("new publish detected on a warm worker; checking safe restore policy")
-            _RESTORE = await asyncio.to_thread(qdrant_boot.maybe_restore)
+            candidate = await asyncio.to_thread(qdrant_boot.maybe_restore)
+            try:
+                _accept_restore(candidate, allow_initial_bind=False)
+            except Exception as e:  # noqa: BLE001 - never mix boot and imported identities
+                _BOOT_ERROR = f"{type(e).__name__}: {e}"
+                return {
+                    "error": f"worker boot failed: {_BOOT_ERROR}",
+                    "restore": _RESTORE,
+                }
             if _RESTORE.get("status") == "restored":
                 srv._result_cache.clear()
+
+        readiness = _worker_readiness()
+        generation_ready = bool(readiness.get("ok"))
+        if op == "health" and not generation_ready:
+            health = {
+                "ok": False,
+                "code": readiness.get("code", "generation_not_verified"),
+                "restore_status": _RESTORE.get("status", "unknown"),
+                "restore_code": _RESTORE.get("code", "unverified"),
+                "readiness": readiness,
+            }
+            return {
+                "result": json.dumps(health, ensure_ascii=False),
+                "sysinfo": _sysinfo(),
+                "restore": _RESTORE,
+            }
+        if op != "health" and not generation_ready:
+            return {
+                "error": (
+                    "worker abstained: no exact, green, immutable generation is verified; "
+                    f"restore_status={_RESTORE.get('status', 'unknown')!r} "
+                    f"restore_code={_RESTORE.get('code', 'unverified')!r}"
+                ),
+                "restore": _RESTORE,
+            }
 
         entry = OPS.get(op)
         if entry is None:
@@ -149,10 +318,6 @@ async def handler(job: dict) -> dict:
                              f"{sorted([*OPS, 'refresh'])}"}
         fn, model = entry
         result = await fn(model(**params)) if model is not None else await fn()
-        if _RESTORE.get("status") == "error":
-            # Serving beats an outage, but stale data must be visible to the caller.
-            result = ("> WARNING: worker data may be STALE — the last publish failed to "
-                      f"restore: {_RESTORE.get('detail')}\n\n") + result
         out = {"result": result}
         if op == "health":
             out["sysinfo"] = _sysinfo()

@@ -4,9 +4,20 @@
 # pod-to-pod), so no decrypt step. Idempotent/resumable: each shard has its own checkpoint.
 set -uo pipefail
 
+if [ "${RUNPOD_EPHEMERAL_QDRANT:-0}" != "1" ]; then
+  echo "refusing legacy embed outside an explicitly attested ephemeral RunPod Qdrant" >&2
+  exit 78
+fi
+
 WORK="${WORK:-/workspace}"
 OUT="$WORK/out"
-COLLECTION="${COLLECTION_NAME:-georgian_legal}"
+GENERATION_ID="${GENERATION_ID:-}"
+COLLECTION="${COLLECTION_NAME:-}"
+if [[ ! "$GENERATION_ID" =~ ^[a-z0-9][a-z0-9_-]{7,127}$ ]] || \
+   [ "$COLLECTION" != "georgian_legal__gen_${GENERATION_ID}" ]; then
+  echo "refusing embed without exact GENERATION_ID/physical collection binding" >&2
+  exit 78
+fi
 QDRANT_VER="${QDRANT_VER:-v1.18.2}"
 N="${SHARDS:-4}"
 mkdir -p "$OUT"
@@ -49,7 +60,7 @@ export EMBED_DEVICE="cuda" EMBED_USE_FP16="true" EMBED_BATCH_SIZE="${EMBED_BATCH
 "$PY" -m ingest embed --checksum >"$OUT/checksum_stdout.txt" 2>&1 || true
 # pre-create the collection once so concurrent shards never race on creation
 "$PY" -c "from ingest.config import load_config; from ingest import qdrant_store as s; \
-  cfg=load_config(); c=s.make_client(cfg); s.ensure_collection(c, cfg); print('collection ready')"
+  cfg=load_config(); c=s.make_client(cfg); s.ensure_collection(c, cfg, apply=True); print('collection ready')"
 
 # drop stale whole-source checkpoints carried in the corpus tar (shards use *.shardXofN.embed.json)
 for f in "$WORK"/ingest/.state/*.embed.json; do case "$f" in *.shard*) ;; *) rm -f "$f";; esac; done 2>/dev/null || true
@@ -58,7 +69,7 @@ echo "[$(date -u +%FT%TZ)] launching $N sharded processes (one per GPU)..."
 pids=""
 for i in $(seq 0 $((N-1))); do
   CUDA_VISIBLE_DEVICES=$i "$PY" -m ingest embed --source all --shard "$i/$N" --batch-size 256 \
-    >"$OUT/shard$i.log" 2>&1 &
+    --apply >"$OUT/shard$i.log" 2>&1 &
   pids="$pids $!"
 done
 fail=0

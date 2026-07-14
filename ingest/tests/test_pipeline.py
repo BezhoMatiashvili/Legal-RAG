@@ -111,6 +111,39 @@ def test_writer_cleans_body_before_chunking_and_hashing(tmp_path):
     assert payload["document_chunk_count"] == sum(len(batch) for batch, _ in client.upserts)
 
 
+def test_generation_writer_stamps_every_point_with_same_identity(tmp_path):
+    cfg = dataclasses.replace(
+        _make_cfg(tmp_path),
+        generation_id="gen_20260713_verified",
+        collection_name="test__gen_gen_20260713_verified",
+        embedding_revision="a" * 40,
+        tokenizer_revision="b" * 40,
+        reranker_revision="c" * 40,
+        rerank_enabled=False,
+    )
+    _write_items(cfg, "ecd", [_ecd_item(1)])
+    client = FakeClient()
+
+    docs, _, skipped = _run(cfg, client, "ecd")
+
+    assert docs == 1 and skipped == 0
+    payloads = [point.payload for batch, _wait in client.upserts for point in batch]
+    assert payloads
+    assert {payload["generation_id"] for payload in payloads} == {cfg.generation_id}
+    assert {payload["schema_version"] for payload in payloads} == {1}
+    assert {payload["tokenizer_model"] for payload in payloads} == {
+        cfg.tokenizer_model
+    }
+    assert {payload["reranker_model"] for payload in payloads} == {
+        cfg.rerank_model
+    }
+    assert {payload["reranker_revision"] for payload in payloads} == {
+        cfg.reranker_revision
+    }
+    assert len({payload["retrieval_fingerprint"] for payload in payloads}) == 1
+    assert all(len(payload["retrieval_fingerprint"]) == 64 for payload in payloads)
+
+
 def test_near_empty_body_is_quarantined(tmp_path):
     cfg = _make_cfg(tmp_path)
     _write_items(cfg, "ecd", [_ecd_item(1, body="too short")])
@@ -119,6 +152,46 @@ def test_near_empty_body_is_quarantined(tmp_path):
     docs, chunks, skipped = _run(cfg, client, "ecd")
 
     assert (docs, chunks, skipped) == (0, 0, 1)
+    assert client.upserts == []
+
+
+def test_incomplete_summary_is_quarantined_even_when_text_is_long(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    item = _ecd_item(1)
+    item.update(
+        {
+            "content_kind": "article_summary",
+            "content_complete": False,
+            "extraction_status": "scanned_no_text",
+            "source_binary_url": "https://court.example/ruling.pdf",
+        }
+    )
+    _write_items(cfg, "ecd", [item])
+    client = FakeClient()
+
+    assert _run(cfg, client, "ecd") == (0, 0, 1)
+    assert client.upserts == []
+
+
+def test_legacy_unlabeled_tas_text_is_quarantined(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    _write_items(
+        cfg,
+        "tas",
+        [
+            {
+                "document_id": "legacy-list-only",
+                "document_no": "AR-LEGACY",
+                "body_markdown": (
+                    "list metadata with enough words to pass the ordinary text "
+                    "hygiene threshold but without decision completeness lineage"
+                ),
+            }
+        ],
+    )
+    client = FakeClient()
+
+    assert _run(cfg, client, "tas") == (0, 0, 1)
     assert client.upserts == []
 
 

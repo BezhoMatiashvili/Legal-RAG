@@ -22,6 +22,11 @@ _MAX_LENGTH = 512   # query+chunk truncation (chunks are already ~512 tokens)
 _BATCH_SIZE = 16
 
 
+def _revision_kwargs(revision: str | None) -> dict[str, str]:
+    """Keep the historical loader call byte-for-byte equivalent while unpinned."""
+    return {"revision": revision} if revision is not None else {}
+
+
 def _auto_device(torch) -> str:
     if torch.cuda.is_available():
         return "cuda"
@@ -60,8 +65,11 @@ class BGEReranker:
         if (cfg.rerank_device or _auto_device(torch)) == "cpu":
             _configure_cpu_threads(torch)  # before the first forward
         self.device = cfg.rerank_device or _auto_device(torch)
-        self.tokenizer = AutoTokenizer.from_pretrained(cfg.rerank_model)
-        model = AutoModelForSequenceClassification.from_pretrained(cfg.rerank_model)
+        revision = _revision_kwargs(cfg.reranker_revision)
+        self.tokenizer = AutoTokenizer.from_pretrained(cfg.rerank_model, **revision)
+        model = AutoModelForSequenceClassification.from_pretrained(
+            cfg.rerank_model, **revision
+        )
         model = model.to(self.device)
         if cfg.rerank_use_fp16 and self.device != "cpu":
             model = model.half()
@@ -117,7 +125,9 @@ class ONNXBGEReranker:
         from transformers import AutoTokenizer
 
         self._np = np
-        self.tokenizer = AutoTokenizer.from_pretrained(cfg.rerank_model)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            cfg.rerank_model, **_revision_kwargs(cfg.reranker_revision)
+        )
         so = ort.SessionOptions()
         so.intra_op_num_threads = int(os.getenv("OMP_NUM_THREADS") or os.cpu_count() or 1)
         so.inter_op_num_threads = 1

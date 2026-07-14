@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -12,6 +13,13 @@ load_dotenv()
 
 # ingest/ingest/config.py -> parents[2] == repo root (sibling of scraper/ and artifacts/).
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+_IMMUTABLE_REVISION_RE = re.compile(r"^[0-9a-f]{7,64}$")
+_GENERATION_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{7,127}$")
+
+
+class ConfigurationError(ValueError):
+    """Configuration is ambiguous or unsafe for the selected runtime mode."""
 
 
 def _bool(name: str, default: bool) -> bool:
@@ -24,6 +32,11 @@ def _bool(name: str, default: bool) -> bool:
 def _int(name: str, default: int) -> int:
     raw = os.getenv(name)
     return int(raw) if raw not in (None, "") else default
+
+
+def _str_opt(name: str) -> str | None:
+    raw = (os.getenv(name) or "").strip()
+    return raw or None
 
 
 def _float_opt(name: str, default: float | None) -> float | None:
@@ -68,12 +81,16 @@ class Config:
     runpod_api_key: str | None
     runpod_api_timeout: int
     embed_model: str
+    embedding_revision: str | None
+    tokenizer_model: str
+    tokenizer_revision: str | None
     dense_dim: int
     embed_device: str | None
     embed_use_fp16: bool
     embed_batch_size: int
     rerank_enabled: bool
     rerank_model: str
+    reranker_revision: str | None
     rerank_candidates: int
     rerank_min_score: float | None
     rerank_device: str | None
@@ -101,6 +118,59 @@ class Config:
     result_cache_enabled: bool
     result_cache_ttl: int
     result_cache_size: int
+    # A production process must be tied to an immutable corpus and model identity.
+    # These fields remain optional in development so existing local fingerprints and
+    # offline workflows retain their current behavior.
+    generation_id: str | None
+    generation_dir: Path | None
+    production_mode: bool
+    # Internal worker mode: handler.py has already verified and bound the atomic publish
+    # manifest plus live Qdrant generation before importing the MCP module. load_config()
+    # never enables this; only the in-process handler installer can construct it.
+    verified_worker_binding: bool
+
+
+def _validate_revision(value: str | None, *, field: str) -> None:
+    if value is None:
+        raise ConfigurationError(f"{field} is required when PRODUCTION_MODE=true")
+    if not _IMMUTABLE_REVISION_RE.fullmatch(value):
+        raise ConfigurationError(
+            f"{field} must be an immutable lowercase hexadecimal revision "
+            "when PRODUCTION_MODE=true"
+        )
+
+
+def _validate_model_name(value: str, *, field: str) -> None:
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigurationError(f"{field} must be a non-empty model identity")
+
+
+def validate_production_config(cfg: Config) -> None:
+    """Reject ambiguous corpus/model identities before any heavyweight model import."""
+    if not cfg.production_mode:
+        return
+    if cfg.generation_id is None:
+        raise ConfigurationError("GENERATION_ID is required when PRODUCTION_MODE=true")
+    if cfg.generation_dir is None and not cfg.verified_worker_binding:
+        raise ConfigurationError("GENERATION_DIR is required when PRODUCTION_MODE=true")
+    if cfg.verified_worker_binding and cfg.search_backend != "local":
+        raise ConfigurationError(
+            "verified worker binding requires SEARCH_BACKEND=local"
+        )
+    if (
+        not _GENERATION_ID_RE.fullmatch(cfg.generation_id)
+        or cfg.generation_id in {"legacy", "snapshot_v1"}
+        or cfg.generation_id.startswith("v1")
+    ):
+        raise ConfigurationError(
+            "GENERATION_ID must be a non-legacy 8-128 character lowercase generation ID"
+        )
+    _validate_model_name(cfg.embed_model, field="EMBED_MODEL")
+    _validate_model_name(cfg.tokenizer_model, field="TOKENIZER_MODEL")
+    _validate_model_name(cfg.rerank_model, field="RERANK_MODEL")
+    _validate_revision(cfg.embedding_revision, field="EMBED_REVISION")
+    _validate_revision(cfg.tokenizer_revision, field="TOKENIZER_REVISION")
+    _validate_revision(cfg.reranker_revision, field="RERANK_REVISION")
 
 
 def load_config() -> Config:
@@ -108,7 +178,8 @@ def load_config() -> Config:
     artifacts_root = Path(artifacts) if artifacts else REPO_ROOT / "artifacts"
     state_dir = REPO_ROOT / "ingest" / ".state"
     ql_path = os.getenv("QUERY_LOG_PATH")
-    return Config(
+    embed_model = os.getenv("EMBED_MODEL", "BAAI/bge-m3")
+    cfg = Config(
         qdrant_url=os.getenv("QDRANT_URL", "http://localhost:6333"),
         qdrant_api_key=os.getenv("QDRANT_API_KEY") or None,
         collection_name=os.getenv("COLLECTION_NAME", "georgian_legal"),
@@ -116,13 +187,17 @@ def load_config() -> Config:
         runpod_endpoint_id=(os.getenv("RUNPOD_ENDPOINT_ID") or "").strip() or None,
         runpod_api_key=os.getenv("RUNPOD_API_KEY") or None,
         runpod_api_timeout=_int("RUNPOD_API_TIMEOUT", 240),
-        embed_model=os.getenv("EMBED_MODEL", "BAAI/bge-m3"),
+        embed_model=embed_model,
+        embedding_revision=_str_opt("EMBED_REVISION"),
+        tokenizer_model=os.getenv("TOKENIZER_MODEL", embed_model),
+        tokenizer_revision=_str_opt("TOKENIZER_REVISION"),
         dense_dim=_int("DENSE_DIM", 1024),
         embed_device=_device_opt("EMBED_DEVICE"),
         embed_use_fp16=_bool("EMBED_USE_FP16", False),
         embed_batch_size=_int("EMBED_BATCH_SIZE", 8),
         rerank_enabled=_bool("RERANK_ENABLED", True),
         rerank_model=os.getenv("RERANK_MODEL", "BAAI/bge-reranker-v2-m3"),
+        reranker_revision=_str_opt("RERANK_REVISION"),
         rerank_candidates=_int("RERANK_CANDIDATES", 80),
         rerank_min_score=_float_opt("RERANK_MIN_SCORE", 0.3),
         rerank_device=_device_opt("RERANK_DEVICE") or _device_opt("EMBED_DEVICE"),
@@ -147,16 +222,20 @@ def load_config() -> Config:
         result_cache_enabled=_bool("RESULT_CACHE_ENABLED", False),
         result_cache_ttl=_int("RESULT_CACHE_TTL", 1800),
         result_cache_size=_int("RESULT_CACHE_SIZE", 512),
+        generation_id=_str_opt("GENERATION_ID"),
+        generation_dir=(
+            Path(value).expanduser().resolve()
+            if (value := _str_opt("GENERATION_DIR")) is not None
+            else None
+        ),
+        production_mode=_bool("PRODUCTION_MODE", False),
+        verified_worker_binding=False,
     )
+    validate_production_config(cfg)
+    return cfg
 
 
-def retrieval_fingerprint(cfg: Config) -> str:
-    """Stable 16-hex digest of the knobs that determine what a search returns.
-
-    Stamped into MCP responses and the query log so any answer is traceable to the exact
-    index + retrieval config that produced it. Lives here (not in ``eval.explog``) so the
-    ``ingest`` package never imports ``eval`` — the layering only goes eval → ingest.
-    """
+def _retrieval_fingerprint_material(cfg: Config) -> dict[str, object]:
     material = {
         "collection_name": cfg.collection_name,
         "embed_model": cfg.embed_model,
@@ -169,6 +248,14 @@ def retrieval_fingerprint(cfg: Config) -> str:
         "chunk_overlap": cfg.chunk_overlap,
         "chunk_min_tokens": cfg.chunk_min_tokens,
     }
+    if cfg.embedding_revision:
+        material["embedding_revision"] = cfg.embedding_revision
+    if cfg.tokenizer_model != cfg.embed_model:
+        material["tokenizer_model"] = cfg.tokenizer_model
+    if cfg.tokenizer_revision:
+        material["tokenizer_revision"] = cfg.tokenizer_revision
+    if cfg.rerank_enabled and cfg.reranker_revision:
+        material["reranker_revision"] = cfg.reranker_revision
     # Conditional so the fingerprint is byte-stable while the knob is at its default (G5).
     if cfg.rerank_enabled and cfg.rerank_backend != "torch":
         material["rerank_backend"] = cfg.rerank_backend
@@ -176,5 +263,20 @@ def retrieval_fingerprint(cfg: Config) -> str:
         material["citation_route"] = cfg.citation_route
     if cfg.embed_header_v2:  # changes corpus vectors; default-off hash stays byte-stable
         material["embed_header_v2"] = True
+    return material
+
+
+def retrieval_fingerprint_sha256(cfg: Config) -> str:
+    """Full cryptographic retrieval identity used by immutable generation artifacts."""
+    material = _retrieval_fingerprint_material(cfg)
     blob = json.dumps(material, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(blob.encode()).hexdigest()[:16]
+    return hashlib.sha256(blob.encode()).hexdigest()
+
+
+def retrieval_fingerprint(cfg: Config) -> str:
+    """Stable 16-hex display digest of the knobs that determine search results.
+
+    Existing MCP responses and logs retain their byte-stable compact value. Immutable
+    generation manifests and point payloads use :func:`retrieval_fingerprint_sha256`.
+    """
+    return retrieval_fingerprint_sha256(cfg)[:16]

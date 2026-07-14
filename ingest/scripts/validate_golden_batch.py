@@ -294,7 +294,7 @@ def main() -> None:
                  "min_tokens": cfg.chunk_min_tokens}
     from ingest.embedding import make_token_counter
 
-    count_tokens = make_token_counter(cfg.embed_model)
+    count_tokens = make_token_counter(cfg.tokenizer_model, cfg.tokenizer_revision)
 
     needed = goldset.gold_docs(batch)
     bodies = goldset.SnapshotBodies(root=spec.roots[0], needed=needed, extra_roots=spec.roots[1:])

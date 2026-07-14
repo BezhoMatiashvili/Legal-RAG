@@ -29,6 +29,7 @@ import os
 import signal
 import time
 from collections import OrderedDict
+from collections.abc import Callable
 from enum import Enum
 from pathlib import Path
 from typing import Literal
@@ -38,9 +39,16 @@ from pydantic import BaseModel, ConfigDict, Field
 from qdrant_client import models
 
 from . import qdrant_store as store
+from .collection_compatibility import (
+    CollectionIncompatibleError,
+    check_collection_compatibility,
+    require_config_manifest_compatibility,
+)
 from .config import Config, load_config, retrieval_fingerprint
+from .generation import GenerationManifest, load_generation
 from .querylog import append_query_log, build_query_record
-from .search import build_filter, detect_language, hybrid_search
+from .retrieval import RetrievalRequest, TemporalContext, execute_retrieval
+from .search import build_filter, detect_language
 from .sources import SOURCES
 
 logger = logging.getLogger("ingest.mcp_server")
@@ -59,6 +67,9 @@ _embedder = None
 _embedder_lock = asyncio.Lock()
 _reranker = None
 _reranker_lock = asyncio.Lock()
+_generation_manifest: GenerationManifest | None = None
+_generation_root: Path | None = None
+_worker_readiness_probe: Callable[[], dict] | None = None
 
 # The embed+rerank path holds the BGE-M3 + cross-encoder working set (~4.6 GB) and is
 # CPU-bound. On this RAM-tight box two concurrent searches co-thrash into swap and each
@@ -72,6 +83,127 @@ def _get_cfg() -> Config:
     if _cfg is None:
         _cfg = load_config()
     return _cfg
+
+
+def _configured_generation_manifest(cfg: Config) -> GenerationManifest | None:
+    """Checksum-load and cache the immutable generation selected by this process."""
+    global _generation_manifest, _generation_root
+    if cfg.generation_dir is None:
+        return None
+    root = cfg.generation_dir.resolve()
+    if _generation_manifest is None or _generation_root != root:
+        artifacts = load_generation(root)
+        require_config_manifest_compatibility(cfg, artifacts.manifest)
+        _generation_manifest = artifacts.manifest
+        _generation_root = root
+    return _generation_manifest
+
+
+def _install_verified_worker_runtime(cfg: Config, readiness_probe: Callable[[], dict]) -> None:
+    """Install handler-owned config/readiness before any worker singleton is used.
+
+    The environment flag alone is intentionally insufficient: only the serverless handler
+    can install this in-process probe.  This keeps a copied/forged environment from bypassing
+    the normal checksummed-generation readiness path.
+    """
+    global _cfg, _worker_readiness_probe
+    if not cfg.production_mode or not cfg.verified_worker_binding:
+        raise ValueError("worker runtime requires a verified production binding")
+    if not callable(readiness_probe):
+        raise TypeError("readiness_probe must be callable")
+    if any(value is not None for value in (_client, _embedder, _reranker)):
+        raise RuntimeError("worker runtime must be installed before clients or models load")
+    if _worker_readiness_probe is not None:
+        raise RuntimeError("worker runtime is already installed")
+    _cfg = cfg
+    _worker_readiness_probe = readiness_probe
+
+
+def _local_readiness(cfg: Config, client) -> dict:
+    """Read-only exact generation readiness; legacy collections never pass open."""
+    if cfg.verified_worker_binding:
+        if _worker_readiness_probe is None:
+            return {
+                "ok": False,
+                "code": "worker_readiness_probe_not_installed",
+                "collection": cfg.collection_name,
+                "generation_id": cfg.generation_id,
+                "issues": [
+                    {
+                        "gate": "integrity",
+                        "code": "worker_readiness_probe_not_installed",
+                    }
+                ],
+            }
+        try:
+            payload = _worker_readiness_probe()
+        except Exception as exc:  # noqa: BLE001 - readiness uncertainty fails closed
+            payload = {
+                "ok": False,
+                "code": "worker_readiness_probe_failed",
+                "error": f"{type(exc).__name__}: {exc}",
+                "issues": [
+                    {"gate": "integrity", "code": "worker_readiness_probe_failed"}
+                ],
+            }
+        if not isinstance(payload, dict):
+            payload = {
+                "ok": False,
+                "code": "worker_readiness_probe_invalid",
+                "issues": [
+                    {"gate": "integrity", "code": "worker_readiness_probe_invalid"}
+                ],
+            }
+        elif payload.get("ok") and (
+            payload.get("collection") != cfg.collection_name
+            or payload.get("generation_id") != cfg.generation_id
+        ):
+            payload = {
+                "ok": False,
+                "code": "worker_readiness_identity_mismatch",
+                "collection": payload.get("collection"),
+                "generation_id": payload.get("generation_id"),
+                "issues": [
+                    {
+                        "gate": "integrity",
+                        "code": "worker_readiness_identity_mismatch",
+                    }
+                ],
+            }
+        return payload
+
+    manifest = _configured_generation_manifest(cfg)
+    if manifest is None:
+        info = client.get_collection(cfg.collection_name)
+        return {
+            "ok": False,
+            "code": "generation_manifest_not_configured",
+            "collection": cfg.collection_name,
+            "points": getattr(info, "points_count", None),
+            "generation_id": cfg.generation_id,
+            "issues": [
+                {
+                    "gate": "integrity",
+                    "code": "generation_manifest_not_configured",
+                }
+            ],
+        }
+    result = check_collection_compatibility(client, cfg.collection_name, manifest)
+    payload = result.to_dict()
+    payload["collection"] = cfg.collection_name
+    payload["points"] = result.points_count
+    return payload
+
+
+def _require_local_readiness(cfg: Config, client) -> None:
+    readiness = _local_readiness(cfg, client)
+    if not readiness["ok"]:
+        codes = ", ".join(
+            str(issue.get("code")) for issue in readiness.get("issues", [])
+        )
+        raise CollectionIncompatibleError(
+            f"production retrieval abstained: collection readiness failed ({codes})"
+        )
 
 
 # --- Result cache -------------------------------------------------------------
@@ -376,6 +508,30 @@ class SearchInput(BaseModel):
     )
 
 
+def _retrieval_request(params: SearchInput) -> RetrievalRequest:
+    """Translate the MCP wire model into the provider-neutral production request."""
+
+    return RetrievalRequest(
+        query=params.query,
+        requested_limit=params.top_k,
+        route=True,
+        language=params.language,
+        temporal_context=TemporalContext(date_from=params.date_from, date_to=params.date_to),
+        filters={
+            "source": params.source,
+            "court": params.court,
+            "status": params.status,
+            "is_consolidated": params.is_consolidated,
+            "document_type": params.document_type,
+            "document_number": params.document_number,
+            "registration_code": params.registration_code,
+            "parties": params.parties,
+            "contains": params.contains,
+        },
+        track="production_direct",
+    )
+
+
 @mcp.tool(
     name="legal_search",
     annotations={
@@ -454,6 +610,13 @@ async def legal_search(params: SearchInput) -> str:
         Returns a "No results found" message when nothing matches.
     """
     cfg = _get_cfg()
+    local_client = None
+    if cfg.production_mode and not _use_remote():
+        try:
+            local_client = _get_client()
+            await asyncio.to_thread(_require_local_readiness, cfg, local_client)
+        except Exception as e:  # noqa: BLE001 - production must abstain before model import
+            return _handle_error(e)
     key = _cache_key(cfg, params) if cfg.result_cache_enabled else None
     if key is not None:
         cached = _cache_get(cfg, key)
@@ -472,58 +635,38 @@ async def legal_search(params: SearchInput) -> str:
         if key is not None and ok and _cacheable_search_result(result):
             _cache_put(cfg, key, result)
         return result
-    degraded = False
     try:
-        client = _get_client()
+        client = local_client or _get_client()
         embedder = await _get_embedder()
         reranker = await _get_reranker()
-        search_kwargs = dict(
-            top_k=params.top_k,
-            rerank_candidates=cfg.rerank_candidates,
-            rerank_min_score=cfg.rerank_min_score,
-            source=params.source,
-            court=params.court,
-            status=params.status,
-            is_consolidated=params.is_consolidated,
-            language=params.language,
-            document_type=params.document_type,
-            document_number=params.document_number,
-            registration_code=params.registration_code,
-            parties=params.parties,
-            contains=params.contains,
-            date_from=params.date_from,
-            date_to=params.date_to,
-        )
         # Serialize the heavy embed+rerank work so overlapping queries don't co-thrash swap.
         async with _search_semaphore:
-            t0 = time.perf_counter()
-            try:
-                hits = await asyncio.to_thread(
-                    hybrid_search, cfg, client, embedder, params.query,
-                    reranker=reranker, **search_kwargs,
-                )
-            except Exception as e:  # noqa: BLE001
-                # A remote GPU reranker can go away (pod terminated / tunnel dropped). Rather
-                # than hang or error the tool, degrade to the RRF-fused order and keep serving.
-                if reranker is None or not _is_remote_reranker(reranker):
-                    raise
-                logger.warning("remote reranker unreachable (%s); falling back to RRF order", e)
-                degraded = True
-                hits = await asyncio.to_thread(
-                    hybrid_search, cfg, client, embedder, params.query,
-                    reranker=None, **search_kwargs,
-                )
-            elapsed_ms = (time.perf_counter() - t0) * 1000
+            outcome = await asyncio.to_thread(
+                execute_retrieval,
+                cfg,
+                client,
+                embedder,
+                reranker,
+                _retrieval_request(params),
+            )
     except Exception as e:  # noqa: BLE001 - surface an actionable message to the agent
         return _handle_error(e)
 
+    hits = outcome.hits
+    elapsed_ms = outcome.timings_ms["total"]
+    degraded = outcome.degraded
+    if degraded:
+        logger.warning(
+            "remote reranker unreachable (%s); falling back to RRF order",
+            outcome.degraded_reason,
+        )
     _log_query(cfg, params, hits, elapsed_ms)
 
     if not hits:
         out = "No results found. Try a broader query or remove filters."
         return out
 
-    fp = retrieval_fingerprint(cfg)
+    fp = outcome.retrieval_fingerprint
     if params.response_format is ResponseFormat.JSON:
         payload = {
             "count": len(hits), "collection": cfg.collection_name, "fingerprint": fp,
@@ -1345,13 +1488,14 @@ async def legal_get_document_versions(params: GetVersionsInput) -> str:
     },
 )
 async def legal_health() -> str:
-    """Liveness/readiness probe: confirms Qdrant is reachable and the collection is populated.
+    """Liveness/readiness probe for exact immutable generation compatibility.
 
     Returns JSON ``{ok, collection, points, qdrant_url, fingerprint}``; ``ok`` is false with
     an actionable hint if Qdrant is unreachable or the collection is missing. No model load.
 
-    In remote mode this probes the serverless endpoint's health API instead (instant, never
-    wakes — and never bills — a worker) and reports the locally-mirrored publish manifest."""
+    In remote mode this probes only the serverless control plane (instant and non-billing).
+    That is liveness, not corpus readiness, so it cannot report ``ok=true`` without a worker
+    generation check; the locally mirrored publish intent is included for diagnosis."""
     if _use_remote():
         cfg = _get_cfg()
         try:
@@ -1363,20 +1507,40 @@ async def legal_health() -> str:
                 "hint": "Check RUNPOD_ENDPOINT_ID / RUNPOD_API_KEY in ingest/.env, or flip "
                         "SEARCH_BACKEND=local to serve from the local Qdrant.",
             }, ensure_ascii=False)
+        published = _publish_manifest(cfg)
+        publish_is_generation = bool(
+            isinstance(published, dict)
+            and published.get("schema_version") == 2
+            and published.get("generation_id")
+            and published.get("generation_manifest_sha256")
+        )
         return json.dumps({
-            "ok": True, "backend": "remote", "endpoint_id": cfg.runpod_endpoint_id,
-            "workers": h.get("workers"), "jobs": h.get("jobs"),
-            "published": _publish_manifest(cfg),
+            "ok": False,
+            "platform_ok": True,
+            "backend": "remote",
+            "code": (
+                "worker_generation_not_probed"
+                if publish_is_generation
+                else "generation_publish_manifest_missing_or_legacy"
+            ),
+            "endpoint_id": cfg.runpod_endpoint_id,
+            "workers": h.get("workers"),
+            "jobs": h.get("jobs"),
+            "published": published,
+            "hint": "Use the worker health operation/readiness gate before promotion; "
+                    "control-plane liveness cannot prove corpus identity.",
         }, ensure_ascii=False)
     try:
         cfg = _get_cfg()
         client = _get_client()
-        info = await asyncio.to_thread(client.get_collection, cfg.collection_name)
-        return json.dumps({
-            "ok": True, "collection": cfg.collection_name,
-            "points": getattr(info, "points_count", None),
-            "qdrant_url": cfg.qdrant_url, "fingerprint": retrieval_fingerprint(cfg),
-        }, ensure_ascii=False)
+        readiness = await asyncio.to_thread(_local_readiness, cfg, client)
+        readiness.update(
+            {
+                "qdrant_url": cfg.qdrant_url,
+                "fingerprint": retrieval_fingerprint(cfg),
+            }
+        )
+        return json.dumps(readiness, ensure_ascii=False)
     except Exception as e:  # noqa: BLE001
         return json.dumps({
             "ok": False, "error": f"{type(e).__name__}: {e}",
