@@ -61,3 +61,18 @@ def test_article_marker_does_not_cross_newline():
 def test_article_kind_wins_over_clause_and_heading():
     body = "# სათაური\nმუხლი 1. დებულება.\n1. პუნქტი."
     assert structure.detect(body).primary_kind == structure.KIND_ARTICLE
+
+
+def test_bold_roman_and_superscript_articles_are_structural_anchors():
+    body = "**თავი I**\n\n**მუხლი IV\nსათაური**\n\n1. წესი.\n\nმუხლი 12¹. სხვა."
+    anchors = structure.article_anchors(body)
+    assert [anchor[2] for anchor in anchors] == ["IV", "12¹"]
+    assert [label for _, label in structure.article_spans(body)] == [
+        "მუხლი IV",
+        "მუხლი 12¹. სხვა.",
+    ]
+    context = structure.context_for_span(body, body.index("წესი"), body.index("წესი") + 4)
+    assert context.article_id == "IV"
+    assert context.chapter == "თავი I"
+    assert context.clause == "1"
+    assert context.parent_id == "article:IV"

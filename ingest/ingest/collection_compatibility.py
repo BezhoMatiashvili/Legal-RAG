@@ -9,8 +9,16 @@ from typing import Any, Literal
 
 from qdrant_client import models
 
-from .config import Config, retrieval_fingerprint_sha256
-from .generation import GenerationManifest
+from .config import (
+    Config,
+    RETRIEVAL_FINGERPRINT_REVISION,
+    retrieval_fingerprint_sha256,
+)
+from .generation import (
+    CANONICAL_PAYLOAD_REQUIRED_NONEMPTY_FIELDS,
+    CANONICAL_PAYLOAD_REVISION,
+    GenerationManifest,
+)
 from .qdrant_store import chunking_fingerprint, vector_space_id
 
 CompatibilityGate = Literal["coverage", "integrity"]
@@ -108,6 +116,11 @@ def config_manifest_issues(
             cfg.embed_header_v2,
         ),
         (
+            "retrieval_fingerprint_revision",
+            manifest.retrieval_fingerprint_revision,
+            RETRIEVAL_FINGERPRINT_REVISION,
+        ),
+        (
             "retrieval_fingerprint",
             manifest.retrieval_fingerprint,
             retrieval_fingerprint_sha256(cfg),
@@ -143,6 +156,9 @@ def expected_point_identity(manifest: GenerationManifest) -> dict[str, Any]:
     manifest = GenerationManifest.from_dict(json.loads(json.dumps(manifest.to_dict())))
     return {
         "schema_version": manifest.schema_version,
+        "canonical_payload_revision": CANONICAL_PAYLOAD_REVISION,
+        "canonical_text_exact": True,
+        "content_complete": True,
         "generation_id": manifest.generation_id,
         "embedding_model": manifest.model.embedding_model,
         "embedding_revision": manifest.model.embedding_revision,
@@ -153,6 +169,7 @@ def expected_point_identity(manifest: GenerationManifest) -> dict[str, Any]:
         "vector_space_id": manifest.vector_space.id,
         "chunking_fingerprint": manifest.chunking.fingerprint,
         "document_header": manifest.chunking.document_header,
+        "retrieval_fingerprint_revision": manifest.retrieval_fingerprint_revision,
         "retrieval_fingerprint": manifest.retrieval_fingerprint,
     }
 
@@ -267,7 +284,11 @@ def _identity_filter(manifest: GenerationManifest) -> models.Filter:
                 match=models.MatchValue(value=value),
             )
             for key, value in expected_point_identity(manifest).items()
-        ]
+        ],
+        must_not=[
+            models.IsEmptyCondition(is_empty=models.PayloadField(key=field))
+            for field in sorted(CANONICAL_PAYLOAD_REQUIRED_NONEMPTY_FIELDS)
+        ],
     )
 
 

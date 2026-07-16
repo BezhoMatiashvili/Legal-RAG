@@ -17,6 +17,11 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 _IMMUTABLE_REVISION_RE = re.compile(r"^[0-9a-f]{7,64}$")
 _GENERATION_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{7,127}$")
 
+# Retrieval identity revision 2 deliberately separates behavior from storage routing.
+# Collection, alias, and generation names are recorded in provenance and cache identity,
+# but they do not change the model/chunk/search behavior fingerprint itself.
+RETRIEVAL_FINGERPRINT_REVISION = 2
+
 
 class ConfigurationError(ValueError):
     """Configuration is ambiguous or unsafe for the selected runtime mode."""
@@ -99,6 +104,13 @@ class Config:
     # I7: 'torch' (default) or 'onnx' (int8 export, scripts/export_onnx_reranker.py).
     rerank_backend: str
     onnx_rerank_path: Path
+    # I8: enrich cross-encoder input with title/type/status/number/heading (default off =
+    # raw chunk body only, current behavior).
+    rerank_context_enriched: bool
+    # I8: query+passage truncation for the cross-encoder (model supports up to 8192; 512
+    # was sized to chunk length, not model capacity). Mirrors RERANK_MAX_LENGTH already
+    # read by scripts/runpod_rerank_server.py.
+    rerank_max_length: int
     chunk_tokens: int
     chunk_overlap: int
     chunk_min_tokens: int
@@ -208,6 +220,8 @@ def load_config() -> Config:
                         else "torch"),
         onnx_rerank_path=Path(os.getenv("ONNX_RERANK_PATH")
                               or state_dir / "onnx" / "bge-reranker-v2-m3-int8.onnx"),
+        rerank_context_enriched=_bool("RERANK_CONTEXT_ENRICHED", False),
+        rerank_max_length=_int("RERANK_MAX_LENGTH", 512),
         chunk_tokens=_int("CHUNK_TOKENS", 512),
         chunk_overlap=_int("CHUNK_OVERLAP", 80),
         chunk_min_tokens=_int("CHUNK_MIN_TOKENS", 64),
@@ -237,7 +251,7 @@ def load_config() -> Config:
 
 def _retrieval_fingerprint_material(cfg: Config) -> dict[str, object]:
     material = {
-        "collection_name": cfg.collection_name,
+        "retrieval_fingerprint_revision": RETRIEVAL_FINGERPRINT_REVISION,
         "embed_model": cfg.embed_model,
         "dense_dim": cfg.dense_dim,
         "rerank_enabled": cfg.rerank_enabled,
@@ -259,6 +273,10 @@ def _retrieval_fingerprint_material(cfg: Config) -> dict[str, object]:
     # Conditional so the fingerprint is byte-stable while the knob is at its default (G5).
     if cfg.rerank_enabled and cfg.rerank_backend != "torch":
         material["rerank_backend"] = cfg.rerank_backend
+    if cfg.rerank_enabled and cfg.rerank_context_enriched:  # I8, default-off (G5)
+        material["rerank_context_enriched"] = True
+    if cfg.rerank_enabled and cfg.rerank_max_length != 512:  # I8, default-stable (G5)
+        material["rerank_max_length"] = cfg.rerank_max_length
     if cfg.citation_route:  # conditional: fingerprint byte-stable while the knob is off (G5)
         material["citation_route"] = cfg.citation_route
     if cfg.embed_header_v2:  # changes corpus vectors; default-off hash stays byte-stable
@@ -276,7 +294,8 @@ def retrieval_fingerprint_sha256(cfg: Config) -> str:
 def retrieval_fingerprint(cfg: Config) -> str:
     """Stable 16-hex display digest of the knobs that determine search results.
 
-    Existing MCP responses and logs retain their byte-stable compact value. Immutable
-    generation manifests and point payloads use :func:`retrieval_fingerprint_sha256`.
+    Fingerprint revision 2 excludes storage routing and intentionally differs from legacy
+    digests. Immutable generation manifests and point payloads use the full digest from
+    :func:`retrieval_fingerprint_sha256` and record the revision separately.
     """
     return retrieval_fingerprint_sha256(cfg)[:16]

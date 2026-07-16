@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DAILY_INGEST = ROOT / "ingest" / "scripts" / "daily_ingest.sh"
 MONITOR_SERVER = ROOT / "ingest" / "scripts" / "monitor_server.py"
 MULTI_ORCHESTRATOR = ROOT / "ingest" / "scripts" / "runpod_orchestrate_multi.py"
+IMMUTABLE_BUILD_RUNBOOK = ROOT / "ingest" / "docs" / "immutable-512-build.md"
 
 
 def _without(env: dict[str, str], *names: str) -> dict[str, str]:
@@ -37,6 +38,13 @@ def test_non_dry_daily_ingest_always_requires_explicit_approval() -> None:
 
     assert result.returncode == 78
     assert "daily ingest refused" in result.stderr
+
+
+def test_daily_ingest_default_includes_supreme_court() -> None:
+    script = DAILY_INGEST.read_text(encoding="utf-8")
+    assert (
+        "matsne ecd constcourt napr supremecourt tas tbappeal" in script
+    )
 
 
 def test_monitor_requires_explicit_source_pod_configuration() -> None:
@@ -122,3 +130,26 @@ def test_systemd_unit_requires_a_configured_repository_root() -> None:
     assert "$LEGAL_SEARCH_REPO/ingest/scripts/daily_ingest.sh" in service
     assert "Desktop/Projects" not in service
     assert "WorkingDirectory=" not in service
+
+
+def test_immutable_build_runbook_requires_new_exact_crawl_evidence() -> None:
+    runbook = IMMUTABLE_BUILD_RUNBOOK.read_text(encoding="utf-8")
+
+    assert "--only matsne ecd constcourt napr tas tbappeal" in runbook
+    assert "--only supremecourt" in runbook
+    assert "--max-runtime-seconds 14400" in runbook
+    assert "-s CLOSESPIDER_TIMEOUT=14400" in runbook
+    assert "scripts/build_source_state_evidence.py" in runbook
+    for source in (
+        "matsne",
+        "napr",
+        "ecd",
+        "constcourt",
+        "supremecourt",
+        "tas",
+        "tbappeal",
+    ):
+        assert f"--select {source}:EXACT_" in runbook
+    assert "AWAITING INDEPENDENT OPERATOR REVIEW" in runbook
+    assert "Historical startup-only records must never" in runbook
+    assert "REVIEWED_SOURCE_STATE_EVIDENCE_SHA256" in runbook

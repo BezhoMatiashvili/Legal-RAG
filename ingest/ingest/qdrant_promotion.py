@@ -149,6 +149,7 @@ def _generation_integrity_check(artifacts: GenerationArtifacts) -> IntegrityChec
         report = verify_generation_artifacts(
             artifacts,
             _stream_points(client, plan.physical_collection),
+            physical_collection=plan.physical_collection,
         )
         report_path = artifacts.root.parent / (
             f"{plan.generation_id}.{plan.promotion_id}.candidate-verification.json"
@@ -158,6 +159,7 @@ def _generation_integrity_check(artifacts: GenerationArtifacts) -> IntegrityChec
         report_matches = (
             report.generation_id == plan.generation_id
             and report.manifest_sha256 == plan.manifest_sha256
+            and report.physical_collection == plan.physical_collection
         )
         provenance_path = report_path.with_name(f"{report_path.stem}.provenance.json")
         atomic_write_json(
@@ -266,6 +268,7 @@ class QdrantPromotionBackend:
             "vector_space_id": expected.vector_space_id,
             "chunking_fingerprint": expected.chunking_fingerprint,
             "document_header": expected.document_header,
+            "retrieval_fingerprint_revision": expected.retrieval_fingerprint_revision,
             "retrieval_fingerprint": expected.retrieval_fingerprint,
         }
 
@@ -336,6 +339,9 @@ class QdrantPromotionBackend:
                 expected.chunking_fingerprint if identity_ok else mismatch
             ),
             document_header=(expected.document_header if identity_ok else not expected.document_header),
+            retrieval_fingerprint_revision=(
+                expected.retrieval_fingerprint_revision if identity_ok else -1
+            ),
             retrieval_fingerprint=(
                 expected.retrieval_fingerprint if identity_ok else mismatch
             ),

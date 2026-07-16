@@ -13,20 +13,27 @@ from urllib.parse import urlparse
 from qdrant_client import QdrantClient, models
 
 from .chunking import Chunk
-from .config import ConfigurationError, Config, retrieval_fingerprint_sha256
+from .config import (
+    RETRIEVAL_FINGERPRINT_REVISION,
+    ConfigurationError,
+    Config,
+    retrieval_fingerprint_sha256,
+)
 from .dedup import content_hash
 from .embedding import Sparse
-from .generation import GENERATION_SCHEMA_VERSION
+from .generation import CANONICAL_PAYLOAD_REVISION, GENERATION_SCHEMA_VERSION
 from .operational import (
     QDRANT_RECREATE_APPROVAL_ENV,
     QDRANT_WRITE_APPROVAL_ENV,
     RUNPOD_EPHEMERAL_QDRANT_ENV,
     require_run_scoped_delta_collection,
 )
+from .promotion import physical_collection_name
 from .sources import (
     PROMOTED_KEYWORD_FIELDS,
     PROMOTED_TEXT_FIELDS,
     CanonicalDoc,
+    derived_version_id,
 )
 
 # Fixed namespace so point IDs are stable across runs/machines.
@@ -45,6 +52,23 @@ KEYWORD_FIELDS = (
     # Indexed so watch's change-detection and cross-source exact-dup version grouping can
     # filter by it without a full scroll.
     "content_hash",
+    "canonical_content_hash",
+    "passage_hash",
+    "passage_id",
+    "source_fingerprint",
+    "normalizer_revision",
+    "chunker_revision",
+    "model_revision",
+    "article_id",
+    "clause_id",
+    "subarticle",
+    "parent_id",
+    "version_id",
+    "supersedes",
+    "consolidation_status",
+    "version_lineage_status",
+    "source_authority",
+    "canonical_payload_revision",
     # Immutable-generation identity. Legacy collections intentionally lack these fields
     # and therefore cannot pass the generation integrity gate.
     "generation_id",
@@ -61,13 +85,33 @@ KEYWORD_FIELDS = (
     "extraction_status",
 )
 # Boolean payload indexes (matsne consolidation flag). Filter with MatchValue(value=True/False).
-BOOL_FIELDS = ("is_consolidated", "content_complete")
+BOOL_FIELDS = (
+    "is_consolidated",
+    "content_complete",
+    "canonical_text_exact",
+    "version_lineage_complete",
+    "freshness_sla_met",
+)
 # Integer payload indexes (e.g. number of consolidated versions).
-INTEGER_FIELDS = ("consolidated_count",)
+INTEGER_FIELDS = ("consolidated_count", "retrieval_fingerprint_revision")
 # Datetime range indexes (in addition to the primary "date" index created below).
-DATETIME_FIELDS = ("date", "in_force_date", "expiry_date")
+DATETIME_FIELDS = (
+    "date",
+    "in_force_date",
+    "expiry_date",
+    "effective_from",
+    "effective_to",
+    "repeal_date",
+)
 # Full-text (MatchText) indexes for exact keyword / phrase lookup by lawyers.
-TEXT_FIELDS = ("text", "title", "parties", "article_summary")
+TEXT_FIELDS = (
+    "text",
+    "title",
+    "parties",
+    "article_summary",
+    "article_label",
+    "chapter",
+)
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", ""}
 _REVISION_RE = re.compile(r"^[0-9a-f]{7,64}$")
 _GENERATION_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{7,127}$")
@@ -125,13 +169,18 @@ class GenerationPointIdentity:
     chunking_fingerprint: str
     document_header: bool
     retrieval_fingerprint: str
+    retrieval_fingerprint_revision: int
 
     def as_payload(self) -> dict:
         return {
             "schema_version": self.schema_version,
+            "canonical_payload_revision": CANONICAL_PAYLOAD_REVISION,
             "generation_id": self.generation_id,
             "embedding_model": self.embedding_model,
             "embedding_revision": self.embedding_revision,
+            # Generic alias consumed by the canonical evidence contract.  The explicit
+            # embedding/tokenizer/reranker revisions remain the authoritative tuple.
+            "model_revision": self.embedding_revision,
             "tokenizer_model": self.tokenizer_model,
             "tokenizer_revision": self.tokenizer_revision,
             "reranker_model": self.reranker_model,
@@ -140,6 +189,7 @@ class GenerationPointIdentity:
             "chunking_fingerprint": self.chunking_fingerprint,
             "document_header": self.document_header,
             "retrieval_fingerprint": self.retrieval_fingerprint,
+            "retrieval_fingerprint_revision": self.retrieval_fingerprint_revision,
         }
 
 
@@ -204,7 +254,36 @@ def generation_point_identity(cfg: Config) -> GenerationPointIdentity | None:
         chunking_fingerprint=chunking_fingerprint(cfg),
         document_header=cfg.embed_header_v2,
         retrieval_fingerprint=retrieval_fingerprint_sha256(cfg),
+        retrieval_fingerprint_revision=RETRIEVAL_FINGERPRINT_REVISION,
     )
+
+
+def validate_generation_identity(cfg: Config) -> GenerationPointIdentity:
+    """Validate the complete immutable generation/model/physical-target tuple.
+
+    This helper performs no client access and is therefore safe to call before importing
+    or loading heavyweight models.  Mutation authorization remains a separate concern in
+    :func:`validate_generation_write_target`.
+    """
+
+    if cfg.generation_id is None:
+        raise ConfigurationError(
+            "Qdrant writes require an explicit non-legacy GENERATION_ID before any "
+            "client, model, checkpoint, or collection access"
+        )
+    try:
+        expected_name = physical_collection_name(cfg.generation_id)
+    except ValueError as exc:
+        raise ConfigurationError(f"invalid GENERATION_ID: {exc}") from exc
+    if cfg.collection_name != expected_name:
+        raise ConfigurationError(
+            "generation writes require the exact physical collection "
+            f"{expected_name!r}; refusing target {cfg.collection_name!r}"
+        )
+    identity = generation_point_identity(cfg)
+    if identity is None:  # pragma: no cover - guarded above, defensive for type narrowing
+        raise ConfigurationError("generation point identity is missing")
+    return identity
 
 
 def validate_generation_write_target(
@@ -227,17 +306,7 @@ def validate_generation_write_target(
                 "run-scoped delta staging must not claim an immutable GENERATION_ID"
             )
     else:
-        if generation_id is None or not _GENERATION_ID_RE.fullmatch(generation_id):
-            raise ConfigurationError(
-                "Qdrant writes require an explicit non-legacy GENERATION_ID before any "
-                "client, model, checkpoint, or collection access"
-            )
-        expected_name = f"georgian_legal__gen_{generation_id}"
-        if cfg.collection_name != expected_name:
-            raise ConfigurationError(
-                "generation writes require the exact physical collection "
-                f"{expected_name!r}; refusing target {cfg.collection_name!r}"
-            )
+        validate_generation_identity(cfg)
     environment = os.environ if environ is None else environ
     attested_ephemeral = environment.get(RUNPOD_EPHEMERAL_QDRANT_ENV) == "1"
     approved_write = environment.get(QDRANT_WRITE_APPROVAL_ENV) == "1"
@@ -276,9 +345,26 @@ def make_client(cfg: Config) -> QdrantClient:
     return QdrantClient(url=cfg.qdrant_url, api_key=cfg.qdrant_api_key, timeout=120)
 
 
-def point_id(source: str, document_id: str, chunk_index: int) -> str:
-    """Deterministic UUIDv5 → idempotent upserts (re-runs overwrite, never duplicate)."""
-    return str(uuid.uuid5(NAMESPACE, f"{source}:{document_id}:{chunk_index}"))
+def point_id(
+    source: str,
+    document_id: str,
+    chunk_index: int,
+    *,
+    version_id: str | None = None,
+) -> str:
+    """Return a deterministic UUIDv5 for a legacy document or canonical version.
+
+    Legacy mutable/non-generation collections intentionally retain the historical
+    ``source:document:chunk`` identity. Immutable schema-v2 generations must pass
+    ``version_id`` so current and repealed versions cannot overwrite each other.
+    """
+
+    material = (
+        f"{source}:{document_id}:{version_id}:{chunk_index}"
+        if version_id is not None
+        else f"{source}:{document_id}:{chunk_index}"
+    )
+    return str(uuid.uuid5(NAMESPACE, material))
 
 
 def _assert_dense_dim(client: QdrantClient, name: str, expected: int) -> None:
@@ -293,6 +379,180 @@ def _assert_dense_dim(client: QdrantClient, name: str, expected: int) -> None:
             f"Collection {name!r} has dense dim {size} but DENSE_DIM={expected}. "
             f"Use --recreate (data loss) or set DENSE_DIM/EMBED_MODEL to match."
         )
+
+
+def inspect_embed_collection(client: QdrantClient, cfg: Config) -> int:
+    """Strictly validate a candidate collection's physical vector shape.
+
+    Unlike the legacy best-effort dimension guard, immutable candidate startup must fail
+    if collection metadata cannot be read or is ambiguous.  The complete model/chunk
+    identity is held by the local create-only binding; this check proves the live physical
+    storage still has the dense+sparse shape that binding names.
+    """
+
+    try:
+        info = client.get_collection(cfg.collection_name)
+        params = info.config.params
+        vectors = params.vectors
+        dense = vectors.get("dense") if isinstance(vectors, dict) else None
+        if dense is None:
+            raise RuntimeError("named dense vector 'dense' is missing")
+        size = getattr(dense, "size", None)
+        distance = getattr(dense, "distance", None)
+        distance_value = getattr(distance, "value", distance)
+        sparse_vectors = getattr(params, "sparse_vectors", None)
+        if sparse_vectors is None:
+            sparse_vectors = getattr(params, "sparse_vectors_config", None)
+        has_sparse = (
+            "sparse" in sparse_vectors
+            if isinstance(sparse_vectors, dict)
+            else False
+        )
+        points_count = info.points_count
+    except Exception as exc:  # noqa: BLE001 - metadata ambiguity is fatal here
+        if isinstance(exc, RuntimeError):
+            raise
+        raise RuntimeError(
+            f"cannot validate immutable candidate collection {cfg.collection_name!r}: {exc}"
+        ) from exc
+
+    if size != cfg.dense_dim:
+        raise RuntimeError(
+            f"candidate collection {cfg.collection_name!r} has dense dimension {size!r}; "
+            f"expected {cfg.dense_dim}"
+        )
+    if str(distance_value).lower() != "cosine":
+        raise RuntimeError(
+            f"candidate collection {cfg.collection_name!r} has distance "
+            f"{distance_value!r}; expected cosine"
+        )
+    if not has_sparse:
+        raise RuntimeError(
+            f"candidate collection {cfg.collection_name!r} lacks named sparse vector 'sparse'"
+        )
+    if not isinstance(points_count, int) or isinstance(points_count, bool) or points_count < 0:
+        raise RuntimeError(
+            f"candidate collection {cfg.collection_name!r} has invalid points_count "
+            f"{points_count!r}"
+        )
+    return points_count
+
+
+def verify_embed_collection_identity(
+    client: QdrantClient,
+    cfg: Config,
+    *,
+    points_count: int,
+) -> None:
+    """Prove every existing point matches the binding identity before a resume."""
+
+    identity = validate_generation_identity(cfg)
+    expected = {
+        "schema_version": identity.schema_version,
+        "canonical_payload_revision": CANONICAL_PAYLOAD_REVISION,
+        "generation_id": identity.generation_id,
+        "embedding_model": identity.embedding_model,
+        "embedding_revision": identity.embedding_revision,
+        "model_revision": identity.embedding_revision,
+        "tokenizer_model": identity.tokenizer_model,
+        "tokenizer_revision": identity.tokenizer_revision,
+        "reranker_model": identity.reranker_model,
+        "reranker_revision": identity.reranker_revision,
+        "vector_space_id": identity.vector_space_id,
+        "chunking_fingerprint": identity.chunking_fingerprint,
+        "document_header": identity.document_header,
+        "retrieval_fingerprint": identity.retrieval_fingerprint,
+        "retrieval_fingerprint_revision": identity.retrieval_fingerprint_revision,
+    }
+    count_filter = models.Filter(
+        must=[
+            models.FieldCondition(key=field, match=models.MatchValue(value=value))
+            for field, value in expected.items()
+        ]
+    )
+    try:
+        result = client.count(
+            collection_name=cfg.collection_name,
+            count_filter=count_filter,
+            exact=True,
+        )
+        matching_count = result.count
+    except Exception as exc:  # noqa: BLE001 - an unavailable proof must fail closed
+        raise RuntimeError(
+            f"cannot verify existing point identity for {cfg.collection_name!r}: {exc}"
+        ) from exc
+    if (
+        not isinstance(matching_count, int)
+        or isinstance(matching_count, bool)
+        or matching_count != points_count
+    ):
+        raise RuntimeError(
+            f"existing candidate identity mismatch for {cfg.collection_name!r}: "
+            f"{matching_count!r} of {points_count} points match the immutable binding"
+        )
+
+
+def prepare_embed_collection(
+    client: QdrantClient,
+    cfg: Config,
+    *,
+    resume: bool,
+    recreate: bool,
+    apply: bool,
+    minimum_points: int = 0,
+    environ: Mapping[str, str] | None = None,
+) -> int:
+    """Create or validate the collection lifecycle for an immutable embed run."""
+
+    if resume and recreate:
+        raise ConfigurationError("--resume and --recreate are mutually exclusive")
+    if (
+        not isinstance(minimum_points, int)
+        or isinstance(minimum_points, bool)
+        or minimum_points < 0
+    ):
+        raise ConfigurationError("minimum_points must be a non-negative integer")
+    validate_generation_write_target(
+        cfg, apply=apply, recreate=recreate, environ=environ
+    )
+    exists = client.collection_exists(cfg.collection_name)
+    if resume:
+        if not exists:
+            raise RuntimeError(
+                f"--resume requires existing physical collection {cfg.collection_name!r}"
+            )
+        points_count = inspect_embed_collection(client, cfg)
+        verify_embed_collection_identity(client, cfg, points_count=points_count)
+        if points_count < minimum_points:
+            raise RuntimeError(
+                f"existing candidate {cfg.collection_name!r} has {points_count} points, "
+                f"below the {minimum_points} chunks acknowledged by resume checkpoints"
+            )
+        return points_count
+
+    if exists and not recreate:
+        points_count = inspect_embed_collection(client, cfg)
+        if points_count:
+            raise RuntimeError(
+                "fresh immutable embed refuses non-empty physical collection "
+                f"{cfg.collection_name!r} ({points_count} points); use --resume with "
+                "matching state"
+            )
+        return points_count
+
+    ensure_collection(
+        client,
+        cfg,
+        recreate=recreate,
+        apply=apply,
+        environ=environ,
+    )
+    points_count = inspect_embed_collection(client, cfg)
+    if points_count:
+        raise RuntimeError(
+            f"new candidate collection {cfg.collection_name!r} is unexpectedly non-empty"
+        )
+    return points_count
 
 
 def ensure_collection(
@@ -360,7 +620,15 @@ def ensure_collection(
         client.create_payload_index(
             name, field_name=field, field_schema=models.PayloadSchemaType.BOOL
         )
-    for field in ("chunk_index", *INTEGER_FIELDS):
+    for field in (
+        "chunk_index",
+        "page_start",
+        "page_end",
+        "article_start_chunk_index",
+        "article_start",
+        "parent_chunk_index",
+        *INTEGER_FIELDS,
+    ):
         client.create_payload_index(
             name, field_name=field, field_schema=models.PayloadSchemaType.INTEGER
         )
@@ -390,6 +658,39 @@ def build_payload(
     document_state_hash: str | None = None,
     cfg: Config | None = None,
 ) -> dict:
+    canonical_text = chunk.canonical_text if chunk.canonical_text is not None else chunk.text
+    has_exact_offsets = (
+        isinstance(chunk.char_start, int)
+        and isinstance(chunk.char_end, int)
+        and 0 <= chunk.char_start <= chunk.char_end <= len(doc.body_markdown or "")
+    )
+    canonical_text_exact = bool(
+        has_exact_offsets
+        and (doc.body_markdown or "")[chunk.char_start : chunk.char_end] == canonical_text
+    )
+    if chunk.canonical_text is not None and has_exact_offsets and not canonical_text_exact:
+        raise ValueError(
+            "chunk canonical_text does not equal the document slice at its declared offsets"
+        )
+    passage_hash = hashlib.sha256(canonical_text.encode("utf-8")).hexdigest()
+    if chunk.passage_hash is not None and chunk.passage_hash != passage_hash:
+        raise ValueError("chunk passage_hash does not match its exact canonical text")
+    canonical_content_hash = content_hash(doc.body_markdown or "")
+    version_id = doc.version_id or derived_version_id(doc)
+    local_parent_id = chunk.parent_id
+    parent_id = (
+        f"{doc.source}:{doc.document_id}:{version_id}:{local_parent_id}:"
+        f"{chunk.parent_chunk_index}"
+        if local_parent_id
+        else None
+    )
+    passage_identity_material = (
+        f"{doc.source}\0{doc.document_id}\0{version_id}\0"
+        f"{chunk.char_start}\0{chunk.char_end}\0{passage_hash}"
+    )
+    passage_id = "passage:" + hashlib.sha256(
+        passage_identity_material.encode("utf-8")
+    ).hexdigest()
     payload = {
         "source": doc.source,
         "document_id": doc.document_id,
@@ -402,6 +703,13 @@ def build_payload(
         "court": doc.court,
         "source_url": doc.source_url,
         "source_binary_url": doc.source_binary_url,
+        "official_url": doc.official_url or doc.source_url,
+        "official_binary_url": doc.official_binary_url or doc.source_binary_url,
+        "binary_url": doc.official_binary_url or doc.source_binary_url,
+        "official_html_url": doc.official_html_url or doc.official_url or doc.source_url,
+        "official_pdf_url": doc.official_pdf_url,
+        "source_authority": doc.source_authority,
+        "freshness_sla_met": doc.freshness_sla_met,
         "document_number": doc.document_number,
         "registration_code": doc.registration_code,
         "parties": doc.parties,
@@ -411,17 +719,52 @@ def build_payload(
         "in_force_date": _rfc3339(doc.in_force_date),
         "expiry_date": _rfc3339(doc.expiry_date),
         "heading": " > ".join(chunk.heading_path) or None,
+        "heading_path": list(chunk.heading_path),
+        "article_id": chunk.article_id,
+        "article_label": chunk.article_label,
+        "article_start": chunk.article_start,
+        "clause": chunk.clause,
+        "clause_id": chunk.clause_id or chunk.clause,
+        "clause_ids": list(chunk.clause_ids),
+        "subarticle": chunk.subarticle,
+        "subarticle_ids": list(chunk.subarticle_ids),
+        "chapter": chunk.chapter,
+        "parent_id": parent_id,
+        "structural_parent_id": local_parent_id,
+        "article_start_chunk_index": chunk.article_start_chunk_index,
+        "parent_chunk_index": chunk.parent_chunk_index,
         "token_count": chunk.token_count,
         "char_start": chunk.char_start,
         "char_end": chunk.char_end,
+        "page_start": chunk.page_start,
+        "page_end": chunk.page_end,
+        "offset_unit": "unicode_codepoint",
         "text": chunk.text,
+        "canonical_text_exact": canonical_text_exact,
+        "passage_hash": passage_hash,
+        "passage_content_hash": passage_hash,
+        "passage_id": passage_id,
         "article_summary": doc.article_summary,
         "content_kind": doc.content_kind,
         "content_complete": doc.content_complete,
         "extraction_status": doc.extraction_status,
         # Doc-level identity replicated on each chunk: lets watch skip re-embedding an
         # unchanged doc (compare chunk-0's hash) without re-reading the whole body from Qdrant.
-        "content_hash": content_hash(doc.body_markdown or ""),
+        "content_hash": canonical_content_hash,
+        "canonical_content_hash": canonical_content_hash,
+        "source_fingerprint": doc.source_fingerprint,
+        "normalizer_revision": doc.normalizer_revision,
+        "chunker_revision": chunk.chunker_revision,
+        "version_id": version_id,
+        "version_id_kind": doc.version_id_kind,
+        "supersedes": list(doc.supersedes),
+        "effective_from": _rfc3339(doc.effective_from),
+        "effective_to": _rfc3339(doc.effective_to),
+        "repeal_date": _rfc3339(doc.repeal_date),
+        "consolidation_status": doc.consolidation_status,
+        "consolidated_dates": list(doc.consolidated_dates),
+        "version_lineage_status": doc.version_lineage_status,
+        "version_lineage_complete": doc.version_lineage_complete,
     }
     if document_chunk_count is not None:
         # Completeness marker for safe delta merges. Search does not consume/index it; the
@@ -437,6 +780,27 @@ def build_payload(
         if document_chunk_count is None or document_state_hash is None:
             raise ConfigurationError(
                 "generation points require document_chunk_count and document_state_hash"
+            )
+        if not canonical_text_exact or not canonical_text or chunk.char_end <= chunk.char_start:
+            raise ConfigurationError(
+                "generation points require non-empty text proven equal to the canonical "
+                "document slice at exact character offsets"
+            )
+        if not isinstance(doc.source_fingerprint, str) or not re.fullmatch(
+            r"[0-9a-f]{64}", doc.source_fingerprint
+        ):
+            raise ConfigurationError(
+                "generation points require a canonical source_fingerprint"
+            )
+        if not (doc.official_url or doc.source_url):
+            raise ConfigurationError("generation points require an official source URL")
+        if doc.source_authority not in {"official", "primary_official"}:
+            raise ConfigurationError(
+                "generation points require official source authority"
+            )
+        if not doc.content_complete or doc.extraction_status != "full_text":
+            raise ConfigurationError(
+                "generation points require complete, full-text source extraction"
             )
         payload.update(identity.as_payload())
     # Promoted structured fields (e.g. tas applicant IDs/phones). setdefault so a promoted
@@ -461,19 +825,32 @@ def upsert_points(client: QdrantClient, name: str, points, *, wait: bool = False
 
 
 def delete_doc_chunks_from(
-    client: QdrantClient, name: str, source: str, document_id: str, from_index: int
+    client: QdrantClient,
+    name: str,
+    source: str,
+    document_id: str,
+    from_index: int,
+    *,
+    version_id: str | None = None,
 ) -> None:
-    """Durably drop stale chunks of a re-ingested doc after its replacement is upserted."""
+    """Durably drop only the stale tail of the replaced document version."""
     _refuse_serving_collection_mutation(name)
+    conditions = [
+        models.FieldCondition(key="source", match=models.MatchValue(value=source)),
+        models.FieldCondition(key="document_id", match=models.MatchValue(value=document_id)),
+        models.FieldCondition(key="chunk_index", range=models.Range(gte=from_index)),
+    ]
+    if version_id is not None:
+        conditions.append(
+            models.FieldCondition(
+                key="version_id", match=models.MatchValue(value=version_id)
+            )
+        )
     client.delete(
         collection_name=name,
         points_selector=models.FilterSelector(
             filter=models.Filter(
-                must=[
-                    models.FieldCondition(key="source", match=models.MatchValue(value=source)),
-                    models.FieldCondition(key="document_id", match=models.MatchValue(value=document_id)),
-                    models.FieldCondition(key="chunk_index", range=models.Range(gte=from_index)),
-                ]
+                must=conditions
             )
         ),
         wait=True,

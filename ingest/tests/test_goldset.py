@@ -4,6 +4,8 @@ Runs against the real snapshot v1 (fast — just reads the docs jsonl), which is
 invariant Part 2 must protect: every evidence quote still slices back exactly.
 """
 
+import json
+
 import pytest
 
 from ingest.chunking import default_token_counter
@@ -88,3 +90,24 @@ def test_lint_fails_loud_when_span_maps_to_nothing():
     bodies = StubBodies({("s", "d"): body})
     with pytest.raises(ValueError, match="map to no chunk"):
         goldset.lint_span_coverage([q], bodies, count_tokens=count, **CHUNK_CFG)
+
+
+def test_v3_relevance_group_source_and_version_family_are_loaded(tmp_path):
+    path = tmp_path / "v3.jsonl"
+    record = {
+        "id": "qv3", "query": "q", "query_type": "historical", "query_language": "ka",
+        "source": "matsne", "document_id": "current",
+        "gold": {"source": "matsne", "document_id": "current"},
+        "version_family": "law-42-lineage",
+        "relevance": [{
+            "source": "constcourt", "document_id": "decision-1", "evidence_quote": "x",
+            "char_start": 0, "char_end": 1, "grade": 2,
+            "equivalence_group": "operative-rule", "required": True,
+        }],
+    }
+    path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    (query,) = goldset.load_golden_set(path)
+    assert query.cluster_id == "law-42-lineage"
+    assert query.relevance[0].source == "constcourt"
+    assert query.relevance[0].evidence_group == "operative-rule"
+    assert ("constcourt", "decision-1") in goldset.gold_docs([query])

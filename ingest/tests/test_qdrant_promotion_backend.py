@@ -66,6 +66,7 @@ def _plan(snapshot) -> PromotionPlan:
                 "vector_space_id": "b" * 64,
                 "chunking_fingerprint": "c" * 64,
                 "document_header": True,
+                "retrieval_fingerprint_revision": 2,
                 "retrieval_fingerprint": "d" * 64,
             },
             "created_at": "2026-07-13T12:00:00Z",
@@ -131,6 +132,7 @@ class _FakeClient:
             "vector_space_id",
             "chunking_fingerprint",
             "document_header",
+            "retrieval_fingerprint_revision",
             "retrieval_fingerprint",
         } == keys
         return SimpleNamespace(count=self.plan.expected_collection.points_count)
@@ -347,11 +349,13 @@ def test_generation_integrity_check_streams_and_persists_post_restore_report(
         ok=True,
         generation_id=plan.generation_id,
         manifest_sha256=plan.manifest_sha256,
+        physical_collection=plan.physical_collection,
     )
 
-    def verify(checked_artifacts, points):
+    def verify(checked_artifacts, points, *, physical_collection):
         observed["artifacts"] = checked_artifacts
         observed["points"] = list(points)
+        observed["physical_collection"] = physical_collection
         return report
 
     def persist(path, checked_report):
@@ -367,6 +371,7 @@ def test_generation_integrity_check_streams_and_persists_post_restore_report(
     assert proof.ok is True
     assert observed["artifacts"] is artifacts
     assert observed["points"] == [{"id": "point-1"}, {"id": "point-2"}]
+    assert observed["physical_collection"] == plan.physical_collection
     assert observed["report"] is report
     assert observed["report_path"] == tmp_path / (
         f"{plan.generation_id}.{plan.promotion_id}.candidate-verification.json"

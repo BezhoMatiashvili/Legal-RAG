@@ -145,6 +145,38 @@ def test_save_load_roundtrip(tmp_path):
         assert _as_scores(built.search(q, k=10)) == _as_scores(loaded.search(q, k=10))
 
 
+def test_version_scoped_keys_survive_build_and_load(tmp_path):
+    class VersionedClient(FakeClient):
+        def __init__(self):
+            self._pts = [
+                _Pt(
+                    {
+                        "source": "matsne",
+                        "document_id": "law",
+                        "version_id": version,
+                        "chunk_index": 0,
+                        "text": text,
+                    }
+                )
+                for version, text in (
+                    ("v-current", "current operative labor rule"),
+                    ("v-repealed", "repealed historical labor rule"),
+                )
+            ]
+
+    built = FullCorpusBM25.build(
+        VersionedClient(), "versioned", index_dir=tmp_path / "idx", batch=1
+    )
+    expected = {
+        ("matsne", "law", "v-current", 0),
+        ("matsne", "law", "v-repealed", 0),
+    }
+    assert {key for key, _score in built.search("labor rule", 10)} == expected
+
+    loaded = FullCorpusBM25.load(tmp_path / "idx")
+    assert {key for key, _score in loaded.search("labor rule", 10)} == expected
+
+
 def test_build_or_load_uses_cache(tmp_path):
     _build(tmp_path)
     # build_or_load with a client that would explode if scrolled proves the cache is used

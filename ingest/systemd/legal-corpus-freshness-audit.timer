@@ -1,0 +1,11 @@
+[Unit]
+Description=Weekly trigger for Georgian Legal RAG corpus freshness audit
+
+[Timer]
+OnCalendar=Sun *-*-* 07:00:00
+Persistent=true
+RandomizedDelaySec=30min
+Unit=legal-corpus-freshness-audit.service
+
+[Install]
+WantedBy=timers.target

@@ -24,6 +24,7 @@ from ingest.artifacts import (
     load_verified_generation_coverage,
     write_prune_plan,
 )
+from ingest.generation import GENERATION_SCHEMA_VERSION
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
@@ -72,7 +73,7 @@ def _write_generation(
     directory = root / generation_id
     directory.mkdir(parents=True)
     manifest = {
-        "schema_version": 1,
+        "schema_version": GENERATION_SCHEMA_VERSION,
         "generation_id": generation_id,
         "covered_runs": covered_runs,
     }
@@ -80,8 +81,9 @@ def _write_generation(
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     if verified:
         report = {
-            "schema_version": 1,
+            "schema_version": GENERATION_SCHEMA_VERSION,
             "generation_id": generation_id,
+            "physical_collection": f"georgian_legal__gen_{generation_id}",
             "verified_at": "2026-07-13T11:00:00Z",
             "ok": True,
             "manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
@@ -186,7 +188,7 @@ def test_verified_coverage_accepts_mapping_and_records_but_fails_closed(tmp_path
     (inline_only / "manifest.json").write_text(
         json.dumps(
             {
-                "schema_version": 1,
+                "schema_version": GENERATION_SCHEMA_VERSION,
                 "generation_id": "inline-only",
                 "covered_runs": {"ecd": ["run-5"]},
                 "verified": True,
@@ -197,7 +199,10 @@ def test_verified_coverage_accepts_mapping_and_records_but_fails_closed(tmp_path
     bad = generations / "missing-coverage"
     bad.mkdir(parents=True)
     (bad / "manifest.json").write_text(
-        json.dumps({"schema_version": 1, "generation_id": "missing-coverage"}),
+        json.dumps({
+            "schema_version": GENERATION_SCHEMA_VERSION,
+            "generation_id": "missing-coverage",
+        }),
         encoding="utf-8",
     )
 
@@ -218,8 +223,9 @@ def test_verification_report_requires_all_gates_and_matching_coverage(tmp_path):
         verified=False,
     )
     report = {
-        "schema_version": 1,
+        "schema_version": GENERATION_SCHEMA_VERSION,
         "generation_id": "gen-report",
+        "physical_collection": "georgian_legal__gen_gen-report",
         "verified_at": "2026-07-13T11:00:00Z",
         "ok": True,
         "manifest_sha256": hashlib.sha256(
@@ -237,6 +243,11 @@ def test_verification_report_requires_all_gates_and_matching_coverage(tmp_path):
     assert [
         item.generation_id for item in load_verified_generation_coverage(generations)
     ] == ["gen-report"]
+
+    report["physical_collection"] = "georgian_legal"
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    assert load_verified_generation_coverage(generations) == ()
+    report["physical_collection"] = "georgian_legal__gen_gen-report"
 
     report["quality"] = {"ok": False, "issue_count": 1, "examples": ["bad"]}
     report_path.write_text(json.dumps(report), encoding="utf-8")

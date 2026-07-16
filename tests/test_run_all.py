@@ -20,7 +20,7 @@ def test_default_watcher_uses_only_production_corpus_sources():
     command = build_watch_command(_args())
 
     assert command[command.index("--source") + 1] == ",".join(CORPUS_SOURCES)
-    assert "supremecourt" not in command
+    assert "supremecourt" in command[command.index("--source") + 1]
 
 
 def test_only_subset_scopes_watcher_and_preserves_canonical_order():
@@ -30,9 +30,8 @@ def test_only_subset_scopes_watcher_and_preserves_canonical_order():
     assert command[command.index("--collection") + 1] == "test"
 
 
-def test_supremecourt_only_is_rejected_for_ingest_launcher():
-    with pytest.raises(SystemExit, match="intentionally excluded"):
-        selected_ingest_sources(["supremecourt"])
+def test_supremecourt_only_is_first_class_for_ingest_launcher():
+    assert selected_ingest_sources(["supremecourt"]) == ["supremecourt"]
 
 
 def test_unknown_spider_fails_before_children_start():

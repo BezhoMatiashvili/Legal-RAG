@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import sqlite3
 import stat
@@ -19,11 +20,23 @@ sys.path.insert(0, str(ROOT / "scraper"))
 
 from scrapy.settings import Settings  # noqa: E402
 
+from legal_scrapers import extensions as scraper_extensions  # noqa: E402
+from legal_scrapers.completion import CompletionAlreadyFinalized  # noqa: E402
 from legal_scrapers.extensions import (  # noqa: E402
-    DurableDedupCommitExtension,
+    CompletionAttestationExtension,
     RotatingSpiderLogExtension,
 )
+from legal_scrapers.completion import (  # noqa: E402
+    build_terminal_record,
+    build_startup_record,
+    evaluate_crawl_quality,
+    failed_feed_durability,
+    failed_source_validation,
+    publish_startup_metadata,
+    publish_terminal_record,
+)
 from legal_scrapers.pipelines import DedupPipeline  # noqa: E402
+from legal_scrapers.spiders import base as base_spider_module  # noqa: E402
 from legal_scrapers.spiders.base import BaseLegalSpider  # noqa: E402
 
 
@@ -230,15 +243,95 @@ def test_legacy_refresh_context_remains_unknown_after_schema_migration(
     }
 
 
-def _feed_crawler(spider, feeds, stats):
-    settings = Settings({"FEEDS": {str(path): {"format": "jsonlines"} for path in feeds}})
+def _persisted_row(spider, key):
+    connection = sqlite3.connect(spider.dedup_db_path)
+    try:
+        return connection.execute(
+            "SELECT key, last_success, content_hash, refresh_deadline, outcome, "
+            "content_kind, content_complete, source_binary_url FROM seen WHERE key = ?",
+            (key,),
+        ).fetchone()
+    finally:
+        connection.close()
+
+
+def _full_persisted_row(spider, key):
+    connection = sqlite3.connect(spider.dedup_db_path)
+    try:
+        return connection.execute(
+            "SELECT key, run_id, ts, last_success, content_hash, refresh_deadline, "
+            "outcome, content_kind, content_complete, source_binary_url, "
+            "is_consolidated FROM seen WHERE key = ?",
+            (key,),
+        ).fetchone()
+    finally:
+        connection.close()
+
+
+def _pending_rows(spider, run_id=None):
+    connection = sqlite3.connect(spider.dedup_db_path)
+    try:
+        return connection.execute(
+            "SELECT pending_run_id, key, run_id, outcome, content_hash "
+            "FROM pending_seen WHERE pending_run_id = ? ORDER BY key",
+            (run_id or spider.run_id,),
+        ).fetchall()
+    finally:
+        connection.close()
+
+
+def _feed_crawler(spider, root, stats, *, payload=b"{}\n"):
+    source_root = root / "crawl-artifacts" / spider.name
+    run_dir = source_root / "runs" / spider.run_id
+    latest_dir = source_root / "latest"
+    for directory in (source_root, source_root / "runs", run_dir, latest_dir):
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        directory.chmod(0o700)
+    spider.started_at = NOW
+    spider.source_root = source_root
+    spider.run_dir = run_dir
+    spider.latest_dir = latest_dir
+    spider.items_path = run_dir / "items.jsonl"
+    spider.latest_items_path = latest_dir / "items.jsonl"
+    spider.log_path = run_dir / "spider.log"
+    spider.run_metadata_path = run_dir / "run.json"
+    spider.latest_metadata_path = latest_dir / "run.json"
+    for path in (spider.items_path, spider.latest_items_path):
+        path.write_bytes(payload)
+        path.chmod(0o600)
+    startup = build_startup_record(spider)
+    publish_startup_metadata(
+        spider.run_metadata_path,
+        spider.latest_metadata_path,
+        startup,
+    )
+    settings = Settings(
+        {
+            "FEEDS": {
+                str(spider.items_path): {"format": "jsonlines"},
+                str(spider.latest_items_path): {"format": "jsonlines"},
+            }
+        }
+    )
     crawler = types.SimpleNamespace(settings=settings, stats=_Stats(stats), spider=spider)
     spider.crawler = crawler
     return crawler
 
 
+def _finish_attestation(crawler, *, order="feed-first"):
+    extension = CompletionAttestationExtension(crawler)
+    if order == "feed-first":
+        extension.feed_exporter_closed()
+        extension.spider_closed(crawler.spider, "finished")
+    else:
+        extension.spider_closed(crawler.spider, "finished")
+        extension.feed_exporter_closed()
+    return extension
+
+
+@pytest.mark.parametrize("order", ["feed-first", "spider-first"])
 def test_success_commits_only_after_all_feeds_fsync(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, order: str
 ) -> None:
     spider = _make_spider(_GenericSpider, tmp_path / "store", monkeypatch)
     item = {
@@ -251,18 +344,14 @@ def test_success_commits_only_after_all_feeds_fsync(
     assert DedupPipeline().process_item(item, spider) is item
     assert _row(spider, "complete") is None
 
-    feeds = [tmp_path / "run.jsonl", tmp_path / "latest.jsonl"]
-    for path in feeds:
-        path.write_text("{}\n", encoding="utf-8")
-        path.chmod(0o600)
     crawler = _feed_crawler(
         spider,
-        feeds,
+        tmp_path,
         {"feedexport/success_count/FileFeedStorage": 2},
     )
-    DurableDedupCommitExtension(crawler).feed_exporter_closed()
+    _finish_attestation(crawler, order=order)
 
-    stored = _row(spider, "complete")
+    stored = _persisted_row(spider, "complete")
     assert stored[1] == NOW.isoformat()
     assert stored[2] == hashlib.sha256(b"full ruling text").hexdigest()
     assert datetime.fromisoformat(stored[3]) == NOW + timedelta(days=30)
@@ -272,8 +361,13 @@ def test_success_commits_only_after_all_feeds_fsync(
         1,
         "https://source.invalid/ruling.pdf",
     )
-    assert all(path.stat().st_mode & 0o777 == 0o600 for path in feeds)
+    assert all(
+        path.stat().st_mode & 0o777 == 0o600
+        for path in (spider.items_path, spider.latest_items_path)
+    )
     assert crawler.stats.values["dedup/committed_after_feeds"] == 1
+    assert spider._dedup_conn is None
+    assert spider._pending_reversible_dedup_commit is None
 
 
 def test_insecure_existing_feed_is_not_chmodded_or_committed(
@@ -283,20 +377,19 @@ def test_insecure_existing_feed_is_not_chmodded_or_committed(
     DedupPipeline().process_item(
         {"document_id": "retry", "body_markdown": "complete"}, spider
     )
-    feed = tmp_path / "existing.jsonl"
-    feed.write_text("{}\n", encoding="utf-8")
-    feed.chmod(0o644)
     crawler = _feed_crawler(
         spider,
-        [feed],
-        {"feedexport/success_count/FileFeedStorage": 1},
+        tmp_path,
+        {"feedexport/success_count/FileFeedStorage": 2},
     )
+    feed = spider.latest_items_path
+    feed.chmod(0o644)
 
-    DurableDedupCommitExtension(crawler).feed_exporter_closed()
+    _finish_attestation(crawler)
 
     assert feed.stat().st_mode & 0o777 == 0o644
-    assert _row(spider, "retry") is None
-    assert crawler.stats.values["dedup/feed_commit_refused"] == 1
+    assert _persisted_row(spider, "retry") is None
+    assert crawler.stats.values["quality/feed_durability_failed"] == 1
 
 
 def test_operational_spider_log_uses_bounded_private_rotation(tmp_path: Path) -> None:
@@ -329,25 +422,22 @@ def test_feed_failure_discards_staged_success_without_db_ghost(
     spider = _make_spider(_GenericSpider, tmp_path / "store", monkeypatch)
     item = {"document_id": "retry", "body_markdown": "complete"}
     DedupPipeline().process_item(item, spider)
-    feeds = [tmp_path / "run.jsonl", tmp_path / "latest.jsonl"]
-    for path in feeds:
-        path.write_text("{}\n", encoding="utf-8")
     crawler = _feed_crawler(
         spider,
-        feeds,
+        tmp_path,
         {
             "feedexport/success_count/FileFeedStorage": 1,
             "feedexport/failed_count/FileFeedStorage": 1,
         },
     )
 
-    DurableDedupCommitExtension(crawler).feed_exporter_closed()
+    _finish_attestation(crawler)
 
-    assert _row(spider, "retry") is None
+    assert _persisted_row(spider, "retry") is None
     assert "retry" not in spider._seen_keys
-    assert crawler.stats.values["dedup/feed_commit_refused"] == 1
     assert crawler.stats.values["quality/failures"] == 1
-    assert crawler.stats.values["quality/durable_feed_commit_refused"] == 1
+    assert crawler.stats.values["quality/feed_durability_failed"] == 1
+    assert spider._dedup_conn is None
 
 
 def test_fsync_failure_refuses_commit(
@@ -357,25 +447,505 @@ def test_fsync_failure_refuses_commit(
     DedupPipeline().process_item(
         {"document_id": "retry", "body_markdown": "complete"}, spider
     )
-    feeds = [tmp_path / "run.jsonl", tmp_path / "latest.jsonl"]
-    for path in feeds:
-        path.write_text("{}\n", encoding="utf-8")
     crawler = _feed_crawler(
         spider,
-        feeds,
+        tmp_path,
         {"feedexport/success_count/FileFeedStorage": 2},
     )
-    extension = DurableDedupCommitExtension(crawler)
-    monkeypatch.setattr(
-        extension, "_fsync_local_feed", lambda _path: (_ for _ in ()).throw(OSError("disk"))
-    )
+    extension = CompletionAttestationExtension(crawler)
 
+    def fail_feed_proof(_spider, _stats):
+        raise OSError("disk")
+
+    monkeypatch.setattr(extension, "_attest_feeds", fail_feed_proof)
+
+    extension.spider_closed(spider, "finished")
     extension.feed_exporter_closed()
 
-    assert _row(spider, "retry") is None
+    assert _persisted_row(spider, "retry") is None
     assert "retry" not in spider._seen_keys
     assert crawler.stats.values["quality/failures"] == 1
-    assert crawler.stats.values["quality/durable_feed_commit_refused"] == 1
+    assert crawler.stats.values["quality/feed_durability_failed"] == 1
+
+
+@pytest.mark.parametrize(
+    ("failure_kind", "quality_key"),
+    (
+        ("spider_error", "spider_errors"),
+        ("item_error", "item_errors"),
+        ("quality_failure", "quality_failures"),
+        ("abnormal_close", None),
+    ),
+)
+def test_nonfeed_eligibility_failures_discard_staged_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_kind: str,
+    quality_key: str | None,
+) -> None:
+    spider = _make_spider(_GenericSpider, tmp_path / "store", monkeypatch)
+    DedupPipeline().process_item(
+        {"document_id": "retry", "body_markdown": "complete"}, spider
+    )
+    stats = {"feedexport/success_count/FileFeedStorage": 2}
+    if failure_kind == "quality_failure":
+        stats["quality/failures"] = 1
+    crawler = _feed_crawler(spider, tmp_path, stats)
+    extension = CompletionAttestationExtension(crawler)
+    if failure_kind == "spider_error":
+        extension.spider_error(None, None, spider)
+    elif failure_kind == "item_error":
+        extension.item_error(None, None, spider, None)
+    reason = "shutdown" if failure_kind == "abnormal_close" else "finished"
+
+    extension.feed_exporter_closed()
+    extension.spider_closed(spider, reason)
+
+    assert _persisted_row(spider, "retry") is None
+    terminal = json.loads(spider.run_metadata_path.read_text(encoding="utf-8"))
+    assert terminal["outcome"] == "failure"
+    assert terminal["quality_passed"] is False
+    assert terminal["feeds_durable"] is False
+    if quality_key is not None:
+        assert terminal["quality"][quality_key] == 1
+    assert spider._dedup_conn is None
+
+
+def test_dedup_commit_error_discards_stage_and_publishes_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spider = _make_spider(_GenericSpider, tmp_path / "store", monkeypatch)
+    DedupPipeline().process_item(
+        {"document_id": "retry", "body_markdown": "complete"}, spider
+    )
+    crawler = _feed_crawler(
+        spider,
+        tmp_path,
+        {"feedexport/success_count/FileFeedStorage": 2},
+    )
+
+    def fail_commit():
+        raise sqlite3.OperationalError("simulated commit failure")
+
+    monkeypatch.setattr(spider, "commit_staged_seen_reversible", fail_commit)
+    _finish_attestation(crawler)
+
+    assert _persisted_row(spider, "retry") is None
+    assert spider._staged_dedup_records == {}
+    assert crawler.stats.values["quality/dedup_commit_failed"] == 1
+    terminal = json.loads(spider.run_metadata_path.read_text(encoding="utf-8"))
+    assert terminal["outcome"] == "failure"
+    assert spider._dedup_conn is None
+
+
+def test_ambiguous_prepare_commit_raise_leaves_no_active_seen_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spider = _make_spider(_GenericSpider, tmp_path / "store", monkeypatch)
+    DedupPipeline().process_item(
+        {"document_id": "retry", "body_markdown": "complete"}, spider
+    )
+    crawler = _feed_crawler(
+        spider,
+        tmp_path,
+        {"feedexport/success_count/FileFeedStorage": 2},
+    )
+    real_prepare = spider.commit_staged_seen_reversible
+
+    def commit_then_raise():
+        real_prepare()
+        assert _full_persisted_row(spider, "retry") is None
+        assert len(_pending_rows(spider)) == 1
+        raise sqlite3.OperationalError("commit acknowledgement lost")
+
+    monkeypatch.setattr(spider, "commit_staged_seen_reversible", commit_then_raise)
+    _finish_attestation(crawler)
+
+    assert _full_persisted_row(spider, "retry") is None
+    assert _pending_rows(spider) == []
+    assert crawler.stats.values["quality/dedup_commit_failed"] == 1
+    terminal = json.loads(spider.run_metadata_path.read_text(encoding="utf-8"))
+    assert terminal["outcome"] == "failure"
+    assert spider._dedup_conn is None
+
+
+def test_late_quality_failure_discards_prepared_shadow_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spider = _make_spider(_GenericSpider, tmp_path / "store", monkeypatch)
+    DedupPipeline().process_item(
+        {"document_id": "retry", "body_markdown": "complete"}, spider
+    )
+    crawler = _feed_crawler(
+        spider,
+        tmp_path,
+        {"feedexport/success_count/FileFeedStorage": 2},
+    )
+    real_prepare = spider.commit_staged_seen_reversible
+
+    def prepare_then_flip_quality():
+        token = real_prepare()
+        assert _full_persisted_row(spider, "retry") is None
+        assert len(_pending_rows(spider)) == 1
+        crawler.stats.inc_value("quality/failures")
+        return token
+
+    monkeypatch.setattr(
+        spider,
+        "commit_staged_seen_reversible",
+        prepare_then_flip_quality,
+    )
+    _finish_attestation(crawler)
+
+    assert _full_persisted_row(spider, "retry") is None
+    assert _pending_rows(spider) == []
+    terminal = json.loads(spider.run_metadata_path.read_text(encoding="utf-8"))
+    assert terminal["outcome"] == "failure"
+    assert terminal["quality_passed"] is False
+    assert spider._dedup_conn is None
+
+
+def test_staged_records_without_reversible_api_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spider = _make_spider(_GenericSpider, tmp_path / "store", monkeypatch)
+    DedupPipeline().process_item(
+        {"document_id": "retry", "body_markdown": "complete"}, spider
+    )
+    crawler = _feed_crawler(
+        spider,
+        tmp_path,
+        {"feedexport/success_count/FileFeedStorage": 2},
+    )
+    monkeypatch.setattr(spider, "commit_staged_seen_reversible", None)
+
+    _finish_attestation(crawler)
+
+    assert _full_persisted_row(spider, "retry") is None
+    assert spider._staged_dedup_records == {}
+    terminal = json.loads(spider.run_metadata_path.read_text(encoding="utf-8"))
+    assert terminal["outcome"] == "failure"
+    assert crawler.stats.values["quality/reversible_dedup_commit_unavailable"] == 1
+    assert spider._dedup_conn is None
+
+
+@pytest.mark.parametrize(
+    "publication_error",
+    [
+        OSError("simulated publication failure"),
+        CompletionAlreadyFinalized("simulated existing claim"),
+    ],
+    ids=["publication-error", "existing-claim"],
+)
+def test_publication_failure_compensates_new_seen_row_and_closes_store(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    publication_error: Exception,
+) -> None:
+    spider = _make_spider(_GenericSpider, tmp_path / "store", monkeypatch)
+    DedupPipeline().process_item(
+        {"document_id": "retry", "body_markdown": "complete"}, spider
+    )
+    crawler = _feed_crawler(
+        spider,
+        tmp_path,
+        {"feedexport/success_count/FileFeedStorage": 2},
+    )
+    observed_prepared = []
+
+    def fail_publication(_spider, _record):
+        observed_prepared.append(
+            (_full_persisted_row(spider, "retry"), _pending_rows(spider))
+        )
+        raise publication_error
+
+    monkeypatch.setattr(scraper_extensions, "publish_terminal_record", fail_publication)
+    _finish_attestation(crawler)
+
+    assert observed_prepared
+    assert observed_prepared[0][0] is None
+    assert len(observed_prepared[0][1]) == 1
+    assert _full_persisted_row(spider, "retry") is None
+    assert _pending_rows(spider) == []
+    assert spider._staged_dedup_records == {}
+    assert "retry" not in spider._seen_keys
+    assert spider._dedup_conn is None
+    assert spider._pending_reversible_dedup_commit is None
+    assert crawler.stats.values["dedup/compensated_after_publication_failure"] == 1
+    startup = json.loads(spider.run_metadata_path.read_text(encoding="utf-8"))
+    assert startup["outcome"] == "started"
+
+
+def test_publication_failure_restores_exact_prior_seen_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = tmp_path / "store"
+    first = _make_spider(_GenericSpider, store, monkeypatch)
+    assert first.stage_seen(
+        {
+            "document_id": "existing",
+            "body_markdown": "prior body",
+            "is_consolidated": True,
+        }
+    )
+    first.commit_staged_seen()
+    first._dedup_conn.execute(
+        "UPDATE seen SET refresh_deadline = ? WHERE key = ?",
+        ((NOW - timedelta(days=1)).isoformat(), "existing"),
+    )
+    first._dedup_conn.commit()
+    first._dedup_conn.close()
+
+    spider = _make_spider(_GenericSpider, store, monkeypatch)
+    prior = _full_persisted_row(spider, "existing")
+    assert "existing" in spider._refresh_keys
+    assert DedupPipeline().process_item(
+        {"document_id": "existing", "body_markdown": "replacement body"}, spider
+    )
+    crawler = _feed_crawler(
+        spider,
+        tmp_path,
+        {"feedexport/success_count/FileFeedStorage": 2},
+    )
+
+    def fail_publication(_spider, _record):
+        assert _full_persisted_row(spider, "existing") == prior
+        pending = _pending_rows(spider)
+        assert len(pending) == 1
+        assert pending[0][1:4] == ("existing", spider.run_id, "success")
+        raise OSError("simulated publication failure")
+
+    monkeypatch.setattr(scraper_extensions, "publish_terminal_record", fail_publication)
+    _finish_attestation(crawler)
+
+    assert _full_persisted_row(spider, "existing") == prior
+    assert spider._staged_dedup_records == {}
+    assert "existing" in spider._refresh_keys
+    assert not spider.is_seen({"document_id": "existing"})
+    assert spider._dedup_conn is None
+
+
+def test_persistent_pending_cleanup_failure_remains_inactive_and_reopens_safe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifacts_root = tmp_path / "crawl-artifacts"
+    spider = _make_spider(_GenericSpider, artifacts_root, monkeypatch)
+    DedupPipeline().process_item(
+        {"document_id": "retry", "body_markdown": "complete"}, spider
+    )
+    crawler = _feed_crawler(
+        spider,
+        tmp_path,
+        {"feedexport/success_count/FileFeedStorage": 2},
+    )
+
+    def fail_publication(_spider, _record):
+        raise OSError("simulated publication failure")
+
+    def fail_cleanup(*_args, **_kwargs):
+        raise sqlite3.OperationalError("disk remains read-only")
+
+    monkeypatch.setattr(scraper_extensions, "publish_terminal_record", fail_publication)
+    monkeypatch.setattr(spider, "discard_pending_staged_seen", fail_cleanup)
+    monkeypatch.setattr(spider, "rollback_staged_seen_commit", fail_cleanup)
+    _finish_attestation(crawler)
+
+    assert _full_persisted_row(spider, "retry") is None
+    assert len(_pending_rows(spider)) == 1
+    assert spider._dedup_conn is None
+    startup = json.loads(spider.run_metadata_path.read_text(encoding="utf-8"))
+    assert startup["outcome"] == "started"
+
+    reopened = _make_spider(_GenericSpider, artifacts_root, monkeypatch)
+    assert _pending_rows(reopened) == []
+    assert _full_persisted_row(reopened, "retry") is None
+    assert not reopened.is_seen({"document_id": "retry"})
+
+
+def test_publisher_raise_after_durable_success_leaves_pending_until_reopen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifacts_root = tmp_path / "crawl-artifacts"
+    spider = _make_spider(_GenericSpider, artifacts_root, monkeypatch)
+    DedupPipeline().process_item(
+        {"document_id": "accepted", "body_markdown": "complete"}, spider
+    )
+    crawler = _feed_crawler(
+        spider,
+        tmp_path,
+        {"feedexport/success_count/FileFeedStorage": 2},
+    )
+    real_publish = scraper_extensions.publish_terminal_record
+
+    def publish_then_raise(publishing_spider, record):
+        real_publish(publishing_spider, record)
+        assert _full_persisted_row(spider, "accepted") is None
+        assert len(_pending_rows(spider)) == 1
+        raise OSError("publisher acknowledgement lost")
+
+    monkeypatch.setattr(
+        scraper_extensions,
+        "publish_terminal_record",
+        publish_then_raise,
+    )
+    extension = _finish_attestation(crawler)
+
+    terminal = json.loads(spider.run_metadata_path.read_text(encoding="utf-8"))
+    assert terminal["outcome"] == "success"
+    assert _full_persisted_row(spider, "accepted") is None
+    assert len(_pending_rows(spider)) == 1
+    assert extension._terminal_success_verified is False
+    assert spider._dedup_conn is None
+
+    reopened = _make_spider(_GenericSpider, artifacts_root, monkeypatch)
+    assert _pending_rows(reopened) == []
+    assert _full_persisted_row(reopened, "accepted") is not None
+    assert reopened.is_seen({"document_id": "accepted"})
+
+
+def _leave_authorized_success_pending(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    key: str,
+) -> tuple[Path, _GenericSpider]:
+    artifacts_root = tmp_path / "crawl-artifacts"
+    spider = _make_spider(_GenericSpider, artifacts_root, monkeypatch)
+    DedupPipeline().process_item(
+        {"document_id": key, "body_markdown": "complete"}, spider
+    )
+    crawler = _feed_crawler(
+        spider,
+        tmp_path,
+        {"feedexport/success_count/FileFeedStorage": 2},
+    )
+
+    def fail_promotion(_token):
+        raise sqlite3.OperationalError("leave inactive for startup test")
+
+    monkeypatch.setattr(spider, "accept_staged_seen_commit", fail_promotion)
+    _finish_attestation(crawler)
+    assert _full_persisted_row(spider, key) is None
+    assert len(_pending_rows(spider)) == 1
+    assert spider._dedup_conn is None
+    return artifacts_root, spider
+
+
+@pytest.mark.parametrize(
+    "failure_site",
+    ["success-verifier", "authorization-inspection"],
+)
+def test_reopen_preserves_authorized_pending_on_transient_proof_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_site: str,
+) -> None:
+    key = f"transient-{failure_site}"
+    artifacts_root, _original = _leave_authorized_success_pending(
+        tmp_path,
+        monkeypatch,
+        key=key,
+    )
+    if failure_site == "success-verifier":
+        original_callable = base_spider_module.verify_terminal_record
+
+        def transient_failure(*_args, **_kwargs):
+            raise OSError("transient items/source proof failure")
+
+        patched_name = "verify_terminal_record"
+    else:
+        original_callable = base_spider_module.terminal_authorization_exists
+
+        def transient_failure(*_args, **_kwargs):
+            raise OSError("transient authorization inspection failure")
+
+        patched_name = "terminal_authorization_exists"
+    monkeypatch.setattr(base_spider_module, patched_name, transient_failure)
+
+    ambiguous = _make_spider(_GenericSpider, artifacts_root, monkeypatch)
+    assert len(_pending_rows(ambiguous)) == 1
+    assert _full_persisted_row(ambiguous, key) is None
+    assert not ambiguous.is_seen({"document_id": key})
+    ambiguous._dedup_conn.close()
+
+    monkeypatch.setattr(base_spider_module, patched_name, original_callable)
+    recovered = _make_spider(_GenericSpider, artifacts_root, monkeypatch)
+    assert _pending_rows(recovered) == []
+    assert _full_persisted_row(recovered, key) is not None
+    assert recovered.is_seen({"document_id": key})
+
+
+def test_reopen_discards_pending_for_strictly_authorized_terminal_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifacts_root = tmp_path / "crawl-artifacts"
+    spider = _make_spider(_GenericSpider, artifacts_root, monkeypatch)
+    key = "authorized-failure"
+    DedupPipeline().process_item(
+        {"document_id": key, "body_markdown": "complete"}, spider
+    )
+    spider.commit_staged_seen_reversible()
+    assert len(_pending_rows(spider)) == 1
+    _feed_crawler(
+        spider,
+        tmp_path,
+        {"feedexport/success_count/FileFeedStorage": 2},
+    )
+    quality = evaluate_crawl_quality(
+        {"quality/failures": 1},
+        spider.name,
+        "shutdown",
+        spider_errors=1,
+    )
+    failure = build_terminal_record(
+        spider,
+        finish_reason="shutdown",
+        quality=quality,
+        feeds=failed_feed_durability(),
+        source_validation=failed_source_validation(spider.name),
+        completed_at=NOW + timedelta(hours=1),
+        outcome="failure",
+    )
+    publish_terminal_record(spider, failure)
+    spider._dedup_conn.close()
+
+    reopened = _make_spider(_GenericSpider, artifacts_root, monkeypatch)
+    assert _pending_rows(reopened) == []
+    assert _full_persisted_row(reopened, key) is None
+    assert not reopened.is_seen({"document_id": key})
+
+
+def test_reopen_promotes_orphan_pending_only_for_exact_verified_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifacts_root = tmp_path / "crawl-artifacts"
+    spider = _make_spider(_GenericSpider, artifacts_root, monkeypatch)
+    DedupPipeline().process_item(
+        {"document_id": "recovered", "body_markdown": "complete"}, spider
+    )
+    crawler = _feed_crawler(
+        spider,
+        tmp_path,
+        {"feedexport/success_count/FileFeedStorage": 2},
+    )
+
+    def fail_promotion(_token):
+        raise sqlite3.OperationalError("process died before pending promotion")
+
+    monkeypatch.setattr(spider, "accept_staged_seen_commit", fail_promotion)
+    extension = _finish_attestation(crawler)
+
+    terminal = json.loads(spider.run_metadata_path.read_text(encoding="utf-8"))
+    assert terminal["outcome"] == "success"
+    assert extension._terminal_success_verified is True
+    assert _full_persisted_row(spider, "recovered") is None
+    assert len(_pending_rows(spider)) == 1
+    assert spider._dedup_conn is None
+
+    reopened = _make_spider(_GenericSpider, artifacts_root, monkeypatch)
+    assert _pending_rows(reopened) == []
+    assert _full_persisted_row(reopened, "recovered") is not None
+    assert reopened.is_seen({"document_id": "recovered"})
 
 
 def test_summary_only_outcome_is_durable_but_remains_retryable(
@@ -392,17 +962,14 @@ def test_summary_only_outcome_is_durable_but_remains_retryable(
     DedupPipeline().process_item(item, spider)
     assert "summary" not in spider._seen_keys
 
-    feeds = [tmp_path / "run.jsonl", tmp_path / "latest.jsonl"]
-    for path in feeds:
-        path.write_text("{}\n", encoding="utf-8")
     crawler = _feed_crawler(
         spider,
-        feeds,
+        tmp_path,
         {"feedexport/success_count/FileFeedStorage": 2},
     )
-    DurableDedupCommitExtension(crawler).feed_exporter_closed()
+    _finish_attestation(crawler)
 
-    stored = _row(spider, "summary")
+    stored = _persisted_row(spider, "summary")
     assert stored[1] is None
     assert stored[4:] == (
         "incomplete",
@@ -410,7 +977,6 @@ def test_summary_only_outcome_is_durable_but_remains_retryable(
         0,
         "https://source.invalid/ruling.pdf",
     )
-    spider._dedup_conn.close()
     reopened = _make_spider(_GenericSpider, tmp_path / "store", monkeypatch)
     assert not reopened.is_seen({"document_id": "summary"})
     assert reopened._refresh_keys == {"summary"}
@@ -473,6 +1039,8 @@ def test_supreme_extension_path_remains_isolated() -> None:
         stats=_Stats(),
     )
 
-    DurableDedupCommitExtension(crawler).feed_exporter_closed()
+    extension = CompletionAttestationExtension(crawler)
+    extension._discard_staged(spider, [])
+    extension._commit_staged(spider, [])
 
     assert calls == []

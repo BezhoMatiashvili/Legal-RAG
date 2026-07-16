@@ -3,6 +3,7 @@
 import argparse
 import dataclasses
 import logging
+from pathlib import Path
 
 from .config import load_config
 
@@ -112,96 +113,169 @@ def _cmd_watch(args) -> None:
 
 
 def _cmd_snapshot(args) -> None:
-    from . import pipeline, snapshot
+    from . import snapshot
 
     cfg = _resolved_cfg(args)
-    sources = pipeline.resolve_sources(args.source) if args.source != "all" else list(snapshot.SOURCES_PRESENT)
-    print(f"Building clean corpus snapshot from {len(sources)} source(s): {', '.join(sources)}")
-    snapshot.build_snapshot(
-        cfg, sources=sources, limit=args.limit,
-        near_dup=not args.no_near_dup, token_sample=args.token_sample,
+    if args.source != "all":
+        raise SystemExit("sealed snapshots require --source all (all seven sources)")
+    sources = list(snapshot.SOURCES_PRESENT)
+    print(
+        f"Building clean corpus snapshot {args.snapshot_id!r} from "
+        f"{len(sources)} source(s): {', '.join(sources)}"
     )
+    try:
+        snapshot.build_snapshot(
+            cfg,
+            snapshot_id=args.snapshot_id,
+            output_root=args.output_root,
+            source_state_evidence=args.source_state_evidence,
+            preflight=args.preflight,
+            sources=sources,
+            limit=args.limit,
+            near_dup=not args.no_near_dup,
+            token_sample=args.token_sample,
+        )
+    except snapshot.SnapshotSafetyError as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 def _cmd_embed(args) -> None:
-    import json as _json
-    import random
-
     from . import qdrant_store as store
 
     cfg = _resolved_cfg(args)
-    if not args.checksum:
-        store.validate_generation_write_target(
-            cfg, apply=args.apply, recreate=args.recreate
-        )
-
     from . import embed_job
     from .embedding import BGEM3Embedder, make_token_counter
 
-    print(f"Loading embedding model {cfg.embed_model} (device={cfg.embed_device or 'auto/cpu'}, "
-          f"fp16={cfg.embed_use_fp16}, batch={cfg.embed_batch_size})...")
-    embedder = BGEM3Embedder(cfg)
+    batch_size = getattr(args, "batch_size", 256)
+    if (
+        not isinstance(batch_size, int)
+        or isinstance(batch_size, bool)
+        or batch_size <= 0
+    ):
+        raise SystemExit("--batch-size must be a positive integer")
+    # Identity validation is deliberately first: no snapshot, checkpoint, client, or model
+    # access is permitted for an ambiguous generation or mutable model revision.
+    store.validate_generation_identity(cfg)
+    if args.resume and args.recreate:
+        raise SystemExit("--resume and --recreate are mutually exclusive")
+    sealed = embed_job.verify_snapshot_docs(args.snapshot_docs)
+    embed_job.validate_snapshot_build_config(sealed, cfg)
 
-    digest, vec = embed_job.dense_checksum(embedder)
-    print(f"VECTOR-SPACE CHECKSUM: sha={digest}  dims[:8]={[round(x, 5) for x in vec[:8]]}")
-    print("  (embed the same sentence CPU vs GPU; assert cosine≈1 — guardrail G2)")
     if args.checksum:
-        ref = embed_job.SNAPSHOT_DOCS.parent / "checksum_cpu.json"
-        embed_job.save_checksum_reference(embedder, ref)
-        print(f"  saved CPU reference vector → {ref}")
+        if args.checksum_output is None:
+            raise SystemExit("--checksum requires explicit --checksum-output PATH")
+        if args.resume or args.recreate or args.apply or args.shard:
+            raise SystemExit(
+                "--checksum is incompatible with --resume, --recreate, --apply, and --shard"
+            )
+        print(
+            f"Loading embedding model {cfg.embed_model} "
+            f"(device={cfg.embed_device or 'auto/cpu'}, fp16={cfg.embed_use_fp16}, "
+            f"batch={cfg.embed_batch_size})..."
+        )
+        embedder = BGEM3Embedder(cfg)
+        digest = embed_job.save_checksum_reference(
+            embedder,
+            args.checksum_output,
+            snapshot_root=sealed.root,
+        )
+        print(f"VECTOR-SPACE CHECKSUM: sha={digest}; saved → {args.checksum_output}")
         return
+    if args.checksum_output is not None:
+        raise SystemExit("--checksum-output is only valid with --checksum")
 
-    count_tokens = make_token_counter(cfg.tokenizer_model, cfg.tokenizer_revision)
-    client = store.make_client(cfg)
-    store.ensure_collection(
-        client, cfg, recreate=args.recreate, apply=args.apply
+    store.validate_generation_write_target(
+        cfg,
+        apply=args.apply,
+        recreate=args.recreate,
     )
 
-    if args.pilot:
-        # gold/holdout docs (so the harness resolves) + a distractor sample per source
-        holdout = _json.loads(
-            (embed_job.SNAPSHOT_DOCS.parent.parent.parent / "eval" / "holdout_doc_ids.json").read_text()
-        )
-        gold_by_src: dict[str, set[str]] = {}
-        for x in holdout:
-            gold_by_src.setdefault(x["source"], set()).add(x["document_id"])
-        rng = random.Random(0)
-        docs = []
-        for source in embed_job.SOURCES:
-            docs.extend(embed_job.load_snapshot_docs(source, gold_by_src.get(source, set())))
-            gold_ids = gold_by_src.get(source, set())
-            pool = [d for d in embed_job.iter_snapshot_docs(source, limit=args.distractors * 3)
-                    if d.document_id not in gold_ids]
-            docs.extend(rng.sample(pool, min(args.distractors, len(pool))))
-        d, c, k = embed_job.embed_docs(cfg, client, embedder, count_tokens, docs,
-                                       batch_size=args.batch_size)
-        info = client.get_collection(cfg.collection_name)
-        print(f"Pilot embedded: {d} docs -> {c} chunks ({k} skipped). "
-              f"Collection '{cfg.collection_name}' now has {info.points_count} points.")
-        return
-
-    # full-corpus resumable embed (RunPod production profile)
     shard = None
     if args.shard:
-        i, n = (int(x) for x in args.shard.split("/"))
+        try:
+            i, n = (int(x) for x in args.shard.split("/"))
+        except (TypeError, ValueError) as exc:
+            raise SystemExit("--shard must have form i/n") from exc
         if not (0 <= i < n):
             raise SystemExit(f"--shard i/n must have 0<=i<n (got {args.shard!r})")
         shard = (i, n)
-        print(f"  [shard {i}/{n}] embedding every {n}-th doc")
-    sources = [args.source] if args.source != "all" else list(embed_job.SOURCES)
-    grand_d = grand_c = grand_k = 0
-    for source in sources:
-        d, c, k = embed_job.embed_source_resumable(
-            cfg, client, embedder, count_tokens, source,
-            batch_size=args.batch_size, limit=args.limit, shard=shard,
+        print(f"  [shard {i}/{n}] embedding every {n}-th document")
+    if args.source != "all" and args.source not in embed_job.SOURCES:
+        raise SystemExit(f"unsupported snapshot source {args.source!r}")
+    if not args.resume and args.source != "all":
+        raise SystemExit("a fresh immutable embed must initialize all sources (--source all)")
+    sources = (
+        [args.source]
+        if args.source != "all"
+        else list(embed_job.SOURCES)
+    )
+
+    # Binding/checkpoint state is fully validated before any Qdrant or model access.
+    binding = embed_job.prepare_binding(cfg, sealed, resume=args.resume)
+    checkpoints = embed_job.preflight_checkpoints(
+        binding,
+        sources,
+        shard,
+        resume=args.resume,
+    )
+    client = store.make_client(cfg)
+    store.prepare_embed_collection(
+        client,
+        cfg,
+        resume=args.resume,
+        recreate=args.recreate,
+        apply=args.apply,
+        minimum_points=sum(
+            checkpoint["chunks_completed"] for checkpoint in checkpoints.values()
+        ),
+    )
+    if args.resume:
+        embed_job.verify_resume_checkpoint_points(
+            cfg,
+            client,
+            sealed,
+            checkpoints,
         )
-        print(f"  {source}: {d} docs -> {c} chunks ({k} skipped)")
-        grand_d += d
-        grand_c += c
-        grand_k += k
+
+    print(
+        f"Loading embedding model {cfg.embed_model} "
+        f"(device={cfg.embed_device or 'auto/cpu'}, fp16={cfg.embed_use_fp16}, "
+        f"batch={cfg.embed_batch_size})..."
+    )
+    embedder = BGEM3Embedder(cfg)
+    count_tokens = make_token_counter(
+        cfg.tokenizer_model,
+        cfg.tokenizer_revision,
+    )
+    digest, vec = embed_job.dense_checksum(embedder)
+    print(
+        f"VECTOR-SPACE CHECKSUM: sha={digest}  "
+        f"dims[:8]={[round(x, 5) for x in vec[:8]]}"
+    )
+
+    grand_d = grand_c = 0
+    for source in sources:
+        docs, chunks, skipped = embed_job.embed_source_resumable(
+            cfg,
+            client,
+            embedder,
+            count_tokens,
+            source,
+            binding=binding,
+            snapshot_docs=sealed.docs,
+            resume=args.resume,
+            prepared_checkpoint=checkpoints[source],
+            batch_size=batch_size,
+            shard=shard,
+        )
+        print(f"  {source}: {docs} docs -> {chunks} chunks ({skipped} skipped)")
+        grand_d += docs
+        grand_c += chunks
     info = client.get_collection(cfg.collection_name)
-    print(f"Done: {grand_d} docs -> {grand_c} chunks ({grand_k} skipped). "
-          f"Collection '{cfg.collection_name}' now has {info.points_count} points.")
+    print(
+        f"Done: {grand_d} docs -> {grand_c} chunks (0 skipped). "
+        f"Collection '{cfg.collection_name}' now has {info.points_count} points."
+    )
 
 
 def _cmd_search(args) -> None:
@@ -280,8 +354,34 @@ def main() -> None:
 
     p_snap = sub.add_parser(
         "snapshot", help="build a clean, deduplicated, versioned corpus snapshot (Part 1)")
+    p_snap.add_argument(
+        "--snapshot-id",
+        required=True,
+        help="new immutable non-v1 snapshot identifier",
+    )
+    p_snap.add_argument(
+        "--output-root",
+        required=True,
+        type=Path,
+        help="parent directory for the create-only snapshot",
+    )
+    p_snap.add_argument(
+        "--source-state-evidence",
+        type=Path,
+        help="production run-selection ledger with exact items/run.json hashes",
+    )
+    p_snap.add_argument(
+        "--preflight",
+        action="store_true",
+        help="build a non-production snapshot below ingest/.state/v3",
+    )
     p_snap.add_argument("--source", default="all", help="spider name or 'all' (present sources)")
-    p_snap.add_argument("--limit", type=int, default=None, help="cap docs per source (dev)")
+    p_snap.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="cap docs per source (only valid with --preflight)",
+    )
     p_snap.add_argument("--no-near-dup", action="store_true",
                         help="skip the MinHash/LSH near-duplicate pass (faster)")
     p_snap.add_argument("--token-sample", type=int, default=2000,
@@ -289,17 +389,28 @@ def main() -> None:
     p_snap.set_defaults(func=_cmd_snapshot)
 
     p_embed = sub.add_parser(
-        "embed", help="embed the clean snapshot into Qdrant (CPU pilot / RunPod GPU prod)")
+        "embed", help="embed one sealed snapshot into its immutable physical collection")
+    p_embed.add_argument(
+        "--snapshot-docs",
+        required=True,
+        type=Path,
+        help="exact SNAPSHOT/docs directory beside a sealed production manifest",
+    )
     p_embed.add_argument("--source", default="all", help="source name or 'all'")
-    p_embed.add_argument("--pilot", action="store_true",
-                         help="embed holdout/gold docs + a distractor sample (interim baseline)")
-    p_embed.add_argument("--distractors", type=int, default=400,
-                         help="distractor docs/source in --pilot mode")
     p_embed.add_argument("--checksum", action="store_true",
-                         help="print the vector-space checksum and exit (CPU-vs-GPU guardrail)")
-    p_embed.add_argument("--limit", type=int, default=None, help="cap docs/source (full mode)")
+                         help="create only the CPU/GPU vector-space checksum artifact")
+    p_embed.add_argument(
+        "--checksum-output",
+        type=Path,
+        help="create-only checksum JSON path outside the immutable snapshot",
+    )
     p_embed.add_argument("--batch-size", type=int, default=256, help="points per upsert batch")
     p_embed.add_argument("--recreate", action="store_true", help="drop & recreate the collection")
+    p_embed.add_argument(
+        "--resume",
+        action="store_true",
+        help="require and resume the exact existing binding, checkpoints, and collection",
+    )
     p_embed.add_argument(
         "--apply",
         action="store_true",

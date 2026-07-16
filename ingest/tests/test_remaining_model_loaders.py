@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import builtins
 import importlib.util
+import json
 import sys
 import types
 from pathlib import Path
@@ -179,3 +180,84 @@ def test_finetune_cross_encoder_forwards_revision_only_when_configured(
             {"num_labels": 1, "max_length": 512, "revision": REVISION},
         ),
     ]
+
+
+def test_finetune_hard_negatives_cover_same_document_neighbors_and_versions() -> None:
+    from scripts.finetune_reranker import (
+        HARD_NEGATIVE_KINDS,
+        _select_hard_negatives,
+    )
+
+    gold = {
+        "source": "matsne",
+        "document_id": "law-1",
+        "version_id": "v2",
+        "version_family": "law-1-lineage",
+        "chunk_index": 7,
+        "article_id": "10",
+    }
+
+    def point(text: str, **payload):
+        return types.SimpleNamespace(payload={"text": text, **payload})
+
+    common = {"source": "matsne", "document_id": "law-1"}
+    points = [
+        point("positive", **common, version_id="v2", chunk_index=7, article_id="10"),
+        point("wrong passage", **common, version_id="v2", chunk_index=8, article_id="10"),
+        point("neighbor", **common, version_id="v2", chunk_index=9, article_id="11"),
+        point("old version", **common, version_id="v1", chunk_index=7, article_id="10"),
+        point(
+            "blind leak",
+            source="matsne",
+            document_id="blind-law",
+            version_id="v1",
+            chunk_index=1,
+            version_family="blind-lineage",
+        ),
+        point(
+            "similar authority",
+            source="matsne",
+            document_id="law-2",
+            version_id="v1",
+            chunk_index=1,
+        ),
+    ]
+    selected = _select_hard_negatives(
+        points,
+        gold=gold,
+        positive_family="law-1-lineage",
+        excluded_families={"blind-lineage"},
+        limit=4,
+    )
+    assert {kind for _text, kind in selected} == HARD_NEGATIVE_KINDS
+    assert "positive" not in {text for text, _kind in selected}
+    assert "blind leak" not in {text for text, _kind in selected}
+
+
+def test_finetune_exclusion_uses_explicit_version_family(tmp_path) -> None:
+    from scripts.finetune_reranker import _excluded_families, _record_family
+
+    test = tmp_path / "test.jsonl"
+    test.write_text(
+        json.dumps({
+            "gold": {
+                "source": "matsne",
+                "document_id": "law-1-v2",
+                "version_family": "law-1-lineage",
+            }
+        }) + "\n",
+        encoding="utf-8",
+    )
+    holdout = tmp_path / "holdout.json"
+    holdout.write_text(
+        json.dumps([{"source": "ecd", "document_id": "case-1"}]),
+        encoding="utf-8",
+    )
+    assert _excluded_families(test, holdout) == {
+        "law-1-lineage",
+        "ecd:case-1",
+    }
+    assert _record_family({
+        "gold": {"source": "matsne", "document_id": "law-1-v1"},
+        "version_family": "law-1-lineage",
+    }) == "law-1-lineage"

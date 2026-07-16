@@ -1,6 +1,13 @@
 import pytest
 
-from ingest.sources import SOURCES, _parse_date, normalize, normalize_status
+from ingest.sources import (
+    NORMALIZER_REVISION,
+    SOURCES,
+    _parse_date,
+    normalize,
+    normalize_registration_code,
+    normalize_status,
+)
 
 
 @pytest.mark.parametrize(
@@ -49,6 +56,20 @@ def test_matsne_number_and_registration_and_date():
 
 
 @pytest.mark.parametrize(
+    "raw",
+    ["000000000.00.00.000000", "0", "00-00", "-", "N/A", "არ არის", "   "],
+)
+def test_placeholder_registration_codes_are_null(raw):
+    assert normalize_registration_code(raw) is None
+
+
+def test_real_registration_code_is_preserved():
+    assert normalize_registration_code("040.000.000.05.001.000.223") == (
+        "040.000.000.05.001.000.223"
+    )
+
+
+@pytest.mark.parametrize(
     "raw,canonical",
     [
         ("ძალაში მყოფი აქტები", "in_force"),
@@ -73,6 +94,25 @@ def test_matsne_status_and_force_dates_indexed():
     assert doc.status_raw == "ძალადაკარგული აქტები"
     assert doc.in_force_date == "2020-01-01"
     assert doc.expiry_date == "2024-06-03"
+
+
+def test_matsne_canonical_version_metadata_uses_latest_consolidation_date():
+    doc = normalize("matsne", {
+        "document_id": "111", "document_url": "https://matsne.gov.ge/ka/document/view/111",
+        "body_markdown": "კანონის ზუსტი ტექსტი", "entry_into_force_date": "01/01/2020",
+        "consolidated_dates": ["03/02/2021", "05/04/2024"],
+        "is_consolidated": True, "registration_code": "000000000.00.00.000000",
+    })
+    assert doc.registration_code is None
+    assert doc.version_id.startswith("derived:")
+    assert doc.effective_from == "2024-04-05"
+    assert doc.consolidation_status == "consolidated"
+    assert doc.version_lineage_status == "partial"
+    assert doc.version_lineage_complete is False
+    assert doc.normalizer_revision == NORMALIZER_REVISION
+    assert len(doc.source_fingerprint) == 64
+    assert doc.official_url.endswith("/111")
+    assert doc.source_authority == "primary_official"
 
 
 def test_non_matsne_sources_have_no_status():

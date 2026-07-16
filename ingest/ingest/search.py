@@ -39,12 +39,15 @@ def build_filter(
     document_id: str | None = None,
     document_number: str | None = None,
     registration_code: str | None = None,
+    article_id: str | None = None,
+    clause_id: str | None = None,
     parties: str | None = None,
     contains: str | None = None,
     status: str | None = None,
     is_consolidated: bool | None = None,
     date_from: str | None = None,
     date_to: str | None = None,
+    as_of: str | None = None,
 ) -> models.Filter | None:
     """Build an AND filter over the indexed payload fields.
 
@@ -79,6 +82,18 @@ def build_filter(
                 key="registration_code", match=models.MatchValue(value=registration_code)
             )
         )
+    if article_id:
+        must.append(
+            models.FieldCondition(
+                key="article_id", match=models.MatchValue(value=article_id)
+            )
+        )
+    if clause_id:
+        must.append(
+            models.FieldCondition(
+                key="clause_id", match=models.MatchValue(value=clause_id)
+            )
+        )
     if parties:
         must.append(models.FieldCondition(key="parties", match=models.MatchText(text=parties)))
     if contains:
@@ -96,6 +111,30 @@ def build_filter(
             models.FieldCondition(
                 key="date",
                 range=models.DatetimeRange(gte=_date_bound(date_from), lte=_date_bound(date_to)),
+            )
+        )
+    if as_of:
+        instant = _date_bound(as_of)
+        # Canonical version intervals are [effective_from, effective_to).  An omitted
+        # effective_to means the version remains open-ended.  Publication date (``date``)
+        # is deliberately not consulted here.
+        must.append(
+            models.FieldCondition(
+                key="effective_from",
+                range=models.DatetimeRange(lte=instant),
+            )
+        )
+        must.append(
+            models.Filter(
+                should=[
+                    models.FieldCondition(
+                        key="effective_to",
+                        range=models.DatetimeRange(gt=instant),
+                    ),
+                    models.IsEmptyCondition(
+                        is_empty=models.PayloadField(key="effective_to")
+                    ),
+                ]
             )
         )
     return models.Filter(must=must) if must else None
@@ -201,6 +240,7 @@ def hybrid_search(
         points = rerank_points(
             reranker, query, points,
             top_k=len(points) if diversity_on else top_k, min_score=rerank_min_score,
+            enrich_context=getattr(cfg, "rerank_context_enriched", False),
         )
         if timings_ms is not None:
             timings_ms["rerank"] = (
@@ -302,13 +342,43 @@ def diversify(points, *, top_k: int, max_per_doc: int | None = None,
     return selected
 
 
-def rerank_points(reranker, query: str, points, *, top_k: int, min_score: float | None = None):
+def _rerank_text(payload: dict, *, enrich: bool) -> str:
+    """Cross-encoder input for one candidate.
+
+    Raw chunk body by default (current behavior). When ``enrich`` (I8,
+    ``RERANK_CONTEXT_ENRICHED``), prepends a terse title/type-status/number/heading header
+    built from the same payload fields recall already benefits from (``build_payload``),
+    so the cross-encoder can disambiguate near-duplicate documents instead of reading body
+    text alone.
+    """
+    text = payload.get("text") or ""
+    if not enrich:
+        return text
+    parts = []
+    if payload.get("title"):
+        parts.append(payload["title"])
+    kind = " ".join(p for p in (payload.get("document_type"), payload.get("status")) if p)
+    if kind:
+        parts.append(kind)
+    num = "/".join(
+        p for p in (payload.get("document_number"), payload.get("registration_code")) if p
+    )
+    if num:
+        parts.append(f"№{num}")
+    if payload.get("heading"):
+        parts.append(payload["heading"])
+    header = " | ".join(parts)
+    return f"{header}\n{text}" if header else text
+
+
+def rerank_points(reranker, query: str, points, *, top_k: int, min_score: float | None = None,
+                   enrich_context: bool = False):
     """Re-score fused candidates with a cross-encoder, gate, and return the best ``top_k``.
 
     Each point's ``.score`` is overwritten with its rerank score so downstream
     formatting reports the calibrated relevance, not the RRF rank score.
     """
-    texts = [(pt.payload or {}).get("text") or "" for pt in points]
+    texts = [_rerank_text(pt.payload or {}, enrich=enrich_context) for pt in points]
     scores = reranker.score(query, texts)
     for pt, score in zip(points, scores):
         pt.score = float(score)

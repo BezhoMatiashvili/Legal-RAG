@@ -11,7 +11,8 @@ Components:
 | Qdrant | vector DB, collection `georgian_legal` | Docker (`ingest/docker-compose.yml`), data bind-mounted at `ingest/qdrant_storage/` |
 | MCP server | `legal_rag` — the product surface (Claude is the client) | spawned per-connection by the MCP client from `.mcp.json` (stdio) |
 | Session monitor | ops dashboard, `http://localhost:8770` | manual or `legal-monitor.service` |
-| Daily ingest | scrape → embed delta → verify | `scripts/daily_ingest.sh` via `legal-ingest.timer` |
+| Daily ingest | seven-source scrape → embed delta → verify | `scripts/daily_ingest.sh` via `legal-ingest.timer` |
+| Weekly audit | immutable source/completeness/freshness audit | `scripts/audit_corpus_freshness.py` via `legal-corpus-freshness-audit.timer` |
 | GPU rerank (optional) | remote reranker for interactive latency | RunPod pod (`scripts/runpod_rerank.py`) or serverless (`docs/runpod-serverless.md`) |
 
 Two virtualenvs, on purpose: repo-root `.venv` (Python 3.14, scraper), `ingest/.venv`
@@ -117,7 +118,8 @@ MCP server behavior worth knowing:
 
 ## 4. Daily ingestion schedule
 
-`scripts/daily_ingest.sh` chains: scrape (6 corpus sources; `seen.sqlite` keeps it
+`scripts/daily_ingest.sh` chains: scrape (seven corpus sources, including Supreme Court;
+`seen.sqlite` keeps it
 delta-only) → `python -m ingest watch --source all --once` (CPU-embeds the delta, drains,
 exits) → `scripts/verify_all_embedded.py` (document-ID coverage; exit 0 required).
 Logs to `ingest/.state/daily_ingest.log`. `--dry-run` prints the plan + preflight only.
@@ -150,8 +152,28 @@ journalctl --user -u legal-ingest.service -e      # logs (also .state/daily_inge
 
 Tuning via env (in the service file): `DAILY_INGEST_LOOKBACK_DAYS` (default 14) — run a
 wide sweep monthly (`DAILY_INGEST_LOOKBACK_DAYS=90 scripts/daily_ingest.sh`) to catch
-late-published documents; dedup makes wide windows safe, just slower. `supremecourt` is
-excluded from the corpus by design — don't add it without a product decision.
+late-published documents; dedup makes wide windows safe, just slower. Summary-only or
+incomplete TAS/Tbilisi Appeal records remain quarantined from authoritative evidence.
+
+The weekly audit is read-only with respect to the corpus and may be staged separately from
+the disabled legacy writer. It checksum-loads an immutable generation and an
+official-source observation file, compares authoritative version records by
+`(source, document_id, version_id)`, and creates a new owner-only report without replacing
+an earlier report:
+
+```bash
+install -d -m 700 ~/.local/state/georgia-legal-search/freshness-audits
+cp ingest/systemd/legal-corpus-freshness-audit.{service,timer} ~/.config/systemd/user/
+# Set LEGAL_SEARCH_REPO, LEGAL_CORPUS_GENERATION, and LEGAL_CORPUS_FRESHNESS_INPUT in:
+$EDITOR ~/.config/georgia-legal-search.env
+systemctl --user daemon-reload
+systemctl --user enable --now legal-corpus-freshness-audit.timer
+```
+
+The observation file must itself come from the private official-source audit workflow;
+the timer does not crawl the network. A current-law answer is eligible only when serving
+has installed a passing, unexpired report whose generation-manifest checksum matches the
+active immutable generation.
 
 **After approval, do not run the timer while gated retrieval evals are in flight** (see
 `improvement.md`): the embed stage yellows the index. The lock check protects eval runs

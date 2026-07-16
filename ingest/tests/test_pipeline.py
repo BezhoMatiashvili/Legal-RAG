@@ -3,10 +3,11 @@ import json
 
 import pytest
 
-from ingest import pipeline
+from ingest import embed_job, pipeline, qdrant_store, snapshot, sources
 from ingest.config import load_config
 from ingest.dedup import content_hash
 from ingest.embedding import Embedded, Sparse
+from ingest.generation import GENERATION_SCHEMA_VERSION
 
 
 class FakeEmbedder:
@@ -67,6 +68,7 @@ def _ecd_item(doc_id, body="body text here for chunking with enough meaningful l
         "decision_document_id": doc_id, "case_no": f"case-{doc_id}",
         "decision_type_name": "განაჩენი", "court_name": "court",
         "decision_date": "2020-04-30", "body_markdown": body,
+        "source_url": f"https://ecd.court.ge/Decision/{doc_id}",
     }
 
 
@@ -130,7 +132,7 @@ def test_generation_writer_stamps_every_point_with_same_identity(tmp_path):
     payloads = [point.payload for batch, _wait in client.upserts for point in batch]
     assert payloads
     assert {payload["generation_id"] for payload in payloads} == {cfg.generation_id}
-    assert {payload["schema_version"] for payload in payloads} == {1}
+    assert {payload["schema_version"] for payload in payloads} == {GENERATION_SCHEMA_VERSION}
     assert {payload["tokenizer_model"] for payload in payloads} == {
         cfg.tokenizer_model
     }
@@ -142,6 +144,61 @@ def test_generation_writer_stamps_every_point_with_same_identity(tmp_path):
     }
     assert len({payload["retrieval_fingerprint"] for payload in payloads}) == 1
     assert all(len(payload["retrieval_fingerprint"]) == 64 for payload in payloads)
+
+
+def test_generation_writer_keeps_two_versions_of_same_document_distinct(tmp_path):
+    cfg = dataclasses.replace(
+        _make_cfg(tmp_path),
+        generation_id="gen_20260713_versions",
+        collection_name="test__gen_gen_20260713_versions",
+        embedding_revision="a" * 40,
+        tokenizer_revision="b" * 40,
+        reranker_revision="c" * 40,
+        rerank_enabled=False,
+    )
+    _write_items(
+        cfg,
+        "ecd",
+        [
+            _ecd_item(1, body="first complete canonical version of the legal decision"),
+            _ecd_item(1, body="second complete canonical version of the legal decision"),
+        ],
+    )
+    client = FakeClient()
+
+    docs, _, skipped = _run(
+        cfg, client, "ecd", skip_stale_delete=True
+    )
+
+    points = [point for batch, _wait in client.upserts for point in batch]
+    versions = {point.payload["version_id"] for point in points}
+    assert docs == 2 and skipped == 0
+    assert len(versions) == 2
+    assert len({point.id for point in points}) == len(points)
+    assert {
+        point.id for point in points
+    } == {
+        qdrant_store.point_id(
+            point.payload["source"],
+            point.payload["document_id"],
+            point.payload["chunk_index"],
+            version_id=point.payload["version_id"],
+        )
+        for point in points
+    }
+
+
+def test_generation_identity_derives_same_version_when_source_omits_one(tmp_path):
+    cfg = dataclasses.replace(
+        _make_cfg(tmp_path), generation_id="gen_20260713_derived"
+    )
+    doc = sources.normalize("ecd", _ecd_item(1))
+    doc = dataclasses.replace(doc, version_id=None)
+
+    assert pipeline._generation_version_id(cfg, doc) == sources.derived_version_id(doc)
+    assert pipeline._generation_version_id(
+        dataclasses.replace(cfg, generation_id=None), doc
+    ) is None
 
 
 def test_near_empty_body_is_quarantined(tmp_path):
@@ -236,6 +293,60 @@ def test_resume_skips_through_last_id(tmp_path):
     assert docs == 2  # only docs 2 and 3 processed
 
 
+def test_generation_resume_checkpoints_exact_document_version(tmp_path):
+    cfg = dataclasses.replace(
+        _make_cfg(tmp_path),
+        generation_id="gen_20260713_resume_versions",
+        collection_name="test__gen_gen_20260713_resume_versions",
+        embedding_revision="a" * 40,
+        tokenizer_revision="b" * 40,
+        reranker_revision="c" * 40,
+        rerank_enabled=False,
+    )
+    _write_items(cfg, "ecd", [
+        _ecd_item(1, body="first complete canonical version for resume safety"),
+        _ecd_item(1, body="second complete canonical version for resume safety"),
+    ])
+    first_client = FakeClient()
+
+    first_docs, _, _ = _run(cfg, first_client, "ecd", limit=1)
+    checkpoint = json.loads((cfg.state_dir / "ecd.json").read_text())
+    first_version = first_client.upserts[0][0][0].payload["version_id"]
+
+    assert first_docs == 1
+    assert checkpoint == {
+        "last_document_id": "1",
+        "docs": 1,
+        "chunks": 1,
+        "last_version_id": first_version,
+    }
+
+    resumed_client = FakeClient()
+    resumed_docs, _, _ = _run(cfg, resumed_client, "ecd", resume=True)
+    resumed_versions = {
+        point.payload["version_id"]
+        for batch, _wait in resumed_client.upserts
+        for point in batch
+    }
+    assert resumed_docs == 1
+    assert first_version not in resumed_versions
+    assert len(resumed_versions) == 1
+
+
+def test_generation_resume_rejects_legacy_document_only_checkpoint(tmp_path):
+    cfg = dataclasses.replace(
+        _make_cfg(tmp_path), generation_id="gen_20260713_resume_guard"
+    )
+    _write_items(cfg, "ecd", [_ecd_item(1)])
+    cfg.state_dir.mkdir(parents=True, exist_ok=True)
+    (cfg.state_dir / "ecd.json").write_text(
+        json.dumps({"last_document_id": "1"}), encoding="utf-8"
+    )
+
+    with pytest.raises(RuntimeError, match="lacks last_version_id"):
+        _run(cfg, FakeClient(), "ecd", resume=True)
+
+
 def test_resume_id_not_found_raises(tmp_path):
     cfg = _make_cfg(tmp_path)
     _write_items(cfg, "ecd", [_ecd_item(1), _ecd_item(2)])
@@ -255,9 +366,11 @@ def test_delete_checkpoint(tmp_path):
     pipeline.delete_checkpoint(cfg, "ecd")  # idempotent (missing_ok)
 
 
-def test_resolve_all_excludes_non_corpus_supremecourt():
+def test_resolve_all_includes_first_class_supremecourt():
     assert pipeline.resolve_sources("all") == list(pipeline.CORPUS_SOURCES)
-    assert "supremecourt" not in pipeline.resolve_sources("all")
+    assert "supremecourt" in pipeline.resolve_sources("all")
+    assert "supremecourt" in snapshot.SOURCES_PRESENT
+    assert "supremecourt" in embed_job.SOURCES
 
 
 def test_resolve_sources_accepts_deduplicated_comma_list():

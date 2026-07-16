@@ -17,6 +17,8 @@ from pathlib import Path
 from typing import Any
 
 from .generation import (
+    CANONICAL_PAYLOAD_REQUIRED_FIELDS,
+    CANONICAL_PAYLOAD_REVISION,
     GENERATION_SCHEMA_VERSION,
     MANIFEST_FILENAME,
     DocumentRecord,
@@ -47,6 +49,7 @@ class VerificationOutcome:
 class VerificationReport:
     generation_id: str
     manifest_sha256: str
+    physical_collection: str | None
     verified_at: str
     covered_runs: tuple[dict[str, str], ...]
     stats: Mapping[str, int]
@@ -73,6 +76,7 @@ class VerificationReport:
             "schema_version": self.schema_version,
             "generation_id": self.generation_id,
             "manifest_sha256": self.manifest_sha256,
+            "physical_collection": self.physical_collection,
             "verified_at": self.verified_at,
             "ok": self.ok,
             "covered_runs": [dict(run) for run in self.covered_runs],
@@ -272,12 +276,149 @@ def _expect_payload_value(
         )
 
 
+def _validate_canonical_payload(
+    payload: Mapping[str, Any],
+    manifest: GenerationManifest,
+    issues: _Issues,
+    *,
+    point_id: str,
+    text: str | None,
+) -> None:
+    """Validate the schema-v2 fields that make a point admissible as legal evidence."""
+    identity_fields = {
+        "canonical_payload_revision",
+        "canonical_text_exact",
+        "model_revision",
+    }
+    for field in sorted(CANONICAL_PAYLOAD_REQUIRED_FIELDS - identity_fields):
+        if field not in payload:
+            issues.add("missing_payload_field", point_id=point_id, field=field)
+
+    _expect_payload_value(
+        payload,
+        "canonical_payload_revision",
+        CANONICAL_PAYLOAD_REVISION,
+        issues,
+        point_id=point_id,
+    )
+    _expect_payload_value(
+        payload,
+        "canonical_text_exact",
+        True,
+        issues,
+        point_id=point_id,
+    )
+    _expect_payload_value(
+        payload,
+        "model_revision",
+        manifest.model.embedding_revision,
+        issues,
+        point_id=point_id,
+    )
+
+    for field in ("canonical_content_hash", "passage_hash", "source_fingerprint"):
+        if field in payload and not _is_sha256(payload[field]):
+            issues.add("invalid_payload_hash", point_id=point_id, field=field)
+    if (
+        _is_sha256(payload.get("canonical_content_hash"))
+        and payload.get("canonical_content_hash") != payload.get("content_hash")
+    ):
+        issues.add(
+            "canonical_content_hash_mismatch",
+            point_id=point_id,
+        )
+    if text is not None and _is_sha256(payload.get("passage_hash")):
+        actual = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        if payload["passage_hash"] != actual:
+            issues.add("passage_hash_mismatch", point_id=point_id)
+
+    start, end = payload.get("char_start"), payload.get("char_end")
+    if not _is_int(start):
+        issues.add("invalid_payload_field", point_id=point_id, field="char_start")
+    if not _is_int(end, minimum=1):
+        issues.add("invalid_payload_field", point_id=point_id, field="char_end")
+    if _is_int(start) and _is_int(end, minimum=1):
+        if end <= start or (text is not None and end - start != len(text)):
+            issues.add("invalid_canonical_offsets", point_id=point_id)
+
+    for field in (
+        "passage_id",
+        "normalizer_revision",
+        "chunker_revision",
+        "version_id",
+        "version_lineage_status",
+        "official_url",
+    ):
+        if field in payload and not _is_string(payload[field]):
+            issues.add("invalid_payload_field", point_id=point_id, field=field)
+    authority = payload.get("source_authority")
+    if authority not in {"official", "primary_official"}:
+        issues.add("invalid_payload_field", point_id=point_id, field="source_authority")
+
+    for field in (
+        "article_id",
+        "clause_id",
+        "subarticle",
+        "chapter",
+        "parent_id",
+        "consolidation_status",
+        "official_binary_url",
+    ):
+        if field in payload and payload[field] is not None and not _is_string(payload[field]):
+            issues.add("invalid_payload_field", point_id=point_id, field=field)
+    heading_path = payload.get("heading_path")
+    if "heading_path" in payload and (
+        not isinstance(heading_path, list)
+        or any(not _is_string(item) for item in heading_path)
+    ):
+        issues.add("invalid_payload_field", point_id=point_id, field="heading_path")
+    supersedes = payload.get("supersedes")
+    if "supersedes" in payload and (
+        not isinstance(supersedes, list)
+        or any(not _is_string(item) for item in supersedes)
+    ):
+        issues.add("invalid_payload_field", point_id=point_id, field="supersedes")
+
+    for field in (
+        "article_start_chunk_index",
+        "parent_chunk_index",
+        "page_start",
+        "page_end",
+    ):
+        value = payload.get(field)
+        if field in payload and value is not None and not _is_int(value):
+            issues.add("invalid_payload_field", point_id=point_id, field=field)
+    if "version_lineage_complete" in payload and not isinstance(
+        payload["version_lineage_complete"], bool
+    ):
+        issues.add(
+            "invalid_payload_field",
+            point_id=point_id,
+            field="version_lineage_complete",
+        )
+    freshness = payload.get("freshness_sla_met")
+    if "freshness_sla_met" in payload and freshness is not None and not isinstance(
+        freshness, bool
+    ):
+        issues.add("invalid_payload_field", point_id=point_id, field="freshness_sla_met")
+
+    for field in ("effective_from", "effective_to", "repeal_date"):
+        value = payload.get(field)
+        if field not in payload or value is None:
+            continue
+        try:
+            parse_rfc3339_utc(value, field=f"payload.{field}")
+        except ValueError:
+            issues.add("invalid_payload_field", point_id=point_id, field=field)
+
+
 def _create_tables(connection: sqlite3.Connection) -> None:
     connection.executescript(
         """
         CREATE TABLE expected (
             source TEXT NOT NULL,
             document_id TEXT NOT NULL,
+            version_id TEXT NOT NULL,
             expected_chunks INTEGER NOT NULL,
             state_hash TEXT NOT NULL,
             content_hash TEXT NOT NULL,
@@ -288,21 +429,23 @@ def _create_tables(connection: sqlite3.Connection) -> None:
             article_summary TEXT,
             source_binary_url TEXT,
             refresh_deadline TEXT,
-            PRIMARY KEY (source, document_id)
+            PRIMARY KEY (source, document_id, version_id)
         );
         CREATE TABLE observed (
             source TEXT NOT NULL,
             document_id TEXT NOT NULL,
+            version_id TEXT NOT NULL,
             chunk_index INTEGER NOT NULL,
             point_id TEXT NOT NULL UNIQUE,
             text_sha256 TEXT,
-            PRIMARY KEY (source, document_id, chunk_index)
+            PRIMARY KEY (source, document_id, version_id, chunk_index)
         );
         CREATE TABLE samples (
             source TEXT NOT NULL,
             document_id TEXT NOT NULL,
+            version_id TEXT NOT NULL,
             chunk_index INTEGER NOT NULL,
-            PRIMARY KEY (source, document_id, chunk_index)
+            PRIMARY KEY (source, document_id, version_id, chunk_index)
         );
         """
     )
@@ -329,11 +472,19 @@ def verify_generation_points(
     now: datetime | None = None,
     max_examples: int = 20,
     temp_dir: str | Path | None = None,
+    physical_collection: str | None = None,
 ) -> VerificationReport:
     """Verify a point stream against a generation ledger using bounded memory."""
     if not isinstance(manifest, GenerationManifest):
         raise TypeError("manifest must be a GenerationManifest")
     manifest = GenerationManifest.from_dict(json.loads(json.dumps(manifest.to_dict())))
+    if physical_collection is not None:
+        expected_collection = f"georgian_legal__gen_{manifest.generation_id}"
+        if physical_collection != expected_collection:
+            raise ValueError(
+                "verification must target the exact physical collection "
+                f"{expected_collection!r}; got {physical_collection!r}"
+            )
     if not _is_sha256(manifest_sha256):
         raise ValueError("manifest_sha256 must be a lowercase SHA-256 digest")
     if not _is_int(max_examples, minimum=1):
@@ -385,15 +536,16 @@ def verify_generation_points(
                 connection.execute(
                     """
                     INSERT INTO expected (
-                        source, document_id, expected_chunks, state_hash,
+                        source, document_id, version_id, expected_chunks, state_hash,
                         content_hash, excluded, complete, content_kind,
                         extraction_status, article_summary, source_binary_url,
                         refresh_deadline
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         record.source,
                         record.document_id,
+                        record.version_id,
                         record.expected_chunk_count,
                         record.document_state_hash,
                         record.content_hash,
@@ -467,6 +619,8 @@ def verify_generation_points(
                 actual=expected_chunks,
             )
 
+        from .qdrant_store import point_id as expected_point_id
+
         observed_points = 0
         for point in points:
             observed_points += 1
@@ -500,6 +654,7 @@ def verify_generation_points(
 
             source = payload.get("source")
             document_id = payload.get("document_id")
+            version_id = payload.get("version_id")
             chunk_index = payload.get("chunk_index")
             key_is_valid = True
             if not _is_string(source):
@@ -514,6 +669,13 @@ def verify_generation_points(
                     "invalid_payload_field",
                     point_id=issue_point_id,
                     field="document_id",
+                )
+                key_is_valid = False
+            if not _is_string(version_id):
+                integrity.add(
+                    "invalid_payload_field",
+                    point_id=issue_point_id,
+                    field="version_id",
                 )
                 key_is_valid = False
             if not _is_int(chunk_index):
@@ -598,6 +760,13 @@ def verify_generation_points(
                 payload,
                 "document_header",
                 manifest.chunking.document_header,
+                integrity,
+                point_id=issue_point_id,
+            )
+            _expect_payload_value(
+                payload,
+                "retrieval_fingerprint_revision",
+                manifest.retrieval_fingerprint_revision,
                 integrity,
                 point_id=issue_point_id,
             )
@@ -718,20 +887,45 @@ def verify_generation_points(
             else:
                 text_sha256 = hashlib.sha256(text.encode("utf-8")).hexdigest()
 
+            _validate_canonical_payload(
+                payload,
+                manifest,
+                integrity,
+                point_id=issue_point_id,
+                text=text if isinstance(text, str) else None,
+            )
+
             if not key_is_valid:
                 continue
             assert isinstance(source, str)
             assert isinstance(document_id, str)
+            assert isinstance(version_id, str)
             assert isinstance(chunk_index, int)
+            deterministic_point_id = expected_point_id(
+                source,
+                document_id,
+                chunk_index,
+                version_id=version_id,
+            )
+            if point_id is not None and point_id != deterministic_point_id:
+                integrity.add(
+                    "version_scoped_point_id_mismatch",
+                    source=source,
+                    document_id=document_id,
+                    version_id=version_id,
+                    chunk_index=chunk_index,
+                    expected=deterministic_point_id,
+                    actual=point_id,
+                )
             expected = connection.execute(
                 """
                 SELECT expected_chunks, state_hash, content_hash, excluded,
                        complete, content_kind, extraction_status,
                        article_summary, source_binary_url
                 FROM expected
-                WHERE source = ? AND document_id = ?
+                WHERE source = ? AND document_id = ? AND version_id = ?
                 """,
-                (source, document_id),
+                (source, document_id, version_id),
             ).fetchone()
             if expected is None:
                 integrity.add(
@@ -804,12 +998,13 @@ def verify_generation_points(
                 connection.execute(
                     """
                     INSERT INTO observed (
-                        source, document_id, chunk_index, point_id, text_sha256
-                    ) VALUES (?, ?, ?, ?, ?)
+                        source, document_id, version_id, chunk_index, point_id, text_sha256
+                    ) VALUES (?, ?, ?, ?, ?, ?)
                     """,
                     (
                         source,
                         document_id,
+                        version_id,
                         chunk_index,
                         storage_point_id,
                         text_sha256,
@@ -819,9 +1014,10 @@ def verify_generation_points(
                 existing_key = connection.execute(
                     """
                     SELECT 1 FROM observed
-                    WHERE source = ? AND document_id = ? AND chunk_index = ?
+                    WHERE source = ? AND document_id = ? AND version_id = ?
+                      AND chunk_index = ?
                     """,
-                    (source, document_id, chunk_index),
+                    (source, document_id, version_id, chunk_index),
                 ).fetchone()
                 code = (
                     "duplicate_logical_chunk"
@@ -844,6 +1040,7 @@ def verify_generation_points(
             SELECT
                 e.source,
                 e.document_id,
+                e.version_id,
                 e.expected_chunks,
                 e.excluded,
                 COUNT(o.chunk_index),
@@ -852,13 +1049,15 @@ def verify_generation_points(
             FROM expected AS e
             LEFT JOIN observed AS o
               ON o.source = e.source AND o.document_id = e.document_id
-            GROUP BY e.source, e.document_id
-            ORDER BY e.source, e.document_id
+             AND o.version_id = e.version_id
+            GROUP BY e.source, e.document_id, e.version_id
+            ORDER BY e.source, e.document_id, e.version_id
             """
         )
         for (
             source,
             document_id,
+            version_id,
             expected_count,
             excluded,
             actual_count,
@@ -902,10 +1101,11 @@ def verify_generation_points(
         ).fetchone()[0]
         observed_indexed_documents = connection.execute(
             """
-            SELECT COUNT(DISTINCT o.source || char(0) || o.document_id)
+            SELECT COUNT(DISTINCT o.source || char(0) || o.document_id || char(0) || o.version_id)
             FROM observed AS o
             JOIN expected AS e
               ON e.source = o.source AND e.document_id = o.document_id
+             AND e.version_id = o.version_id
             WHERE e.excluded = 0
             """
         ).fetchone()[0]
@@ -915,6 +1115,7 @@ def verify_generation_points(
             FROM observed AS o
             LEFT JOIN expected AS e
               ON e.source = o.source AND e.document_id = o.document_id
+             AND e.version_id = o.version_id
             WHERE e.source IS NULL
             """
         ).fetchone()[0]
@@ -943,10 +1144,15 @@ def verify_generation_points(
             try:
                 connection.execute(
                     """
-                    INSERT INTO samples (source, document_id, chunk_index)
-                    VALUES (?, ?, ?)
+                    INSERT INTO samples (source, document_id, version_id, chunk_index)
+                    VALUES (?, ?, ?, ?)
                     """,
-                    (sample.source, sample.document_id, sample.chunk_index),
+                    (
+                        sample.source,
+                        sample.document_id,
+                        sample.version_id,
+                        sample.chunk_index,
+                    ),
                 )
             except sqlite3.IntegrityError:
                 integrity.add(
@@ -960,9 +1166,9 @@ def verify_generation_points(
                 """
                 SELECT expected_chunks, excluded
                 FROM expected
-                WHERE source = ? AND document_id = ?
+                WHERE source = ? AND document_id = ? AND version_id = ?
                 """,
-                (sample.source, sample.document_id),
+                (sample.source, sample.document_id, sample.version_id),
             ).fetchone()
             if expected is None or expected[1] or sample.chunk_index >= expected[0]:
                 integrity.add(
@@ -976,9 +1182,15 @@ def verify_generation_points(
                 """
                 SELECT point_id, text_sha256
                 FROM observed
-                WHERE source = ? AND document_id = ? AND chunk_index = ?
+                WHERE source = ? AND document_id = ? AND version_id = ?
+                  AND chunk_index = ?
                 """,
-                (sample.source, sample.document_id, sample.chunk_index),
+                (
+                    sample.source,
+                    sample.document_id,
+                    sample.version_id,
+                    sample.chunk_index,
+                ),
             ).fetchone()
             if observed is None:
                 coverage.add(
@@ -1031,6 +1243,7 @@ def verify_generation_points(
         return VerificationReport(
             generation_id=manifest.generation_id,
             manifest_sha256=manifest_sha256,
+            physical_collection=physical_collection,
             verified_at=_format_utc(current_time),
             covered_runs=covered_runs,
             stats=stats,
@@ -1055,6 +1268,7 @@ def verify_generation_artifacts(
     now: datetime | None = None,
     max_examples: int = 20,
     temp_dir: str | Path | None = None,
+    physical_collection: str | None = None,
 ) -> VerificationReport:
     """Verify a checksum-validated artifact bundle against a point stream."""
     if not isinstance(artifacts, GenerationArtifacts):
@@ -1068,6 +1282,7 @@ def verify_generation_artifacts(
         now=now,
         max_examples=max_examples,
         temp_dir=temp_dir,
+        physical_collection=physical_collection,
     )
 
 

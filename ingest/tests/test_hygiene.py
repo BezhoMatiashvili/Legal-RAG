@@ -89,6 +89,52 @@ def test_assess_gate_measured_on_cleaned_text_not_raw():
     assert hygiene.assess(long_ka + "�" * 3 + "\x00" * 400).quarantine_reason == hygiene.Q_MOJIBAKE
 
 
+def test_strip_data_uris_replaces_image_and_counts():
+    blob = "data:image/jpeg;base64," + "A" * 500 + "=="
+    body = f"მუხლი 1. იხილეთ ილუსტრაცია: {blob} შემდეგი ტექსტი."
+    cleaned, count = hygiene.strip_data_uris(body)
+    assert count == 1
+    assert "[image]" in cleaned
+    assert blob not in cleaned
+    assert "A" * 20 not in cleaned  # payload itself is gone, not just truncated
+    assert "მუხლი 1" in cleaned and "შემდეგი ტექსტი" in cleaned
+
+
+def test_strip_data_uris_leaves_non_data_uri_text_untouched():
+    body = "მუხლი 1. ჩვეულებრივი ტექსტი base64 სიტყვის ხსენებით, არა URI."
+    cleaned, count = hygiene.strip_data_uris(body)
+    assert count == 0
+    assert cleaned == body
+
+
+def test_clean_text_strips_data_uri_and_preserves_surrounding_text():
+    blob = "data:image/png;base64," + "QUJDREVGRw==" * 40
+    body = f"დადგენილება № 5.\x00 {blob} დასკვნა."
+    cleaned = hygiene.clean_text(body)
+    assert "[image]" in cleaned
+    assert blob not in cleaned
+    assert "\x00" not in cleaned
+    assert "დადგენილება № 5." in cleaned and "დასკვნა." in cleaned
+
+
+def test_clean_text_data_uri_stripping_is_idempotent():
+    blob = "data:image/jpeg;base64," + "Zm9vYmFy" * 30
+    body = f"ტექსტი {blob} დასასრული"
+    once = hygiene.clean_text(body)
+    assert hygiene.clean_text(once) == once
+
+
+def test_assess_measures_meaningful_chars_after_data_uri_strip():
+    # A body that is almost entirely a base64 blob with only a few real chars must not
+    # be counted as "meaningful" via the blob's characters — assess() must measure on
+    # what clean_text actually leaves in the index (a short [image] marker), matching
+    # the module's own "measured on cleaned text" invariant for control/mojibake gates.
+    blob = "data:image/png;base64," + "Q" * 2000
+    r = hygiene.assess(blob + " მუხლი")
+    assert r.meaningful_chars < 30  # "[image] მუხლი" — well under NEAR_EMPTY_CHARS
+    assert r.quarantine_reason == hygiene.Q_NEAR_EMPTY
+
+
 def test_assess_reports_nfc_change():
     decomposed = unicodedata.normalize("NFD", "ჩ") + "test text long enough to be usable content here"
     r = hygiene.assess(decomposed)

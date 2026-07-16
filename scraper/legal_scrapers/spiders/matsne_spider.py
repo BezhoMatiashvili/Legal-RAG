@@ -11,6 +11,7 @@ from scrapy.exceptions import DontCloseSpider
 from scrapy.http import HtmlResponse
 from scrapy.loader import ItemLoader
 
+from ..completion import atomic_create_private
 from ..items import MatsneItem
 from ..utils.dates import parse_dotted
 from ..utils.pagination import (
@@ -68,7 +69,6 @@ class MatsneSpider(BaseLegalSpider):
     def from_crawler(cls, crawler, *args, **kwargs):
         spider = super().from_crawler(crawler, *args, **kwargs)
         crawler.signals.connect(spider.spider_idle, signal=signals.spider_idle)
-        crawler.signals.connect(spider.spider_closed, signal=signals.spider_closed)
         return spider
 
     def _doc_type(self) -> str:
@@ -371,14 +371,19 @@ class MatsneSpider(BaseLegalSpider):
                 urls.append(url)
         return urls
 
-    def spider_closed(self, reason: str):
-        """On a CLEAN finish of a doc_type=main crawl, mark the enumeration complete.
+    def prepare_completion(self, reason: str):
+        """Finalize late crawl state exactly once before completion attestation.
 
-        Writes ``<run_dir>/main_listed_ids.txt.complete`` containing the listed-id
-        count. reconcile_consolidated.py refuses destructive passes on sidecars
-        without a matching sentinel (an aborted crawl leaves a partial enumeration
-        that must never be treated as the full type=main universe).
+        The completion extension owns close ordering.  It invokes this hook after the
+        spider has stopped producing work and before it evaluates quality.  On a clean
+        ``doc_type=main`` run, write ``main_listed_ids.txt.complete`` containing the
+        listed-id count.  ``reconcile_consolidated.py`` refuses destructive passes on
+        sidecars without a matching sentinel, so an aborted crawl can never turn a
+        partial enumeration into the full type=main universe.
         """
+        if getattr(self, "_completion_prepared", False):
+            return
+        self._completion_prepared = True
         pagination_ok = True
         if reason == "finished":
             scope_urls = getattr(self, "_pagination_scope_urls", {})
@@ -404,7 +409,16 @@ class MatsneSpider(BaseLegalSpider):
         if run_dir is None:
             return
         count = len(getattr(self, "_main_listed_ids", ()))
-        (run_dir / "main_listed_ids.txt.complete").write_text(f"{count}\n", encoding="utf-8")
+        atomic_create_private(
+            run_dir / "main_listed_ids.txt.complete",
+            f"{count}\n".encode("utf-8"),
+        )
+
+    # Compatibility for direct unit-level callers.  This method is deliberately no
+    # longer connected to ``signals.spider_closed``; CompletionAttestationExtension is
+    # the sole owner of terminal preparation and publication.
+    def spider_closed(self, reason: str):
+        return self.prepare_completion(reason)
 
     def spider_idle(self):
         """Start the deferred (catch-all) batch once phase 1 has fully drained.

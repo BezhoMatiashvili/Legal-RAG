@@ -2,13 +2,13 @@ import hashlib
 import json
 import stat
 import sys
-import uuid
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from ingest.generation import (
+    CANONICAL_PAYLOAD_REVISION,
     CHECKSUM_FILENAME,
     DOCUMENTS_FILENAME,
     GENERATION_SCHEMA_VERSION,
@@ -16,6 +16,8 @@ from ingest.generation import (
     SAMPLE_CHECKS_FILENAME,
     ChecksumMismatchError,
 )
+from ingest.qdrant_store import point_id
+from ingest.promotion import physical_collection_name
 from scripts.verify_generation import (
     sibling_report_path,
     stream_collection_points,
@@ -30,6 +32,7 @@ CHUNKING_FINGERPRINT = "3" * 64
 RETRIEVAL_FINGERPRINT = "4" * 64
 CONTENT_HASH = "5" * 64
 STATE_HASH = "6" * 64
+VERSION_ID = "derived:" + "d" * 64
 
 
 def _manifest_data():
@@ -65,6 +68,7 @@ def _manifest_data():
             "document_header": True,
         },
         "covered_runs": [{"source": "matsne", "run_id": "20260713t100000z"}],
+        "retrieval_fingerprint_revision": 2,
         "retrieval_fingerprint": RETRIEVAL_FINGERPRINT,
         "code": {"git_sha": "9" * 40, "dirty_patch_sha256": None},
         "dependency": {"lock_sha256": "a" * 64, "image_digest": None},
@@ -77,7 +81,7 @@ def _manifest_data():
 
 
 def _point_id(index):
-    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"matsne:doc-1:{index}"))
+    return point_id("matsne", "doc-1", index, version_id=VERSION_ID)
 
 
 def _document_data():
@@ -86,6 +90,7 @@ def _document_data():
         "generation_id": GENERATION_ID,
         "source": "matsne",
         "document_id": "doc-1",
+        "version_id": VERSION_ID,
         "source_identity": "b" * 64,
         "content_hash": CONTENT_HASH,
         "document_state_hash": STATE_HASH,
@@ -102,6 +107,7 @@ def _document_data():
 
 def _point(index, *, legacy=False):
     text = f"chunk {index}"
+    char_start = index * 100
     payload = {
         "source": "matsne",
         "document_id": "doc-1",
@@ -112,10 +118,43 @@ def _point(index, *, legacy=False):
         payload.update(
             {
                 "schema_version": GENERATION_SCHEMA_VERSION,
+                "canonical_payload_revision": CANONICAL_PAYLOAD_REVISION,
                 "generation_id": GENERATION_ID,
                 "document_chunk_count": 2,
                 "document_state_hash": STATE_HASH,
                 "content_hash": CONTENT_HASH,
+                "canonical_content_hash": CONTENT_HASH,
+                "canonical_text_exact": True,
+                "passage_id": f"passage:{index}",
+                "passage_hash": hashlib.sha256(text.encode()).hexdigest(),
+                "source_fingerprint": "c" * 64,
+                "normalizer_revision": "canonical-source-normalizer-v2",
+                "chunker_revision": "structural-article-clause-v2",
+                "model_revision": REVISION,
+                "article_id": None,
+                "clause_id": None,
+                "subarticle": None,
+                "chapter": None,
+                "heading_path": [],
+                "parent_id": None,
+                "article_start_chunk_index": None,
+                "parent_chunk_index": None,
+                "char_start": char_start,
+                "char_end": char_start + len(text),
+                "page_start": None,
+                "page_end": None,
+                "version_id": VERSION_ID,
+                "supersedes": [],
+                "effective_from": None,
+                "effective_to": None,
+                "repeal_date": None,
+                "consolidation_status": None,
+                "version_lineage_status": "partial",
+                "version_lineage_complete": False,
+                "official_url": "https://example.invalid/document",
+                "official_binary_url": None,
+                "source_authority": "primary_official",
+                "freshness_sla_met": True,
                 "content_kind": "full_text",
                 "content_complete": True,
                 "extraction_status": "full_text",
@@ -130,6 +169,7 @@ def _point(index, *, legacy=False):
                 "vector_space_id": VECTOR_SPACE_ID,
                 "chunking_fingerprint": CHUNKING_FINGERPRINT,
                 "document_header": True,
+                "retrieval_fingerprint_revision": 2,
                 "retrieval_fingerprint": RETRIEVAL_FINGERPRINT,
             }
         )
@@ -158,6 +198,7 @@ def _write_generation(root: Path) -> None:
             "generation_id": GENERATION_ID,
             "source": "matsne",
             "document_id": "doc-1",
+            "version_id": VERSION_ID,
             "chunk_index": 0,
             "point_id": _point_id(0),
             "text_sha256": hashlib.sha256(b"chunk 0").hexdigest(),
@@ -225,7 +266,7 @@ def test_adapter_streams_vectors_and_payloads_then_writes_owner_only_sibling(tmp
     report, report_path = verify_generation_directory(
         client,
         generation,
-        "candidate",
+        physical_collection_name(GENERATION_ID),
         page_size=1,
     )
 
@@ -235,6 +276,7 @@ def test_adapter_streams_vectors_and_payloads_then_writes_owner_only_sibling(tmp
     assert stat.S_IMODE(report_path.stat().st_mode) == 0o600
     persisted = json.loads(report_path.read_text(encoding="utf-8"))
     assert persisted["ok"] is True
+    assert persisted["physical_collection"] == physical_collection_name(GENERATION_ID)
     assert (
         persisted["manifest_sha256"]
         == hashlib.sha256((generation / MANIFEST_FILENAME).read_bytes()).hexdigest()
@@ -262,11 +304,11 @@ def test_adapter_refuses_legacy_points_and_persists_failed_four_gate_proof(tmp_p
     report, report_path = verify_generation_directory(
         client,
         generation,
-        "legacy",
+        physical_collection_name(GENERATION_ID),
     )
 
     assert not report.ok
-    assert report.coverage.ok
+    assert not report.coverage.ok
     assert not report.integrity.ok
     assert "missing_payload_field" in _codes(report.integrity)
     assert "identity_payload_count_mismatch" in _codes(report.integrity)
@@ -280,7 +322,21 @@ def test_checksum_failure_happens_before_any_collection_read_or_report(tmp_path)
     client = FakeReadOnlyClient([_point(0), _point(1)])
 
     with pytest.raises(ChecksumMismatchError):
-        verify_generation_directory(client, generation, "candidate")
+        verify_generation_directory(
+            client, generation, physical_collection_name(GENERATION_ID)
+        )
+
+    assert client.calls == []
+    assert not sibling_report_path(generation).exists()
+
+
+def test_verification_rejects_alias_or_wrong_collection_before_qdrant_read(tmp_path):
+    generation = tmp_path / "generation-1"
+    _write_generation(generation)
+    client = FakeReadOnlyClient([_point(0), _point(1)])
+
+    with pytest.raises(ValueError, match="exact physical collection"):
+        verify_generation_directory(client, generation, "georgian_legal")
 
     assert client.calls == []
     assert not sibling_report_path(generation).exists()

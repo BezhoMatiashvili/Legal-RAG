@@ -8,6 +8,10 @@ the RunPod GPU, snapshot-transferred back and restored locally under that name).
 script preflights document completeness, upserts the current points, then removes obsolete
 high-index tail chunks from shortened documents in the main ``georgian_legal`` collection.
 
+LEGACY-ONLY: this mutable v2 merge is not a schema-v2 generation publisher. Immutable
+v3 generations are built and published through the generation pipeline/snapshot ledger;
+this script rejects generation-stamped points.
+
 Point ids are deterministic UUIDv5 over ``(source, document_id, chunk_index)``
 (``qdrant_store.point_id``), so the upsert is idempotent and additive: re-running never
 duplicates, a re-embedded doc's chunks overwrite in place, and only genuinely new chunks
@@ -64,6 +68,12 @@ DEFAULT_LOCK_PATH = REPO_ROOT / "coordination" / "locks" / "qdrant-write.lock"
 DEFAULT_ROLLBACK_ROOT = INGEST_ROOT / ".state" / "qdrant-rollbacks"
 RUN_SCOPED_PREFIX = "georgian_legal_delta"
 _RUN_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,95}$")
+
+
+def _legacy_mutable_point_id(source: str, document_id: str, chunk_index: int) -> str:
+    """Point identity for the explicitly legacy, non-generation merge contract."""
+
+    return point_id(source, document_id, chunk_index)
 
 
 def _to_struct(point, *, payload: dict | None = None) -> models.PointStruct:
@@ -327,6 +337,11 @@ def _point_metadata(point) -> tuple[tuple[str, str], int, _DocVersion | None]:
     ``version``. Chunk zero may never be legacy: it identifies the current document version.
     """
     payload = point.payload or {}
+    if payload.get("generation_id") or payload.get("schema_version") == 2:
+        raise RuntimeError(
+            "immutable generation points cannot be merged into a mutable collection; "
+            "publish a new generation instead"
+        )
     source = payload.get("source")
     document_id = payload.get("document_id")
     chunk_index = payload.get("chunk_index")
@@ -434,7 +449,7 @@ def _audit_delta(
         if is_current:
             current_points += 1
         if exact:
-            expected_point_id = point_id(key[0], key[1], chunk_index)
+            expected_point_id = _legacy_mutable_point_id(key[0], key[1], chunk_index)
             if str(point.id) != expected_point_id:
                 exact_errors.append(
                     f"point {point.id!r} != deterministic UUID5 {expected_point_id!r}"
@@ -586,7 +601,7 @@ def merge_collection(
                 and chunk_index < version.chunk_count
             ):
                 if exact:
-                    expected_point_id = point_id(key[0], key[1], chunk_index)
+                    expected_point_id = _legacy_mutable_point_id(key[0], key[1], chunk_index)
                     if str(point.id) != expected_point_id:
                         ineligible.append(
                             f"{key[0]}:{key[1]} chunk {chunk_index} has ID {point.id!r}"
@@ -708,7 +723,7 @@ def verify_destination_coverage(
                         continue
                     key, chunk_index, version = _point_metadata(point)
                     expected_version = manifests[key]
-                    expected_id = point_id(key[0], key[1], chunk_index)
+                    expected_id = _legacy_mutable_point_id(key[0], key[1], chunk_index)
                     if str(point.id) != expected_id:
                         errors.append(
                             f"{key[0]}:{key[1]} chunk {chunk_index} has non-UUID5 ID"
@@ -997,8 +1012,9 @@ def run_merge_workflow(
             expectations=expectations,
             exact=True,
         )
+        preserve_source = expectations.source if expectations is not None else src
         preserved = _source_document_ids(
-            client, dst, "supremecourt", batch_size=batch_size
+            client, dst, preserve_source, batch_size=batch_size
         )
         rollback = create_rollback_snapshot(
             client,
@@ -1024,13 +1040,13 @@ def run_merge_workflow(
                 raise RuntimeError(
                     f"post-merge chunks {verified_chunks} != audited {audit.current_points}"
                 )
-            after_supreme = _source_document_ids(
-                client, dst, "supremecourt", batch_size=batch_size
+            after_preserved = _source_document_ids(
+                client, dst, preserve_source, batch_size=batch_size
             )
-            missing_preserved = preserved - after_supreme
+            missing_preserved = preserved - after_preserved
             if missing_preserved:
                 raise RuntimeError(
-                    "post-merge lost existing Supreme Court documents: "
+                    f"post-merge lost existing {preserve_source} documents: "
                     + ", ".join(sorted(missing_preserved)[:10])
                 )
             after_points = _count(client, dst)

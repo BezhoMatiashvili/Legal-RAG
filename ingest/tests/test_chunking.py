@@ -1,3 +1,5 @@
+import hashlib
+
 from ingest.chunking import _pack, _split_oversized_run, build_embed_text, chunk_document
 
 
@@ -156,3 +158,28 @@ def test_injected_token_counter_is_used():
     chunk_document("# H\n\none two three four five.", max_tokens=4, overlap=1,
                    min_tokens=1, count_tokens=counter)
     assert calls["n"] > 0
+
+
+def test_article_identity_and_exact_text_propagate_to_continuation_chunks():
+    body = (
+        "**თავი I**\n\n**მუხლი 12¹. სპეციალური წესი**\n\n1. "
+        + " ".join(f"დებულება{i}." for i in range(45))
+    )
+    chunks = chunk_document(body, max_tokens=10, overlap=3, min_tokens=1)
+    article_chunks = [chunk for chunk in chunks if chunk.article_id == "12¹"]
+    assert len(article_chunks) > 2
+    assert all(chunk.article_label in chunk.heading_path for chunk in article_chunks)
+    assert all(chunk.article_start_chunk_index == article_chunks[0].chunk_index for chunk in article_chunks)
+    assert all(chunk.parent_chunk_index == article_chunks[0].chunk_index for chunk in article_chunks)
+    for chunk in chunks:
+        assert chunk.text == body[chunk.char_start : chunk.char_end]
+        assert chunk.canonical_text == chunk.text
+        assert chunk.passage_hash == hashlib.sha256(chunk.text.encode("utf-8")).hexdigest()
+
+
+def test_token_bounded_overlap_keeps_tail_of_large_sentence_exactly():
+    body = " ".join(f"სიტყვა{i}" for i in range(35)) + "."
+    chunks = chunk_document(body, max_tokens=10, overlap=3, min_tokens=1)
+    assert len(chunks) > 2
+    assert any(chunks[i + 1].char_start < chunks[i].char_end for i in range(len(chunks) - 1))
+    assert all(chunk.text == body[chunk.char_start : chunk.char_end] for chunk in chunks)

@@ -1,9 +1,11 @@
 # Georgia Legal Search
 
-Hybrid retrieval over **~208k Georgian legal documents** (legislation + court practice),
-served as an **MCP server whose client is Claude**: the server returns grounded,
-scored, filterable search results; Claude composes the cited answers. There is
-deliberately **no local generation LLM** — retrieval quality is the whole product.
+Accuracy-first retrieval and evidence-validated answering over Georgian legislation and
+court practice. The legacy MCP search surface remains available for research, while the
+new strict `legal_ask` surface is server-owned and returns an answer only after exact
+identity/version/evidence validation and selective-risk calibration. Missing private
+models, stale or ambiguous evidence, and degraded stages produce clarification or
+abstention—not an unverified legal answer.
 
 ```
 matsne.gov.ge ──┐  scrape        normalize      chunk (512 tok,      embed (BGE-M3:
@@ -11,20 +13,21 @@ ecd.court.ge    │  (Scrapy,      (per-source    80 overlap,          1024-d de
 constcourt.ge   ├─ seen.sqlite ─ SourceSpec, ── heading-aware ────── learned sparse) ──┐
 napr.gov.ge     │  dedup)        hygiene +      offsets into                           │
 tas.ge          │                quarantine)    body_markdown)                         ▼
-tbappeal.court.ge ┘                                             Qdrant `georgian_legal`
+tbappeal.court.ge│                                             Qdrant `georgian_legal`
+supremecourt.ge ┘
                                                                 (2.64M points, hybrid
-        Claude (MCP client) ◄── legal_rag MCP server ◄───────── RRF + cross-encoder
-        composes cited answers   (search/lookup/browse/…)        rerank)
+        MCP client ◄──────── legal_rag MCP server ◄──────────── RRF + cross-encoder
+                            (ask/context/search/lookup/…)        rerank + validators)
 ```
 
 | | |
 |---|---|
 | Corpus | 208,218 scraped docs; **207,940 embedded** (97 empty-body + 181 hygiene-quarantined excluded by design) |
 | Index | Qdrant collection `georgian_legal`, **2,637,645 points** (named `dense` + `sparse` vectors, int8-quantized, on-disk payload) |
-| Sources | matsne 156,404 · napr 25,210 · ecd 21,827 · constcourt 3,074 · tas 1,344 · tbappeal 81 (supremecourt scraped separately, excluded from the corpus) |
+| Sources | Legacy live generation: matsne, NAPR, ECD, Constitutional Court, TAS and Tbilisi Appeal. New full-generation builders also include Supreme Court; incomplete/summary-only TAS and Tbilisi Appeal records are quarantined. |
 | Embeddings | `BAAI/bge-m3` — one vector space for corpus (GPU-embedded) and queries (CPU) |
 | Serving config | shipped default **hybrid + rerank@80, no diversity** (`retrieval_fingerprint=06a64f548fcb4d59`); recommended interim config is rerank@50 (`81c807b279399098` — set `RERANK_CANDIDATES=50`, ~40% faster on CPU at a small quality cost) |
-| Quality (golden set v1, k=10) | nDCG **0.289** / R@10 **0.388** (hybrid+rerank@80) vs BM25 floor 0.192 / 0.243 — **+50% nDCG**; cross-lingual EN→KA: BM25/sparse 0.000, rerank@80 R@10 0.273 |
+| Audited v2 retrieval baseline | Success@10 **58.2%**, nDCG@10 **0.483**, evidence-span coverage about **56.7%**. These are retrieval measurements, not end-to-end legal-answer accuracy. |
 
 ## Repo layout
 
@@ -33,12 +36,10 @@ tbappeal.court.ge ┘                                             Qdrant `georgi
 | `scraper/` | Scrapy spiders for the six sources (+supremecourt), per-run JSONL artifacts, cross-run dedup — see `scraper/README.md` |
 | `ingest/` | everything else: normalization, hygiene, chunking, embedding, Qdrant, MCP server, eval harness — see `ingest/README.md` |
 | `ingest/docs/deployment.md` | **how to run the stack** (bring-up, serving modes, daily-ingest timer, recovery) |
+| `ingest/docs/accuracy-first.md` | strict answering/evidence contract, failure modes, and release gates |
 | `ingest/docs/runpod-serverless.md` | scale-to-zero remote serving (GPU + Qdrant in one serverless worker) |
 | `ingest/docs/delta_embed_runbook.md` | GPU path for embedding large scrape deltas |
 | `ingest/eval/phase_c_report.md` | the measured Phase C report behind the serving config |
-| `HANDOFF.md` | living project state + next-session menu |
-| `improvement.md` | gated retrieval-improvement queue (every change measured, kept only if it passes) |
-| `prompt.md` | the full phased spec |
 | `coordination/` | multi-session coordination protocol (gitignored; see `CLAUDE.md`) |
 
 ## Quick start
@@ -57,7 +58,9 @@ uv sync && uv run python -m ingest search "შრომის კოდექს
 # 3) as an MCP server: the repo-root .mcp.json registers `legal_rag` for Claude Code.
 ```
 
-MCP tools: `legal_search` (hybrid+rerank, filters, calibrated 0–1 scores),
+MCP tools: `legal_ask` (strict answer/clarify/abstain), `legal_get_context` (exact
+content-bound evidence and neighbors), `legal_search` (hybrid+rerank research results;
+scores are relevance, not confidence),
 `legal_get_document` (full text by id), `legal_get_document_versions` (consolidation
 lineage), `legal_lookup` (exact document_number / registration_code), `legal_browse`
 (faceted listing), `legal_collection_info`, `ingest_status`, `legal_health`. Search
@@ -67,16 +70,20 @@ log (`ingest/.state/queries.jsonl` — promotion source for golden set v2) carri
 
 ## Qdrant schema (per chunk)
 
-Point id = UUIDv5 of `source:document_id:chunk_index` (idempotent upserts). Vectors:
+Legacy point IDs are UUIDv5 of `source:document_id:chunk_index`. Clean immutable
+generations use `source:document_id:version_id:chunk_index`, preventing two legal versions
+from overwriting one another while preserving idempotent rebuilds. Vectors:
 `dense` (1024, cosine, on-disk) + `sparse`. Payload highlights — full list in
 `ingest/ingest/qdrant_store.py`:
 
-- **identity:** `source`, `document_id`, `chunk_index`, `content_hash`
+- **identity:** `generation_id`, `source`, `document_id`, `version_id`, `chunk_index`,
+  `content_hash`, `passage_hash`, source/normalizer/chunker/model revisions
 - **document:** `title`, `document_type`, `document_number`, `registration_code`,
   `status`, `is_consolidated`, `consolidated_count`, `date`, `in_force_date`,
   `expiry_date`, `court`, `parties`, `language`, `source_url`
-- **chunk:** `text`, `heading`, `token_count`, `char_start`/`char_end` (byte-exact
-  offsets into the document's `body_markdown` — spans survive re-chunking)
+- **structure/version:** `article_id`, `clause_id`, `chapter`, `heading_path`, `parent_id`,
+  `supersedes`, `effective_from`/`effective_to`, consolidation/repeal status
+- **chunk:** exact canonical `text`, `token_count`, character/page offsets and passage hash
 
 Indexes: keyword on the identity/filter fields, full-text (multilingual tokenizer) on
 `text`/`title`/`parties`, datetime ranges on the date fields.
@@ -88,16 +95,18 @@ Indexes: keyword on the identity/filter fields, full-text (multilingual tokenize
   excluded from tuning). Types: natural_question 32, cross_lingual 22, keyword 21,
   legal_citation 17, paraphrase 11. Growing the set = **additive `golden_set_v2`**,
   v1 stays the yardstick until explicitly switched.
-- **Every retrieval change goes through the harness** (`ingest/eval/`): bootstrap CIs,
+- **Every retrieval change goes through the harness** (`ingest/eval/`): clustered CIs,
   paired permutation tests (`--compare`), BM25 full-corpus floor in every report; every
   run appends to `ingest/eval/experiments.jsonl` (the permanent record).
 - **Two hashes, two meanings:** `config_hash` identifies an *eval* configuration
   (knobs + eval-set hash + scoring-logic rev); `retrieval_fingerprint` identifies the
   *serving* configuration. Don't conflate them.
 - **Re-baseline rule:** eval numbers are comparable only at the same corpus state —
-  record `points_count` with every run; after any ingest/re-embed, re-run baselines
-  before gating anything (details: `improvement.md` §8).
-- The gate itself (thresholds, no-peeking rules, keep-or-revert): `improvement.md` §2.
+  record the immutable generation and `points_count` with every run; after any new
+  generation, rerun both production paths twice before gating anything.
+- End-to-end promotion additionally requires the severe/material error, coverage,
+  mechanical-citation, determinism, slice-regression and latency gates documented in
+  `ingest/docs/accuracy-first.md`.
 - CI runs the hermetic ingest suite with `pytest -m "not snapshot"`; releases on the data
   host must additionally run `cd ingest && .venv/bin/python -m pytest -m snapshot -q` against
   the immutable local snapshot before any retrieval-affecting promotion.
@@ -118,7 +127,6 @@ divergent fork — never pull/merge it.
 
 ## Privacy stance
 
-Ingest, embedding, and evaluation are fully local — **no external LLM/embedding/judge
-APIs**. PII stays in the index (legal documents are public records; redaction would
-corrupt the corpus). Accepted caveat: retrieved text reaches Claude (the MCP client) at
-answer time.
+Ingest, embedding, evaluation, translation, generation and verification are private-
+infrastructure only—**no external LLM/embedding/judge APIs**. Model/data licenses require
+an explicit commercial-use attestation before a configuration is production-eligible.

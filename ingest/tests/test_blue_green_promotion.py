@@ -70,6 +70,7 @@ def _plan() -> PromotionPlan:
                 "vector_space_id": SHA_C,
                 "chunking_fingerprint": SHA_D,
                 "document_header": True,
+                "retrieval_fingerprint_revision": 2,
                 "retrieval_fingerprint": SHA_E,
             },
             "created_at": "2026-07-13T12:00:00Z",
@@ -99,6 +100,7 @@ def _inspection(plan: PromotionPlan) -> CollectionInspection:
         vector_space_id=expected.vector_space_id,
         chunking_fingerprint=expected.chunking_fingerprint,
         document_header=expected.document_header,
+        retrieval_fingerprint_revision=expected.retrieval_fingerprint_revision,
         retrieval_fingerprint=expected.retrieval_fingerprint,
         optimizer_status="green",
         integrity_ok=True,
@@ -365,6 +367,14 @@ def test_plan_rejects_blank_model_identity():
     payload["expected_collection"]["tokenizer_model"] = "   "
 
     with pytest.raises(PromotionError, match="non-empty model identity"):
+        PromotionPlan.from_dict(payload)
+
+
+def test_plan_rejects_legacy_retrieval_fingerprint_revision():
+    payload = _plan().to_dict()
+    payload["expected_collection"]["retrieval_fingerprint_revision"] = 1
+
+    with pytest.raises(PromotionError, match="retrieval_fingerprint_revision"):
         PromotionPlan.from_dict(payload)
 
 

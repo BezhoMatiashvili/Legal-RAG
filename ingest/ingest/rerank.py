@@ -18,7 +18,6 @@ import os
 
 from .config import Config
 
-_MAX_LENGTH = 512   # query+chunk truncation (chunks are already ~512 tokens)
 _BATCH_SIZE = 16
 
 
@@ -65,6 +64,7 @@ class BGEReranker:
         if (cfg.rerank_device or _auto_device(torch)) == "cpu":
             _configure_cpu_threads(torch)  # before the first forward
         self.device = cfg.rerank_device or _auto_device(torch)
+        self.max_length = cfg.rerank_max_length
         revision = _revision_kwargs(cfg.reranker_revision)
         self.tokenizer = AutoTokenizer.from_pretrained(cfg.rerank_model, **revision)
         model = AutoModelForSequenceClassification.from_pretrained(
@@ -92,7 +92,7 @@ class BGEReranker:
             idx = order[start : start + _BATCH_SIZE]
             pairs = [[query, texts[i]] for i in idx]
             inputs = self.tokenizer(
-                pairs, padding=True, truncation=True, max_length=_MAX_LENGTH,
+                pairs, padding=True, truncation=True, max_length=self.max_length,
                 return_tensors="pt",
             ).to(self.device)
             with torch.no_grad():
@@ -125,6 +125,7 @@ class ONNXBGEReranker:
         from transformers import AutoTokenizer
 
         self._np = np
+        self.max_length = cfg.rerank_max_length
         self.tokenizer = AutoTokenizer.from_pretrained(
             cfg.rerank_model, **_revision_kwargs(cfg.reranker_revision)
         )
@@ -145,7 +146,7 @@ class ONNXBGEReranker:
             idx = order[start : start + _BATCH_SIZE]
             pairs = [[query, texts[i]] for i in idx]
             enc = self.tokenizer(pairs, padding=True, truncation=True,
-                                 max_length=_MAX_LENGTH, return_tensors="np")
+                                 max_length=self.max_length, return_tensors="np")
             logits = self.session.run(
                 ["logits"],
                 {"input_ids": enc["input_ids"].astype(np.int64),

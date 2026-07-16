@@ -12,8 +12,8 @@
 #   * every stage is idempotent (seen.sqlite, byte-offset watch state, UUIDv5 point ids)
 #
 # Flags:  --dry-run   preflight + plan only; no locks taken, nothing scraped/embedded.
-# Env:    DAILY_INGEST_SOURCES        spiders to scrape (default: the 6 corpus sources —
-#                                     supremecourt is excluded from the corpus by design)
+# Env:    DAILY_INGEST_SOURCES        spiders to scrape (default: all 7 corpus sources,
+#                                     including Supreme Court)
 #         DAILY_INGEST_LOOKBACK_DAYS  scrape window (default 14; dedup makes wider safe —
 #                                     run a wide sweep monthly to catch late-published docs)
 #         DAILY_INGEST_{SCRAPE,EMBED,VERIFY}_TIMEOUT  per-stage timeout(1) values
@@ -32,7 +32,7 @@ ROTATING_TEE=("$INGEST_DIR/.venv/bin/python" "$SCRIPT_DIR/rotating_tee.py" "$LOG
 LOCK_DIR="$REPO_ROOT/coordination/locks"
 OWNER="daily-ingest[$$]"
 
-SOURCES="${DAILY_INGEST_SOURCES:-matsne ecd constcourt napr tas tbappeal}"
+SOURCES="${DAILY_INGEST_SOURCES:-matsne ecd constcourt napr supremecourt tas tbappeal}"
 LOOKBACK_DAYS="${DAILY_INGEST_LOOKBACK_DAYS:-14}"
 SCRAPE_TIMEOUT="${DAILY_INGEST_SCRAPE_TIMEOUT:-2h}"
 EMBED_TIMEOUT="${DAILY_INGEST_EMBED_TIMEOUT:-3h}"
@@ -167,8 +167,7 @@ log "--- stage 1/3: scrape ---"
 
 STAGE="embed"
 log "--- stage 2/3: embed delta (CPU) ---"
-# Per-source (not --source all): 'all' would also pick up artifacts/supremecourt if it
-# ever appeared, and supremecourt is excluded from the corpus by design.
+# Per-source so each source retains its own durable watch checkpoint and report row.
 for src in $SOURCES; do
     (cd "$INGEST_DIR" && OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}" MKL_NUM_THREADS="${MKL_NUM_THREADS:-8}" \
         timeout "$EMBED_TIMEOUT" .venv/bin/python -m ingest watch --source "$src" --once) 2>&1 | "${ROTATING_TEE[@]}"

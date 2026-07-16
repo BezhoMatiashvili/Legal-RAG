@@ -19,6 +19,8 @@ import os
 import sys
 from pathlib import Path
 
+from .completion import evaluate_crawl_quality, verify_terminal_record
+
 # Canonical order for the combined display. Only names actually present in the
 # project's spider loader are launched, so this list can stay ahead of reality.
 SPIDER_ORDER = [
@@ -112,25 +114,50 @@ def crawl_quality_issues(crawlers) -> list[str]:
     issues: list[str] = []
     for crawler in crawlers:
         stats = crawler.stats.get_stats()
-        name = getattr(crawler.spider, "name", crawler.spidercls.name)
+        spider = getattr(crawler, "spider", None)
+        name = getattr(spider, "name", crawler.spidercls.name)
         reason = stats.get("finish_reason")
-        failures = int(stats.get("quality/failures", 0))
-        spider_exceptions = sum(
-            int(value)
-            for key, value in stats.items()
-            if key.startswith("spider_exceptions/")
+        attester = getattr(crawler, "completion_attestation", None)
+        evaluation = evaluate_crawl_quality(
+            stats,
+            name,
+            reason,
+            spider_errors=getattr(attester, "_spider_errors", 0),
+            item_errors=getattr(attester, "_item_errors", 0),
+            reconcilers=getattr(spider, "_pagination_reconcilers", {}),
         )
-        intentional_partial = reason == "closespider_timeout" and bool(
-            getattr(crawler.spider, "partial_by_design", False)
-        )
-        if reason != "finished" and not intentional_partial:
-            issues.append(f"{name}: finish_reason={reason!r}")
-        if failures:
-            issues.append(
-                f"{name}: {failures} completeness-affecting request/response failure(s)"
+        issues.extend(evaluation.issues)
+    return issues
+
+
+def crawl_attestation_issues(crawlers) -> list[str]:
+    """Strictly reload each exact successful terminal record and item binding."""
+
+    issues: list[str] = []
+    for crawler in crawlers:
+        spider = getattr(crawler, "spider", None)
+        name = getattr(spider, "name", crawler.spidercls.name)
+        if spider is None:
+            issues.append(f"{name}: spider never produced exact run evidence")
+            continue
+        run_id = getattr(spider, "run_id", None)
+        record_path = getattr(spider, "run_metadata_path", None)
+        items_path = getattr(spider, "items_path", None)
+        if not run_id or record_path is None or items_path is None:
+            issues.append(f"{name}: exact run-scoped completion paths are unavailable")
+            continue
+        try:
+            verify_terminal_record(
+                record_path,
+                expected_source=name,
+                expected_run_id=run_id,
+                expected_items_path=items_path,
             )
-        if spider_exceptions:
-            issues.append(f"{name}: {spider_exceptions} callback exception(s)")
+        except Exception as exc:  # noqa: BLE001 - every verification failure exits 1
+            issues.append(
+                f"{name}: exact completion evidence rejected for {run_id}: "
+                f"{type(exc).__name__}: {str(exc)[:500]}"
+            )
     return issues
 
 
@@ -178,6 +205,7 @@ def main(argv=None) -> None:
     finally:
         finish_dashboard()
     issues = crawl_quality_issues(crawlers)
+    issues.extend(crawl_attestation_issues(crawlers))
     if issues:
         print(
             "crawl did not satisfy the production completeness gate:", file=sys.stderr

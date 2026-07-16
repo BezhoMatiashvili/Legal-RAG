@@ -26,6 +26,7 @@ import json
 import math
 import os
 import re
+import secrets
 import stat
 import sys
 import time
@@ -216,23 +217,177 @@ def parse_authoritative_total(response) -> int | None:
     return int(re.sub(r"[^0-9]", "", match.group(1)))
 
 
-def _atomic_write(path: Path, payload: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    with tmp.open("wb") as fh:
-        os.chmod(tmp, 0o600)
-        fh.write(payload)
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.replace(tmp, path)
+_DIRECTORY_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_CLOEXEC", 0)
+    | getattr(os, "O_DIRECTORY", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+)
+
+
+def _absolute_lexical(path: str | os.PathLike[str]) -> Path:
+    return Path(os.path.abspath(os.fspath(path)))
+
+
+def _open_directory_nofollow(
+    path: str | os.PathLike[str], *, create: bool = False
+) -> int:
+    """Open a directory by walking every component beneath a trusted root fd.
+
+    A final-component ``O_NOFOLLOW`` is insufficient: an attacker can otherwise
+    replace any ancestor with a symlink between a lexical check and ``os.open``.
+    This walker resolves each component relative to the already-open parent and
+    keeps ``O_NOFOLLOW`` in force for the whole traversal.
+    """
+
+    absolute = _absolute_lexical(path)
+    descriptor = os.open(absolute.anchor, _DIRECTORY_FLAGS)
     try:
-        fd = os.open(path.parent, os.O_DIRECTORY)
+        for component in absolute.parts[1:]:
+            try:
+                info = os.stat(component, dir_fd=descriptor, follow_symlinks=False)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                try:
+                    os.mkdir(component, mode=0o700, dir_fd=descriptor)
+                    os.fsync(descriptor)
+                except FileExistsError:
+                    # A concurrent creator is accepted only after the same
+                    # no-follow type check and descriptor-relative open below.
+                    pass
+                info = os.stat(component, dir_fd=descriptor, follow_symlinks=False)
+            if stat.S_ISLNK(info.st_mode):
+                raise PermissionError(
+                    f"refusing symlinked Supreme Court directory component: "
+                    f"{absolute}"
+                )
+            if not stat.S_ISDIR(info.st_mode):
+                raise PermissionError(
+                    f"Supreme Court directory component is not a directory: "
+                    f"{absolute}"
+                )
+            try:
+                child = os.open(component, _DIRECTORY_FLAGS, dir_fd=descriptor)
+            except OSError as exc:
+                raise PermissionError(
+                    f"cannot safely open Supreme Court directory component "
+                    f"{component!r} in {absolute}: {exc}"
+                ) from exc
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _private_regular_stat(info: os.stat_result, path: Path) -> None:
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or stat.S_IMODE(info.st_mode) != 0o600
+        or info.st_uid != os.geteuid()
+    ):
+        raise PermissionError(
+            f"Supreme Court artifact must be an owner-private regular file: {path}"
+        )
+
+
+def _fsync_private_regular_file(path: Path) -> None:
+    """Fsync one private file and its parent through no-follow descriptors."""
+
+    absolute = _absolute_lexical(path)
+    directory_fd = _open_directory_nofollow(absolute.parent)
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            absolute.name,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory_fd,
+        )
+        _private_regular_stat(os.fstat(descriptor), absolute)
+        os.fsync(descriptor)
+        os.fsync(directory_fd)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(directory_fd)
+
+
+def _atomic_write(path: Path, payload: bytes) -> None:
+    """Durably replace one private file without following any symlink.
+
+    Supreme Court artifacts are acceptance evidence, so a directory fsync is part of
+    the write rather than best-effort cleanup.  The random same-directory temporary
+    name avoids collisions between interrupted or concurrent attempts.
+    """
+
+    path = _absolute_lexical(path)
+    directory_fd = _open_directory_nofollow(path.parent, create=True)
+    temporary_name = f".{path.name}.{secrets.token_hex(16)}.tmp"
+    descriptor = None
+    try:
         try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-    except OSError:
-        pass
+            current = os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            current = None
+        if current is not None:
+            if stat.S_ISLNK(current.st_mode) or not stat.S_ISREG(current.st_mode):
+                raise PermissionError(
+                    f"refusing to replace non-regular Supreme Court artifact: {path}"
+                )
+            if (
+                stat.S_IMODE(current.st_mode) != 0o600
+                or current.st_uid != os.geteuid()
+            ):
+                raise PermissionError(
+                    f"refusing to replace non-private Supreme Court artifact: {path}"
+                )
+        descriptor = os.open(
+            temporary_name,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=directory_fd,
+        )
+        os.fchmod(descriptor, 0o600)
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("short write while materializing Supreme Court artifact")
+            view = view[written:]
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        os.replace(
+            temporary_name,
+            path.name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        os.fsync(directory_fd)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary_name, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+        os.close(directory_fd)
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = _open_directory_nofollow(path)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 class SupremecourtSpider(BaseLegalSpider):
@@ -278,6 +433,7 @@ class SupremecourtSpider(BaseLegalSpider):
         self._unresolved_count = 0
         self._finish_reason: str | None = None
         self._artifacts_finalized = False
+        self._completion_preparing = False
         self._run_ready = False
         self._reconcile_counts = (0, 0, 0)
         self._chamber_start_cursors: dict[int, date | None] = {
@@ -817,21 +973,29 @@ class SupremecourtSpider(BaseLegalSpider):
         line = (
             json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n"
         ).encode()
-        self.journal_path.parent.mkdir(parents=True, exist_ok=True)
         flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
         flags |= getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(self.journal_path, flags, 0o600)
-        current = os.fstat(descriptor)
-        if not stat.S_ISREG(current.st_mode) or stat.S_IMODE(current.st_mode) & 0o077:
-            os.close(descriptor)
-            raise PermissionError(
-                "Supreme Court journal is not an owner-only regular file; "
-                "refusing to chmod existing evidence"
+        journal_path = _absolute_lexical(self.journal_path)
+        directory_fd = _open_directory_nofollow(journal_path.parent)
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(
+                journal_path.name,
+                flags,
+                0o600,
+                dir_fd=directory_fd,
             )
-        with os.fdopen(descriptor, "ab") as fh:
-            fh.write(line)
-            fh.flush()
-            os.fsync(fh.fileno())
+            _private_regular_stat(os.fstat(descriptor), journal_path)
+            with os.fdopen(descriptor, "ab") as fh:
+                descriptor = None
+                fh.write(line)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.fsync(directory_fd)
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            os.close(directory_fd)
         self._cumulative_items[identity] = item
         self._new_identities.add(identity)
         self.crawler.stats.inc_value("supremecourt/new_items")
@@ -1174,12 +1338,25 @@ class SupremecourtSpider(BaseLegalSpider):
         _atomic_write(self.partial_manifest_path, payload)
         _atomic_write(self.latest_manifest_path, payload)
 
-    def closed(self, reason):
+    def prepare_completion(self, reason):
+        """Idempotently materialize the strict partial artifact for the attester."""
+
         if self._artifacts_finalized or not self._run_ready:
             return
-        self._artifacts_finalized = True
-        self._finish_reason = reason
-        _, digest = self._materialize_items()
-        self._write_manifest(final=True, items_sha256=digest)
-        if getattr(self, "_dedup_conn", None) is not None:
-            self._dedup_conn.close()
+        if self._completion_preparing:
+            return
+        self._completion_preparing = True
+        try:
+            self._finish_reason = reason
+            try:
+                _fsync_private_regular_file(self.journal_path)
+            except FileNotFoundError:
+                # An empty journal is positive evidence that this run emitted no new items.
+                _atomic_write(self.journal_path, b"")
+            _, digest = self._materialize_items()
+            self._write_manifest(final=True, items_sha256=digest)
+            if getattr(self, "_dedup_conn", None) is not None:
+                self._dedup_conn.close()
+            self._artifacts_finalized = True
+        finally:
+            self._completion_preparing = False

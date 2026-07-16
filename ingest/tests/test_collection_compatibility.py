@@ -12,6 +12,7 @@ from ingest.collection_compatibility import (
 )
 from ingest.config import load_config
 from ingest.generation import GENERATION_SCHEMA_VERSION, GenerationManifest
+from ingest.generation import CANONICAL_PAYLOAD_REQUIRED_NONEMPTY_FIELDS
 
 GENERATION_ID = "20260713t120000z_core"
 REVISION = "1" * 40
@@ -57,6 +58,7 @@ def _manifest():
                 "document_header": True,
             },
             "covered_runs": [{"source": "matsne", "run_id": "20260713t100000z"}],
+            "retrieval_fingerprint_revision": 2,
             "retrieval_fingerprint": RETRIEVAL_FINGERPRINT,
             "code": {"git_sha": "7" * 40, "dirty_patch_sha256": None},
             "dependency": {"lock_sha256": "8" * 64, "image_digest": None},
@@ -123,6 +125,11 @@ def test_exact_compatibility_uses_only_read_operations_and_all_identity_fields()
     assert client.calls[1][1]["collection_name"] == "candidate"
     assert client.calls[1][1]["exact"] is True
     assert _filter_values(client) == expected_point_identity(manifest)
+    required_nonempty = {
+        condition.is_empty.key
+        for condition in client.calls[1][1]["count_filter"].must_not
+    }
+    assert required_nonempty == set(CANONICAL_PAYLOAD_REQUIRED_NONEMPTY_FIELDS)
 
 
 def test_schema_count_and_identity_mismatches_are_separate_fail_closed_issues():

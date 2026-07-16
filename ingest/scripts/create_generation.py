@@ -1,74 +1,65 @@
 #!/usr/bin/env python3
-"""Atomically publish a prepared immutable generation; never overwrites a destination."""
+"""Publish an exact sealed prepared generation; never accepts loose artifact files."""
 
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from pathlib import Path
-from typing import NoReturn
 
 INGEST_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(INGEST_ROOT))
 
-from ingest.generation import (  # noqa: E402
-    iter_document_records,
-    iter_sample_checks,
-    load_manifest,
+from ingest.config import load_config  # noqa: E402
+from ingest.generation_prepare import (  # noqa: E402
+    GenerationPreparationError,
+    load_prepared_generation,
+    validate_prepared_configuration,
 )
 from ingest.generation_snapshot import publish_generation  # noqa: E402
-
-
-def _reject_duplicate_keys(
-    pairs: list[tuple[str, object]],
-) -> dict[str, object]:
-    value: dict[str, object] = {}
-    for key, item in pairs:
-        if key in value:
-            raise ValueError(f"duplicate JSON key: {key!r}")
-        value[key] = item
-    return value
-
-
-def _reject_nonstandard_constant(value: str) -> NoReturn:
-    raise ValueError(f"non-standard JSON constant: {value}")
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--generation", required=True, help="explicit non-v1 generation ID"
+        "--generation",
+        required=True,
+        help="explicit non-v1 generation ID (must match the prepared manifest)",
     )
-    parser.add_argument("--manifest", type=Path, required=True)
-    parser.add_argument("--documents", type=Path, required=True)
-    parser.add_argument("--samples", type=Path, required=True)
-    parser.add_argument("--source-state", type=Path, required=True)
+    parser.add_argument(
+        "--prepared-dir",
+        type=Path,
+        required=True,
+        help="checksum-sealed output of scripts/prepare_generation.py",
+    )
     parser.add_argument("--output-root", type=Path, required=True)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    manifest = load_manifest(args.manifest)
     try:
-        source_state = json.loads(
-            args.source_state.read_text(encoding="utf-8"),
-            object_pairs_hook=_reject_duplicate_keys,
-            parse_constant=_reject_nonstandard_constant,
+        prepared = load_prepared_generation(args.prepared_dir)
+        if prepared.manifest.generation_id != args.generation:
+            raise GenerationPreparationError(
+                "explicit generation ID does not match prepared manifest"
+            )
+        validate_prepared_configuration(prepared, load_config())
+        publication_provenance = {
+            "prepared_checksums_sha256": prepared.checksums_sha256,
+            "evidence": dict(prepared.provenance),
+        }
+        destination = publish_generation(
+            args.output_root,
+            args.generation,
+            prepared.manifest,
+            prepared.iter_documents(),
+            prepared.iter_samples(),
+            prepared.source_state,
+            preparation_provenance=publication_provenance,
         )
-    except (OSError, UnicodeError, ValueError) as exc:
-        raise SystemExit(f"invalid source-state JSON: {exc}") from exc
-    if not isinstance(source_state, dict):
-        raise SystemExit("invalid source-state JSON: top-level value must be an object")
-    destination = publish_generation(
-        args.output_root,
-        args.generation,
-        manifest,
-        iter_document_records(args.documents, expected_generation_id=args.generation),
-        iter_sample_checks(args.samples, expected_generation_id=args.generation),
-        source_state,
-    )
+    except GenerationPreparationError as exc:
+        raise SystemExit(f"generation publication refused: {exc}") from exc
     print(destination)
     return 0
 

@@ -1,0 +1,214 @@
+{
+  "canonical_exact_quotation_validations": {
+    "explanation": "Legacy retrieval payloads are not canonical generation evidence.",
+    "status": "not_available_in_legacy_corpus",
+    "validated": 0
+  },
+  "configuration_hash": "cacaec91eedef93ad35df4f6dec72eea4cb2fe7235e412e66d1081f6808114b3",
+  "corpus_generation_identity": "not_available_in_legacy_corpus",
+  "corpus_identity_hash": "2046bdca5dd2ab79eefd656e7b8955dc695a084fa0e745cb1fce325f0796e3b3",
+  "correct_abstention_or_clarification": {
+    "ambiguous": 2,
+    "incomplete_source": 2,
+    "unsupported_broad_advice": 1
+  },
+  "correct_document_identity": 15,
+  "degraded_or_failed_queries": {
+    "run_1": [],
+    "run_2": []
+  },
+  "deterministic_repeats": {
+    "matching_question_ids": [
+      "q138",
+      "q169",
+      "q208",
+      "q211",
+      "q229",
+      "q257",
+      "q271",
+      "q276",
+      "q283",
+      "q285",
+      "q291",
+      "q293",
+      "q312",
+      "q329",
+      "q343",
+      "q121",
+      "q191",
+      "q003",
+      "q024",
+      "demo-broad-001"
+    ],
+    "matching_questions": 20,
+    "run_decision_hashes_equal": true,
+    "total_questions": 20
+  },
+  "expected_answer_questions": 15,
+  "frozen_snapshot_span_reconstruction": {
+    "document_content_hash_matches": 15,
+    "track": "offline_frozen_snapshot_audit_not_legacy_retrieval_evidence",
+    "validated_expected_answer_rows": 15
+  },
+  "latency_ms": {
+    "run_1": {
+      "median": 14.398,
+      "p95": 52.487
+    },
+    "run_2": {
+      "median": 7.99,
+      "p95": 19.832
+    }
+  },
+  "latency_tracks_ms": {
+    "policy_only_abstention": {
+      "run_1": {
+        "median": 0.039,
+        "p95": 0.042,
+        "questions": 3
+      },
+      "run_2": {
+        "median": 0.032,
+        "p95": 0.047,
+        "questions": 3
+      }
+    },
+    "read_only_retrieval": {
+      "run_1": {
+        "median": 17.103,
+        "p95": 60.262,
+        "questions": 17
+      },
+      "run_2": {
+        "median": 8.296,
+        "p95": 24.581,
+        "questions": 17
+      }
+    }
+  },
+  "legal_correctness_review": "not yet independently adjudicated",
+  "limitations": [
+    "The presentation set is small, curated, and not a blind benchmark.",
+    "Production severe-error certification is not yet complete.",
+    "The legacy collection is mutable and has no sealed immutable generation identity.",
+    "The full immutable corpus and lawyer-reviewed v3 release study remain future work.",
+    "English is excluded from the live demonstration pending production model attestation."
+  ],
+  "official_url_present_and_matches_frozen": 15,
+  "positioning": "This is an accuracy-first pre-production Georgian legal RAG. It answers only when evidence, identity, version, quotation, and completeness checks pass; otherwise it clarifies or abstains.",
+  "question_set_sha256": "61838610b10f4c319f22516405e0a1828b4bade019e97b356726d02e49fd64dd",
+  "required_evidence_found": 15,
+  "run_decision_hashes": {
+    "run_1": "288d4eaede56296331668140852df04cba6b395eafe6a96b38d3ce04ba7102e8",
+    "run_2": "288d4eaede56296331668140852df04cba6b395eafe6a96b38d3ce04ba7102e8"
+  },
+  "run_hashes": {
+    "run_1": "7a32f3b7c27de46a4434608801d6081fae4b2083a16753fc09cc11b6c296c768",
+    "run_2": "cadb25343d1c85b5fdddc4b97b13f5b4437ee8d3924a0e781e7a5a53a3310a9e"
+  },
+  "schema_version": 1,
+  "scope": "Georgian exact legal identifier lookup; clarification and abstention only beyond that narrow contract.",
+  "synthetic_contract_fixture": {
+    "excluded_from_measured_retrieval_results": true,
+    "run_1": {
+      "answer": null,
+      "checks": [
+        {
+          "name": "evidence_id_binding",
+          "passed": true
+        },
+        {
+          "name": "exact_quote_offsets_and_quote_hash",
+          "passed": true
+        },
+        {
+          "name": "tampered_quote_rejected",
+          "passed": true
+        },
+        {
+          "name": "tampered_passage_hash_rejected",
+          "passed": true
+        },
+        {
+          "name": "incomplete_content_rejected",
+          "passed": true
+        }
+      ],
+      "fixture_is_legal_evidence": false,
+      "model_used": false,
+      "passed": true,
+      "track": "synthetic_contract_fixture"
+    },
+    "run_2": {
+      "answer": null,
+      "checks": [
+        {
+          "name": "evidence_id_binding",
+          "passed": true
+        },
+        {
+          "name": "exact_quote_offsets_and_quote_hash",
+          "passed": true
+        },
+        {
+          "name": "tampered_quote_rejected",
+          "passed": true
+        },
+        {
+          "name": "tampered_passage_hash_rejected",
+          "passed": true
+        },
+        {
+          "name": "incomplete_content_rejected",
+          "passed": true
+        }
+      ],
+      "fixture_is_legal_evidence": false,
+      "model_used": false,
+      "passed": true,
+      "track": "synthetic_contract_fixture"
+    }
+  },
+  "test_evidence": {
+    "git_diff_cached_check": {
+      "status": "passed"
+    },
+    "git_diff_check": {
+      "status": "passed"
+    },
+    "ingest_non_snapshot_tests": {
+      "status": "interrupted",
+      "summary": "Aggregate stopped after 42%; isolated test_part3_mcp versions test stalled on its second asyncio.to_thread call."
+    },
+    "legal_answer_evidence_abstention": {
+      "failed": 0,
+      "passed": 271,
+      "status": "passed",
+      "summary": "Focused legal-answer, evidence, retrieval, release-review, and abstention regressions."
+    },
+    "presentation_tests": {
+      "failed": 0,
+      "passed": 37,
+      "status": "passed",
+      "summary": "Hermetic builder, safety, atomicity, hashing, privacy, and offline rehearsal tests."
+    },
+    "root_tests": {
+      "failed": 0,
+      "passed": 281,
+      "status": "passed"
+    },
+    "ruff_ingest": {
+      "status": "passed",
+      "summary": "All checks passed."
+    },
+    "ruff_root": {
+      "status": "passed",
+      "summary": "All checks passed."
+    },
+    "symbol_map": {
+      "status": "passed",
+      "summary": "Generated and checked: memory refs OK."
+    }
+  },
+  "total_questions": 20
+}

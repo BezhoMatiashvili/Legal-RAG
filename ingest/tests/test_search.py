@@ -14,7 +14,8 @@ def test_build_filter_none_when_empty():
 
 def test_build_filter_exact_keyword_fields():
     flt = build_filter(source="matsne", document_number="55", registration_code="RC-1",
-                       document_id="6835981", court="supremecourt", document_type="legislation")
+                       document_id="6835981", court="supremecourt", document_type="legislation",
+                       article_id="829", clause_id="829.1")
     c = _conds(flt)
     assert c["source"].match.value == "matsne"
     assert c["document_number"].match.value == "55"
@@ -22,6 +23,8 @@ def test_build_filter_exact_keyword_fields():
     assert c["document_id"].match.value == "6835981"
     assert c["court"].match.value == "supremecourt"
     assert c["document_type"].match.value == "legislation"
+    assert c["article_id"].match.value == "829"
+    assert c["clause_id"].match.value == "829.1"
 
 
 def test_build_filter_full_text_fields_use_matchtext():
@@ -38,6 +41,20 @@ def test_build_filter_date_range():
     rng = _conds(flt)["date"].range  # pydantic coerces the RFC3339 strings to datetimes
     assert (rng.gte.year, rng.gte.month, rng.gte.day) == (2026, 4, 1)
     assert (rng.lte.year, rng.lte.month, rng.lte.day) == (2026, 4, 30)
+
+
+def test_build_filter_as_of_uses_effective_interval_not_publication_date():
+    flt = build_filter(as_of="2024-02-03")
+    assert len(flt.must) == 2
+    effective_from = flt.must[0]
+    open_or_later = flt.must[1]
+    assert effective_from.key == "effective_from"
+    assert effective_from.range.lte.date().isoformat() == "2024-02-03"
+    assert {condition.key for condition in open_or_later.should if hasattr(condition, "key")} == {
+        "effective_to"
+    }
+    assert open_or_later.should[0].range.gt.date().isoformat() == "2024-02-03"
+    assert open_or_later.should[1].is_empty.key == "effective_to"
 
 
 def test_build_filter_status_is_exact_keyword():

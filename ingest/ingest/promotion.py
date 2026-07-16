@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Protocol
 
 from .artifacts import atomic_write_json, load_verified_generation_coverage
+from .config import RETRIEVAL_FINGERPRINT_REVISION
 from .generation import (
     MANIFEST_FILENAME,
     GenerationFormatError,
@@ -179,6 +180,7 @@ class ExpectedCollectionIdentity:
     vector_space_id: str
     chunking_fingerprint: str
     document_header: bool
+    retrieval_fingerprint_revision: int
     retrieval_fingerprint: str
 
     @classmethod
@@ -201,10 +203,11 @@ class ExpectedCollectionIdentity:
             "vector_space_id",
             "chunking_fingerprint",
             "document_header",
+            "retrieval_fingerprint_revision",
             "retrieval_fingerprint",
         }
         _exact_keys(value, expected, "expected_collection")
-        return cls(
+        identity = cls(
             payload_schema_version=_require_int(
                 value["payload_schema_version"], "payload_schema_version"
             ),
@@ -238,10 +241,20 @@ class ExpectedCollectionIdentity:
                 value["chunking_fingerprint"], "chunking_fingerprint"
             ),
             document_header=_require_bool(value["document_header"], "document_header"),
+            retrieval_fingerprint_revision=_require_int(
+                value["retrieval_fingerprint_revision"],
+                "retrieval_fingerprint_revision",
+            ),
             retrieval_fingerprint=_require_sha256(
                 value["retrieval_fingerprint"], "retrieval_fingerprint"
             ),
         )
+        if identity.retrieval_fingerprint_revision != RETRIEVAL_FINGERPRINT_REVISION:
+            raise PromotionError(
+                "retrieval_fingerprint_revision must equal "
+                f"{RETRIEVAL_FINGERPRINT_REVISION}"
+            )
+        return identity
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -361,6 +374,7 @@ class CollectionInspection:
     vector_space_id: str
     chunking_fingerprint: str
     document_header: bool
+    retrieval_fingerprint_revision: int
     retrieval_fingerprint: str
     optimizer_status: str
     integrity_ok: bool
@@ -464,6 +478,7 @@ def create_promotion_plan(
             vector_space_id=vector.id,
             chunking_fingerprint=chunking.fingerprint,
             document_header=chunking.document_header,
+            retrieval_fingerprint_revision=manifest.retrieval_fingerprint_revision,
             retrieval_fingerprint=manifest.retrieval_fingerprint,
         ),
         created_at=_format_utc(created_at or datetime.now(UTC)),
@@ -871,6 +886,10 @@ def _candidate_mismatches(
         "document_header": (
             inspection.document_header,
             expected.document_header,
+        ),
+        "retrieval_fingerprint_revision": (
+            inspection.retrieval_fingerprint_revision,
+            expected.retrieval_fingerprint_revision,
         ),
         "retrieval_fingerprint": (
             inspection.retrieval_fingerprint,

@@ -18,7 +18,70 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-GENERATION_SCHEMA_VERSION = 1
+from .config import RETRIEVAL_FINGERPRINT_REVISION
+
+GENERATION_SCHEMA_VERSION = 2
+# Schema v2 is the first generation format whose Qdrant points are valid canonical legal
+# evidence rather than retrieval-only chunks.  The revision marker is repeated on every
+# point and included in startup compatibility counts.
+CANONICAL_PAYLOAD_REVISION = "canonical-evidence-v2"
+CANONICAL_PAYLOAD_REQUIRED_FIELDS = frozenset(
+    {
+        "canonical_payload_revision",
+        "canonical_content_hash",
+        "canonical_text_exact",
+        "passage_id",
+        "passage_hash",
+        "source_fingerprint",
+        "normalizer_revision",
+        "chunker_revision",
+        "model_revision",
+        "article_id",
+        "clause_id",
+        "subarticle",
+        "chapter",
+        "heading_path",
+        "parent_id",
+        "article_start_chunk_index",
+        "parent_chunk_index",
+        "char_start",
+        "char_end",
+        "page_start",
+        "page_end",
+        "version_id",
+        "supersedes",
+        "effective_from",
+        "effective_to",
+        "repeal_date",
+        "consolidation_status",
+        "version_lineage_status",
+        "version_lineage_complete",
+        "official_url",
+        "official_binary_url",
+        "source_authority",
+        "freshness_sla_met",
+    }
+)
+# These fields are never legitimately null/empty on an indexed canonical passage.  Startup
+# compatibility uses Qdrant ``is_empty`` exclusions so deleting any one makes the exact
+# identity count fall below the manifest chunk count before the collection can serve.
+CANONICAL_PAYLOAD_REQUIRED_NONEMPTY_FIELDS = frozenset(
+    {
+        "canonical_payload_revision",
+        "canonical_content_hash",
+        "passage_id",
+        "passage_hash",
+        "source_fingerprint",
+        "normalizer_revision",
+        "chunker_revision",
+        "model_revision",
+        "char_start",
+        "char_end",
+        "version_id",
+        "official_url",
+        "source_authority",
+    }
+)
 CHECKSUM_ALGORITHM = "sha256"
 CHECKSUM_FILENAME = "checksums.json"
 MANIFEST_FILENAME = "manifest.json"
@@ -435,6 +498,7 @@ class GenerationManifest:
     vector_space: VectorSpaceIdentity
     chunking: ChunkingIdentity
     covered_runs: tuple[CoveredRun, ...]
+    retrieval_fingerprint_revision: int
     retrieval_fingerprint: str
     code: CodeIdentity
     dependency: DependencyIdentity
@@ -457,6 +521,7 @@ class GenerationManifest:
             "vector_space",
             "chunking",
             "covered_runs",
+            "retrieval_fingerprint_revision",
             "retrieval_fingerprint",
             "code",
             "dependency",
@@ -514,6 +579,16 @@ class GenerationManifest:
             raise GenerationFormatError(
                 "non-empty generations require at least one covered raw run"
             )
+        fingerprint_revision = _integer(
+            data["retrieval_fingerprint_revision"],
+            field="retrieval_fingerprint_revision",
+            minimum=1,
+        )
+        if fingerprint_revision != RETRIEVAL_FINGERPRINT_REVISION:
+            raise GenerationFormatError(
+                "unsupported retrieval_fingerprint_revision "
+                f"{fingerprint_revision}; expected {RETRIEVAL_FINGERPRINT_REVISION}"
+            )
         return cls(
             schema_version=schema_version,
             generation_id=validate_generation_id(data["generation_id"]),
@@ -528,6 +603,7 @@ class GenerationManifest:
             vector_space=VectorSpaceIdentity.from_dict(data["vector_space"]),
             chunking=ChunkingIdentity.from_dict(data["chunking"]),
             covered_runs=covered_runs,
+            retrieval_fingerprint_revision=fingerprint_revision,
             retrieval_fingerprint=_sha256(
                 data["retrieval_fingerprint"], field="retrieval_fingerprint"
             ),
@@ -546,6 +622,7 @@ class DocumentRecord:
     generation_id: str
     source: str
     document_id: str
+    version_id: str
     source_identity: str
     content_hash: str
     document_state_hash: str
@@ -568,6 +645,7 @@ class DocumentRecord:
             "generation_id",
             "source",
             "document_id",
+            "version_id",
             "source_identity",
             "content_hash",
             "document_state_hash",
@@ -644,6 +722,9 @@ class DocumentRecord:
             document_id=_string(
                 data["document_id"], field="document.document_id", max_length=2048
             ),
+            version_id=_string(
+                data["version_id"], field="document.version_id", max_length=2048
+            ),
             source_identity=_sha256(
                 data["source_identity"], field="document.source_identity"
             ),
@@ -683,6 +764,7 @@ class SampleCheck:
     generation_id: str
     source: str
     document_id: str
+    version_id: str
     chunk_index: int
     point_id: str
     text_sha256: str
@@ -697,6 +779,7 @@ class SampleCheck:
             "generation_id",
             "source",
             "document_id",
+            "version_id",
             "chunk_index",
             "point_id",
             "text_sha256",
@@ -734,6 +817,11 @@ class SampleCheck:
             document_id=_string(
                 data["document_id"],
                 field="sample_check.document_id",
+                max_length=2048,
+            ),
+            version_id=_string(
+                data["version_id"],
+                field="sample_check.version_id",
                 max_length=2048,
             ),
             chunk_index=_integer(data["chunk_index"], field="sample_check.chunk_index"),

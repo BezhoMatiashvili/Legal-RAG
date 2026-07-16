@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import stat
-import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -17,6 +16,7 @@ from ingest.generation import (
     DOCUMENTS_FILENAME,
     MANIFEST_FILENAME,
     SAMPLE_CHECKS_FILENAME,
+    GENERATION_SCHEMA_VERSION,
     GenerationFormatError,
     GenerationManifest,
     load_generation,
@@ -40,8 +40,11 @@ from ingest.promotion import (
     create_promotion_plan,
     physical_collection_name,
 )
+from ingest.qdrant_store import point_id
 
 GENERATION_ID = "gen-20260713"
+VERSION_ONE = "derived:" + "1" * 64
+VERSION_TWO = "derived:" + "2" * 64
 SHA_A = "a" * 64
 SHA_B = "b" * 64
 SHA_C = "c" * 64
@@ -59,7 +62,7 @@ def _mode(path: Path) -> int:
 
 def _manifest(**overrides) -> GenerationManifest:
     data = {
-        "schema_version": 1,
+        "schema_version": GENERATION_SCHEMA_VERSION,
         "generation_id": GENERATION_ID,
         "document_count": 2,
         "indexed_document_count": 1,
@@ -93,6 +96,7 @@ def _manifest(**overrides) -> GenerationManifest:
             "document_header": True,
         },
         "covered_runs": [{"source": "matsne", "run_id": "20260713t100000z"}],
+        "retrieval_fingerprint_revision": 2,
         "retrieval_fingerprint": SHA_D,
         "code": {"git_sha": "c" * 40, "dirty_patch_sha256": None},
         "dependency": {"lock_sha256": SHA_E, "image_digest": None},
@@ -109,10 +113,11 @@ def _manifest(**overrides) -> GenerationManifest:
 def _documents():
     return [
         {
-            "schema_version": 1,
+            "schema_version": GENERATION_SCHEMA_VERSION,
             "generation_id": GENERATION_ID,
             "source": "matsne",
             "document_id": "doc-1",
+            "version_id": VERSION_ONE,
             "source_identity": SHA_A,
             "content_hash": SHA_B,
             "document_state_hash": SHA_C,
@@ -126,10 +131,11 @@ def _documents():
             "source_binary_url": None,
         },
         {
-            "schema_version": 1,
+            "schema_version": GENERATION_SCHEMA_VERSION,
             "generation_id": GENERATION_ID,
             "source": "matsne",
             "document_id": "doc-2",
+            "version_id": VERSION_TWO,
             "source_identity": SHA_D,
             "content_hash": SHA_E,
             "document_state_hash": "f" * 64,
@@ -148,12 +154,15 @@ def _documents():
 def _samples():
     return [
         {
-            "schema_version": 1,
+            "schema_version": GENERATION_SCHEMA_VERSION,
             "generation_id": GENERATION_ID,
             "source": "matsne",
             "document_id": "doc-1",
+            "version_id": VERSION_ONE,
             "chunk_index": 0,
-            "point_id": str(uuid.uuid5(uuid.NAMESPACE_URL, "matsne:doc-1:0")),
+            "point_id": point_id(
+                "matsne", "doc-1", 0, version_id=VERSION_ONE
+            ),
             "text_sha256": SHA_A,
         }
     ]
@@ -220,10 +229,11 @@ def test_generation_is_private_complete_checksummed_and_v1_untouched(tmp_path):
     ]
     assert quarantine == [
         {
-            "schema_version": 1,
+            "schema_version": GENERATION_SCHEMA_VERSION,
             "generation_id": GENERATION_ID,
             "source": "matsne",
             "document_id": "doc-2",
+            "version_id": VERSION_TWO,
             "source_identity": SHA_D,
             "content_hash": SHA_E,
             "document_state_hash": "f" * 64,
@@ -280,6 +290,19 @@ def test_existing_destination_is_never_overwritten_or_consumes_input(tmp_path):
             SOURCE_STATE,
         )
     assert sentinel.read_text(encoding="utf-8") == "keep"
+
+
+def test_publish_rejects_existing_output_root_beneath_symlink_ancestor(tmp_path):
+    real_parent = tmp_path / "real-parent"
+    existing_root = real_parent / "snapshots"
+    existing_root.mkdir(parents=True)
+    linked_parent = tmp_path / "linked-parent"
+    linked_parent.symlink_to(real_parent, target_is_directory=True)
+
+    with pytest.raises(GenerationPublishError, match="not a real directory"):
+        _publish(linked_parent / "snapshots")
+
+    assert not (existing_root / GENERATION_ID).exists()
 
 
 def test_destination_race_is_atomically_rejected_without_overwrite(
@@ -349,7 +372,11 @@ def test_failed_build_retains_private_staging_without_manifest(tmp_path):
 
 def test_sample_for_excluded_document_fails_closed(tmp_path):
     samples = _samples()
-    samples[0] = {**samples[0], "document_id": "doc-2"}
+    samples[0] = {
+        **samples[0],
+        "document_id": "doc-2",
+        "version_id": VERSION_TWO,
+    }
     with pytest.raises(GenerationPublishError, match="non-indexed chunk") as raised:
         _publish(tmp_path / "snapshots", samples=samples)
     assert raised.value.staging_path is not None
@@ -388,6 +415,7 @@ def test_promotion_plan_requires_and_binds_four_gate_verification(tmp_path):
     report = VerificationReport(
         generation_id=GENERATION_ID,
         manifest_sha256=loaded.checksums.files[MANIFEST_FILENAME],
+        physical_collection=physical_collection_name(GENERATION_ID),
         verified_at="2026-07-13T12:05:00Z",
         covered_runs=({"source": "matsne", "run_id": "20260713t100000z"},),
         stats={"observed_points": 2},
@@ -408,7 +436,7 @@ def test_promotion_plan_requires_and_binds_four_gate_verification(tmp_path):
         promotion_id="promotion-20260713",
     )
     assert plan.physical_collection == physical_collection_name(GENERATION_ID)
-    assert plan.expected_collection.payload_schema_version == 1
+    assert plan.expected_collection.payload_schema_version == GENERATION_SCHEMA_VERSION
     assert plan.expected_collection.points_count == 2
     assert plan.expected_collection.document_header is True
     assert plan.manifest_sha256 == loaded.checksums.files[MANIFEST_FILENAME]

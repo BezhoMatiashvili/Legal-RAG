@@ -4,6 +4,7 @@ import pytest
 
 from ingest.config import load_config
 from ingest.generation_scan import aggregate_documents
+from ingest.generation import CANONICAL_PAYLOAD_REVISION
 from ingest import qdrant_store as store
 
 
@@ -52,6 +53,29 @@ def test_two_documents_are_kept_separate(cfg):
     result = aggregate_documents(points, generation_id="legacy_2026_07_09", cfg=cfg)
     ids = sorted(d["document_id"] for d in result.documents)
     assert ids == ["a", "b"]
+
+
+def test_two_versions_of_same_document_are_kept_separate(cfg):
+    points = [
+        {
+            "source": "matsne", "document_id": "d1", "version_id": "v1",
+            "canonical_payload_revision": CANONICAL_PAYLOAD_REVISION,
+            "chunk_index": 0, "text": "same", "content_hash": _chunk_hash("same"),
+        },
+        {
+            "source": "matsne", "document_id": "d1", "version_id": "v2",
+            "canonical_payload_revision": CANONICAL_PAYLOAD_REVISION,
+            "chunk_index": 0, "text": "same", "content_hash": _chunk_hash("same"),
+        },
+    ]
+
+    result = aggregate_documents(points, generation_id="legacy_2026_07_09", cfg=cfg)
+
+    assert {doc["version_id"] for doc in result.documents} == {"v1", "v2"}
+    assert {sample["point_id"] for sample in result.samples} == {
+        store.point_id("matsne", "d1", 0, version_id="v1"),
+        store.point_id("matsne", "d1", 0, version_id="v2"),
+    }
 
 
 def test_out_of_order_scroll_still_aggregates_correctly(cfg):

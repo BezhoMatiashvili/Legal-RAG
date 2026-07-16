@@ -253,6 +253,12 @@ def fetch_live_payloads(batch: list, collection: str | None = None) -> dict[tupl
     client = make_client(cfg)
     coll = collection or cfg.collection_name
     docs = {(q.gold_source, q.gold_document_id) for q in batch}
+    if cfg.generation_id:
+        raise RuntimeError(
+            "validate_golden_batch is the frozen v2 authoring validator; use the "
+            "version-aware v3 dataset/release evaluator for immutable generations"
+        )
+    # Deliberately legacy: v2 gold authoring targets the frozen mutable collection.
     pid_map = {point_id(s, d, 0): (s, d) for s, d in docs}
     out: dict[tuple[str, str], dict] = {}
     ids = list(pid_map)

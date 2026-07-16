@@ -74,6 +74,11 @@ def main() -> None:
     args = ap.parse_args()
 
     cfg = load_config()
+    if cfg.generation_id:
+        raise SystemExit(
+            "diagnose_confident_wrong reads frozen v2 run artifacts with legacy point IDs; "
+            "use the version-aware v3 release evaluator for immutable generations"
+        )
     client = make_client(cfg)
     spec = goldset.EVAL_SETS[args.golden_set]
     meta = {}

@@ -27,8 +27,16 @@ INGEST_DIR = REPO_ROOT / "ingest"
 SCRAPER_DIR = REPO_ROOT / "scraper"
 
 _print_lock = threading.Lock()
-CORPUS_SOURCES = ("matsne", "ecd", "constcourt", "napr", "tas", "tbappeal")
-SCRAPER_SOURCES = (*CORPUS_SOURCES[:4], "supremecourt", *CORPUS_SOURCES[4:])
+CORPUS_SOURCES = (
+    "matsne",
+    "ecd",
+    "constcourt",
+    "napr",
+    "supremecourt",
+    "tas",
+    "tbappeal",
+)
+SCRAPER_SOURCES = CORPUS_SOURCES
 
 
 def selected_ingest_sources(only: list[str] | None) -> list[str]:
@@ -40,9 +48,7 @@ def selected_ingest_sources(only: list[str] | None) -> list[str]:
         raise SystemExit(f"unknown spider(s): {', '.join(unknown)}")
     selected = [source for source in CORPUS_SOURCES if source in only]
     if not selected:
-        raise SystemExit(
-            "--only selected no production corpus source (supremecourt is intentionally excluded)"
-        )
+        raise SystemExit("--only selected no production corpus source")
     return selected
 
 

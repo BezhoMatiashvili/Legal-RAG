@@ -30,7 +30,11 @@ from dataclasses import dataclass, field
 
 from . import qdrant_store as store
 from .config import Config
-from .generation import GENERATION_SCHEMA_VERSION, validate_generation_id
+from .generation import (
+    CANONICAL_PAYLOAD_REVISION,
+    GENERATION_SCHEMA_VERSION,
+    validate_generation_id,
+)
 from .pipeline import _document_state_hash
 
 # Every point in the live corpus predates the content_kind/extraction_status/
@@ -67,7 +71,9 @@ class ScanResult:
     chunk_count: int = 0
 
 
-def _source_identity(source: str, document_id: str, content_hash: str) -> str:
+def _source_identity(
+    source: str, document_id: str, version_id: str, content_hash: str
+) -> str:
     """Sha256 identity of this document's indexed state (source/id/body identity).
 
     Distinct from ``content_hash`` (the cleaned-body hash alone): this additionally binds
@@ -75,7 +81,12 @@ def _source_identity(source: str, document_id: str, content_hash: str) -> str:
     without depending on raw scrape artifacts that may not exist for very old indexed runs.
     """
     material = json.dumps(
-        {"source": source, "document_id": document_id, "content_hash": content_hash},
+        {
+            "source": source,
+            "document_id": document_id,
+            "version_id": version_id,
+            "content_hash": content_hash,
+        },
         sort_keys=True,
         ensure_ascii=False,
         separators=(",", ":"),
@@ -84,7 +95,8 @@ def _source_identity(source: str, document_id: str, content_hash: str) -> str:
 
 
 def _document_record_from_accumulator(
-    *, generation_id: str, source: str, document_id: str, acc: _DocAccumulator, cfg: Config,
+    *, generation_id: str, source: str, document_id: str, version_id: str,
+    acc: _DocAccumulator, cfg: Config,
 ) -> tuple[dict, list[ScanIssue]]:
     issues: list[ScanIssue] = []
     expected_chunk_count = acc.max_index + 1
@@ -126,7 +138,10 @@ def _document_record_from_accumulator(
         "generation_id": generation_id,
         "source": source,
         "document_id": document_id,
-        "source_identity": _source_identity(source, document_id, content_hash),
+        "version_id": version_id,
+        "source_identity": _source_identity(
+            source, document_id, version_id, content_hash
+        ),
         "content_hash": content_hash,
         "document_state_hash": document_state_hash,
         "expected_chunk_count": expected_chunk_count if expected_chunk_count >= 1 else 1,
@@ -141,15 +156,29 @@ def _document_record_from_accumulator(
     return record, issues
 
 
-def _sample_check(*, generation_id: str, source: str, document_id: str, payload: Mapping) -> dict:
+def _sample_check(
+    *, generation_id: str, source: str, document_id: str, version_id: str,
+    payload: Mapping,
+) -> dict:
     text = payload.get("text") or ""
     return {
         "schema_version": GENERATION_SCHEMA_VERSION,
         "generation_id": generation_id,
         "source": source,
         "document_id": document_id,
+        "version_id": version_id,
         "chunk_index": 0,
-        "point_id": store.point_id(source, document_id, 0),
+        "point_id": store.point_id(
+            source,
+            document_id,
+            0,
+            version_id=(
+                version_id
+                if payload.get("canonical_payload_revision")
+                == CANONICAL_PAYLOAD_REVISION
+                else None
+            ),
+        ),
         "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
     }
 
@@ -170,7 +199,7 @@ def aggregate_documents(
     fatal — mirrors ``verify_all_embedded.embedded_universe``'s tolerance for the same.
     """
     validate_generation_id(generation_id)
-    by_doc: dict[tuple[str, str], _DocAccumulator] = {}
+    by_doc: dict[tuple[str, str, str], _DocAccumulator] = {}
     total_chunks = 0
     for payload in points:
         source = payload.get("source")
@@ -178,7 +207,12 @@ def aggregate_documents(
         chunk_index = payload.get("chunk_index")
         if source is None or document_id is None or chunk_index is None:
             continue
-        key = (str(source), str(document_id))
+        version_id = payload.get("version_id")
+        if not version_id:
+            version_id = "legacy:" + str(
+                payload.get("content_hash") or hashlib.sha256(b"").hexdigest()
+            )
+        key = (str(source), str(document_id), str(version_id))
         acc = by_doc.setdefault(key, _DocAccumulator())
         acc.seen_count += 1
         idx = int(chunk_index)
@@ -192,9 +226,10 @@ def aggregate_documents(
     documents: list[dict] = []
     samples: list[dict] = []
     issues: list[ScanIssue] = []
-    for (source, document_id), acc in by_doc.items():
+    for (source, document_id, version_id), acc in by_doc.items():
         record, doc_issues = _document_record_from_accumulator(
-            generation_id=generation_id, source=source, document_id=document_id, acc=acc, cfg=cfg,
+            generation_id=generation_id, source=source, document_id=document_id,
+            version_id=version_id, acc=acc, cfg=cfg,
         )
         documents.append(record)
         issues.extend(doc_issues)
@@ -202,6 +237,7 @@ def aggregate_documents(
         samples.append(
             _sample_check(
                 generation_id=generation_id, source=source, document_id=document_id,
+                version_id=version_id,
                 payload=sample_payload,
             )
         )

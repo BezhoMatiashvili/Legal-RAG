@@ -14,9 +14,10 @@ spider through one ``Live`` is what makes the multi-spider view possible — two
 concurrent ``Live`` instances on the same stdout would corrupt the terminal.
 
 The live display is purely additive and read-only against the crawl. A separate
-``DurableDedupCommitExtension`` waits for Scrapy's feed-exporter-closed signal,
-fsyncs local feeds, and only then commits generic staged dedup outcomes. Totals
-are unknown up front (the ``matsne`` spider is
+``CompletionAttestationExtension`` joins Scrapy's spider-close and
+feed-exporter-close signals, proves durable outputs, commits generic staged dedup
+outcomes, validates source-specific completion, and publishes a terminal record.
+Totals are unknown up front (the ``matsne`` spider is
 two-phase and ``spider_idle``-driven), so the display shows spinners plus
 running counters and rates rather than a misleading "X% complete" bar.
 """
@@ -29,10 +30,28 @@ import time
 from dataclasses import dataclass, field
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from urllib.parse import unquote, urlparse
 
 from scrapy import signals
 from scrapy.exceptions import NotConfigured
+
+from .completion import (
+    CompletionAlreadyFinalized,
+    CompletionError,
+    CompletionMaterializationPending,
+    attest_feed_outputs,
+    attest_materialized_outputs,
+    build_terminal_record,
+    evaluate_crawl_quality,
+    failed_feed_durability,
+    failed_source_validation,
+    generic_source_validation,
+    hash_and_fsync_private_file,
+    publish_terminal_record,
+    terminal_authorization_exists,
+    validate_supremecourt_source,
+    verify_terminal_record,
+)
+from .utils.pagination import finalize_pagination_scope
 
 from rich.console import Group
 from rich.panel import Panel
@@ -140,102 +159,516 @@ class RotatingSpiderLogExtension:
         self.handler = None
 
 
-class DurableDedupCommitExtension:
-    """Commit generic dedup outcomes only after every feed is durably closed."""
+class CompletionAttestationExtension:
+    """Publish exactly one terminal attestation after spider and feeds close.
+
+    Scrapy does not guarantee whether this extension observes ``spider_closed``
+    before the feed exporter emits ``feed_exporter_closed``.  Both handlers only
+    record state and call the same guarded join, so finalization is independent of
+    signal order.  Callback and item-pipeline failures are counted from their own
+    signals because only zero is acceptable for a successful attestation.
+    """
+
+    _MAX_OPERATIONAL_ERRORS = 32
 
     def __init__(self, crawler):
         self.crawler = crawler
+        self._spider_closed_seen = False
+        self._feed_exporter_closed_seen = False
+        self._finish_reason = None
+        self._spider = None
+        self._spider_errors = 0
+        self._item_errors = 0
+        self._prepared = False
+        self._preparation_errors: list[str] = []
+        self._finalizing = False
+        self._finalized = False
+        self._staged_resolved = False
+        self._dedup_commit_token = None
+        self._dedup_prepare_attempted = False
+        self._terminal_published = False
+        self._terminal_success_verified = False
+        self._preserve_pending_for_recovery = False
 
     @classmethod
     def from_crawler(cls, crawler):
         extension = cls(crawler)
         crawler.signals.connect(
-            extension.feed_exporter_closed, signal=signals.feed_exporter_closed
+            extension.spider_closed,
+            signal=signals.spider_closed,
         )
+        crawler.signals.connect(
+            extension.feed_exporter_closed,
+            signal=signals.feed_exporter_closed,
+        )
+        crawler.signals.connect(
+            extension.spider_error,
+            signal=signals.spider_error,
+        )
+        crawler.signals.connect(
+            extension.item_error,
+            signal=signals.item_error,
+        )
+        # The combined runner uses these exact observed counters with the same pure
+        # quality evaluator after the process has drained.
+        crawler.completion_attestation = extension
         return extension
 
-    @staticmethod
-    def _local_feed_path(uri) -> Path | None:
-        text = str(uri)
-        parsed = urlparse(text)
-        if parsed.scheme == "file":
-            return Path(unquote(parsed.path))
-        if not parsed.scheme:
-            return Path(text)
-        return None
+    def spider_error(self, failure, response, spider):
+        del failure, response, spider
+        self._spider_errors += 1
 
-    @staticmethod
-    def _fsync_local_feed(path: Path) -> None:
-        if not path.is_file():
-            raise FileNotFoundError(f"configured feed was not materialized: {path}")
-        if stat.S_IMODE(path.stat().st_mode) & 0o077:
-            raise PermissionError(
-                f"configured feed is not owner-only; refusing to chmod existing file: {path}"
-            )
-        with path.open("rb") as handle:
-            os.fsync(handle.fileno())
-        directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    def item_error(self, item, response, spider, failure):
+        del item, response, spider, failure
+        self._item_errors += 1
+
+    def spider_closed(self, spider, reason):
+        if self._spider_closed_seen:
+            self._try_finalize()
+            return
+        self._spider = spider
+        self._finish_reason = reason
+        self._prepare_completion(spider, reason)
+        self._spider_closed_seen = True
+        # Supreme Court intentionally disables FeedExporter and materializes both
+        # outputs in prepare_completion(), so Scrapy may never emit its exporter-close
+        # signal for that spider.  The custom durability proof below is its equivalent.
+        if getattr(spider, "name", "") == "supremecourt":
+            self._feed_exporter_closed_seen = True
+        self._try_finalize()
+
+    def feed_exporter_closed(self, **_kwargs):
+        self._feed_exporter_closed_seen = True
+        if self._spider is None:
+            self._spider = getattr(self.crawler, "spider", None)
+        self._try_finalize()
+
+    def _bounded_error(self, errors: list[str], message: str) -> None:
+        if len(errors) < self._MAX_OPERATIONAL_ERRORS:
+            errors.append(str(message)[:500])
+
+    def _record_operational_failure(
+        self,
+        spider,
+        errors: list[str],
+        *,
+        kind: str,
+        detail: object,
+    ) -> None:
+        message = f"{kind}: {detail}"
+        self._bounded_error(errors, message)
         try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+            spider.record_quality_failure(
+                kind,
+                "completion://terminal-attestation",
+                detail=str(detail)[:300],
+            )
+        except Exception as exc:  # noqa: BLE001 - retain the original failure
+            self._bounded_error(
+                errors,
+                f"quality_failure_recording_failed: {type(exc).__name__}: {exc}",
+            )
 
-    def feed_exporter_closed(self):
-        spider = getattr(self.crawler, "spider", None)
-        if spider is None or getattr(spider, "name", "") == "supremecourt":
+    def _prepare_completion(self, spider, reason) -> None:
+        if self._prepared:
+            return
+        self._prepared = True
+        hook = getattr(spider, "prepare_completion", None)
+        if callable(hook):
+            try:
+                hook(reason)
+            except Exception as exc:  # noqa: BLE001 - preparation must fail closed
+                self._record_operational_failure(
+                    spider,
+                    self._preparation_errors,
+                    kind="completion_preparation_failed",
+                    detail=f"{type(exc).__name__}: {exc}",
+                )
+
+        # Every registered scope must have an idempotent terminal outcome.  Most
+        # adapters finalize on their last callback; this pass catches interrupted or
+        # otherwise stranded scopes and records their repair evidence before quality
+        # is evaluated.
+        trackers = getattr(spider, "_pagination_reconcilers", {})
+        scope_urls = getattr(spider, "_pagination_scope_urls", {})
+        for scope, tracker in list(trackers.items()):
+            if getattr(tracker, "_finalized", None) is not None:
+                continue
+            try:
+                finalize_pagination_scope(
+                    spider,
+                    tracker,
+                    url=scope_urls.get(scope, f"pagination://{scope}"),
+                )
+            except Exception as exc:  # noqa: BLE001 - reconciliation must fail closed
+                self._record_operational_failure(
+                    spider,
+                    self._preparation_errors,
+                    kind="pagination_finalization_failed",
+                    detail=f"{type(exc).__name__}: {exc}",
+                )
+
+    def _try_finalize(self) -> None:
+        if (
+            self._finalized
+            or self._finalizing
+            or not self._spider_closed_seen
+            or not self._feed_exporter_closed_seen
+        ):
+            return
+        spider = self._spider
+        if spider is None:
+            return
+        self._finalizing = True
+        try:
+            self._finalize(spider, str(self._finish_reason))
+        except CompletionAlreadyFinalized as exc:
+            self._preserve_pending_for_recovery = self._has_authorized_terminal(spider)
+            if not self._preserve_pending_for_recovery:
+                self._rollback_committed_stage(spider, [])
+            spider.logger.error("completion attestation already finalized: %s", exc)
+        except CompletionMaterializationPending as exc:
+            # The durable WAL decision is reconstructible, but exception paths never
+            # activate dedup.  Keep only the inactive pending batch; locked startup
+            # recovery will materialize run.json and then promote it.
+            self._preserve_pending_for_recovery = True
+            spider.logger.error(
+                "completion terminal is authorized and pending startup recovery: %s",
+                exc,
+            )
+        except Exception as exc:  # noqa: BLE001 - leave startup-only on publication crash
+            self._preserve_pending_for_recovery = self._has_authorized_terminal(spider)
+            if not self._preserve_pending_for_recovery:
+                self._rollback_committed_stage(spider, [])
+            spider.logger.exception("completion attestation failed closed: %s", exc)
+        finally:
+            if (
+                not self._terminal_success_verified
+                and not self._preserve_pending_for_recovery
+            ):
+                self._rollback_committed_stage(spider, [])
+            self._close_generic_dedup(spider)
+            self._finalizing = False
+            self._finalized = True
+
+    @staticmethod
+    def _has_published_success(spider) -> bool:
+        try:
+            verify_terminal_record(
+                spider.run_metadata_path,
+                expected_source=spider.name,
+                expected_run_id=spider.run_id,
+                expected_items_path=spider.items_path,
+            )
+        except Exception:  # noqa: BLE001 - only exact success authorizes promotion
+            return False
+        return True
+
+    @staticmethod
+    def _has_authorized_terminal(spider) -> bool:
+        try:
+            return terminal_authorization_exists(
+                spider.run_metadata_path,
+                expected_source=spider.name,
+                expected_run_id=spider.run_id,
+            )
+        except Exception:  # noqa: BLE001 - ambiguity keeps only inactive rows
+            # Only a definite, safely observed absence permits discard.  A malformed
+            # or temporarily unreadable WAL may still encode an irrevocable decision;
+            # retaining inactive shadow rows is always safer than false activation or
+            # irreversible deletion.
+            return True
+
+    @staticmethod
+    def _stats_mapping(crawler) -> dict:
+        stats = getattr(crawler, "stats", None)
+        return dict(stats.get_stats()) if stats is not None else {}
+
+    def _attest_feeds(self, spider, stats: dict):
+        if getattr(spider, "name", "") == "supremecourt":
+            return attest_materialized_outputs(
+                spider.items_path,
+                spider.latest_items_path,
+            )
+        feeds = self.crawler.settings.getdict("FEEDS")
+        return attest_feed_outputs(
+            feeds,
+            stats,
+            spider.items_path,
+            spider.latest_items_path,
+        )
+
+    def _discard_staged(self, spider, errors: list[str]) -> None:
+        if self._staged_resolved or getattr(spider, "name", "") == "supremecourt":
+            return
+        discard = getattr(spider, "discard_staged_seen", None)
+        if not callable(discard):
+            self._staged_resolved = True
+            return
+        try:
+            discard()
+        except Exception as exc:  # noqa: BLE001 - preserve the primary refusal
+            self._bounded_error(
+                errors,
+                f"dedup_discard_failed: {type(exc).__name__}: {exc}",
+            )
+        else:
+            self._staged_resolved = True
+
+    def _commit_staged(self, spider, errors: list[str]) -> None:
+        if self._staged_resolved or getattr(spider, "name", "") == "supremecourt":
             return
         staged = getattr(spider, "_staged_dedup_records", None)
         if not staged:
+            self._staged_resolved = True
             return
-
-        feeds = self.crawler.settings.getdict("FEEDS")
-        stats = self.crawler.stats
-        feed_stats = stats.get_stats()
-        successes = sum(
-            int(value or 0)
-            for key, value in feed_stats.items()
-            if key.startswith("feedexport/success_count/")
-        )
-        failures = sum(
-            int(value or 0)
-            for key, value in feed_stats.items()
-            if key.startswith("feedexport/failed_count/")
-        )
-        if not feeds or failures or successes < len(feeds):
-            spider.discard_staged_seen()
-            stats.inc_value("dedup/feed_commit_refused")
-            spider.record_quality_failure(
-                "durable_feed_commit_refused",
-                "feed-export://configured-outputs",
-                detail=(
-                    f"feeds={len(feeds)} successes={successes} failures={failures}"
-                ),
-            )
-            spider.logger.error(
-                "dedup: refusing staged commit; feeds=%d successes=%d failures=%d",
-                len(feeds),
-                successes,
-                failures,
+        commit = getattr(spider, "commit_staged_seen_reversible", None)
+        rollback = getattr(spider, "rollback_staged_seen_commit", None)
+        accept = getattr(spider, "accept_staged_seen_commit", None)
+        discard_pending = getattr(spider, "discard_pending_staged_seen", None)
+        if not all(
+            callable(method)
+            for method in (commit, rollback, accept, discard_pending)
+        ):
+            self._discard_staged(spider, errors)
+            self._record_operational_failure(
+                spider,
+                errors,
+                kind="reversible_dedup_commit_unavailable",
+                detail="staged records cannot be committed before terminal publication",
             )
             return
-
+        self._dedup_prepare_attempted = True
         try:
-            for uri in feeds:
-                path = self._local_feed_path(uri)
-                if path is not None:
-                    self._fsync_local_feed(path)
-            committed = spider.commit_staged_seen()
-        except Exception as exc:  # noqa: BLE001 - storage failure must fail closed
-            spider.discard_staged_seen()
-            stats.inc_value("dedup/feed_commit_refused")
-            spider.record_quality_failure(
-                "durable_feed_commit_refused",
-                "feed-export://configured-outputs",
+            token = commit()
+        except Exception as exc:  # noqa: BLE001 - dedup commit must fail closed
+            # A SQLite commit can succeed durably and still raise before returning.
+            # Cleanup by run identity, not only by a token that may never arrive.
+            self._rollback_committed_stage(spider, errors)
+            self._record_operational_failure(
+                spider,
+                errors,
+                kind="dedup_commit_failed",
                 detail=f"{type(exc).__name__}: {exc}",
             )
-            spider.logger.error("dedup: staged commit failed closed: %s", exc)
             return
-        stats.inc_value("dedup/committed_after_feeds", committed)
+        if token is None:
+            self._rollback_committed_stage(spider, errors)
+            self._record_operational_failure(
+                spider,
+                errors,
+                kind="dedup_commit_failed",
+                detail="reversible dedup commit returned no compensation token",
+            )
+            return
+        self._dedup_commit_token = token
+        self._staged_resolved = True
+        committed = int(getattr(token, "committed_count", 0))
+        stats = getattr(self.crawler, "stats", None)
+        if stats is not None:
+            stats.inc_value("dedup/committed_after_feeds", committed)
+
+    def _rollback_committed_stage(self, spider, errors: list[str]) -> None:
+        """Discard pending rows without ever modifying active ``seen`` state."""
+        if getattr(spider, "name", "") == "supremecourt":
+            return
+        token = self._dedup_commit_token or getattr(
+            spider, "_pending_reversible_dedup_commit", None
+        )
+        if token is None and not self._dedup_prepare_attempted:
+            self._discard_staged(spider, errors)
+            return
+        discarded = None
+        failures: list[str] = []
+        discard_pending = getattr(spider, "discard_pending_staged_seen", None)
+        if callable(discard_pending):
+            try:
+                discarded = discard_pending(getattr(spider, "run_id", None))
+            except Exception as exc:  # noqa: BLE001 - pending remains inactive
+                failures.append(
+                    f"dedup_pending_discard_failed: {type(exc).__name__}: {exc}"
+                )
+        else:
+            failures.append("pending dedup discard API disappeared")
+
+        # A token-aware delete is a useful second attempt if the run-id recovery API
+        # itself failed.  Both paths only delete shadow rows.
+        rollback = getattr(spider, "rollback_staged_seen_commit", None)
+        if discarded is None and token is not None and callable(rollback):
+            try:
+                discarded = rollback(token)
+            except Exception as exc:  # noqa: BLE001 - pending remains inactive
+                failures.append(
+                    f"dedup_pending_rollback_failed: {type(exc).__name__}: {exc}"
+                )
+
+        if discarded is not None:
+            self._dedup_commit_token = None
+            self._dedup_prepare_attempted = False
+        else:
+            for failure in failures:
+                self._bounded_error(errors, failure)
+            if failures:
+                spider.logger.error(
+                    "dedup pending cleanup failed; rows remain inactive: %s",
+                    "; ".join(failures),
+                )
+        self._staged_resolved = False
+        self._discard_staged(spider, errors)
+        stats = getattr(self.crawler, "stats", None)
+        if stats is not None and discarded is not None:
+            stats.inc_value(
+                "dedup/compensated_after_publication_failure",
+                int(discarded or 0),
+            )
+
+    def _accept_committed_stage(self, spider) -> None:
+        token = self._dedup_commit_token
+        if token is None:
+            return
+        accept = getattr(spider, "accept_staged_seen_commit", None)
+        if not callable(accept):
+            raise RuntimeError("reversible dedup acceptance API disappeared")
+        accept(token)
+        self._dedup_commit_token = None
+        self._dedup_prepare_attempted = False
+
+    @staticmethod
+    def _close_generic_dedup(spider) -> None:
+        if getattr(spider, "name", "") == "supremecourt":
+            return
+        connection = getattr(spider, "_dedup_conn", None)
+        if connection is None:
+            return
+        try:
+            connection.close()
+        except Exception as exc:  # noqa: BLE001 - terminal path must still unwind
+            spider.logger.exception("closing generic dedup store failed: %s", exc)
+        finally:
+            spider._dedup_conn = None
+
+    @staticmethod
+    def _run_items_proof(feeds):
+        run_rows = [row for row in feeds.files if row.get("role") == "run"]
+        if len(run_rows) != 1:
+            raise CompletionError("durable feeds do not contain one run-scoped item proof")
+        return hash_and_fsync_private_file(run_rows[0]["path"])
+
+    def _finalize(self, spider, reason: str) -> None:
+        errors = list(self._preparation_errors)
+        stats = self._stats_mapping(self.crawler)
+
+        try:
+            feeds = self._attest_feeds(spider, stats)
+        except Exception as exc:  # noqa: BLE001 - all feed failures are terminal
+            feeds = failed_feed_durability()
+            self._discard_staged(spider, errors)
+            self._record_operational_failure(
+                spider,
+                errors,
+                kind="feed_durability_failed",
+                detail=f"{type(exc).__name__}: {exc}",
+            )
+
+        try:
+            if getattr(spider, "name", "") == "supremecourt":
+                source_validation = validate_supremecourt_source(
+                    spider.run_dir,
+                    reason,
+                    self._run_items_proof(feeds),
+                )
+            else:
+                source_validation = generic_source_validation()
+        except Exception as exc:  # noqa: BLE001 - source proof must fail closed
+            source_validation = failed_source_validation(
+                kind=(
+                    "supremecourt_partial_v1"
+                    if getattr(spider, "name", "") == "supremecourt"
+                    else "generic"
+                )
+            )
+            self._record_operational_failure(
+                spider,
+                errors,
+                kind="source_validation_failed",
+                detail=f"{type(exc).__name__}: {exc}",
+            )
+
+        # Staged generic successes remain reversible until every eligibility check
+        # available at this point has passed.  Feed durability is a prerequisite,
+        # while source/quality failures discard the stage instead of poisoning future
+        # crawls with success keys from an ineligible attempt.
+        preliminary_stats = self._stats_mapping(self.crawler)
+        preliminary_quality = evaluate_crawl_quality(
+            preliminary_stats,
+            str(getattr(spider, "name", "")),
+            reason,
+            spider_errors=self._spider_errors,
+            item_errors=self._item_errors,
+            reconcilers=getattr(spider, "_pagination_reconcilers", {}),
+        )
+        if (
+            not errors
+            and feeds.durable
+            and preliminary_quality.passed
+            and source_validation.get("passed") is True
+        ):
+            self._commit_staged(spider, errors)
+        else:
+            self._discard_staged(spider, errors)
+
+        # Re-read stats because preparation, feed, dedup, or source validation may
+        # have recorded a quality failure above.
+        stats = self._stats_mapping(self.crawler)
+        quality = evaluate_crawl_quality(
+            stats,
+            str(getattr(spider, "name", "")),
+            reason,
+            spider_errors=self._spider_errors,
+            item_errors=self._item_errors,
+            reconcilers=getattr(spider, "_pagination_reconcilers", {}),
+        )
+        success = (
+            not errors
+            and quality.passed
+            and feeds.durable
+            and source_validation.get("passed") is True
+        )
+        if not success:
+            # A late quality/stat change can invalidate a run after its shadow batch
+            # was prepared.  Failure records never authorize pending promotion.
+            self._rollback_committed_stage(spider, errors)
+        record = build_terminal_record(
+            spider,
+            finish_reason=reason,
+            quality=quality,
+            feeds=feeds,
+            source_validation=source_validation,
+            outcome="success" if success else "failure",
+            failure_count=0 if success else max(1, len(errors)),
+        )
+        publication = publish_terminal_record(spider, record)
+        self._terminal_published = True
+        if success:
+            # The publisher's return can itself be ambiguous around filesystem
+            # durability.  Reload the exact authoritative record (including recovery-
+            # guard absence) before allowing SQLite activation.
+            if not self._has_published_success(spider):
+                raise CompletionError(
+                    "published success could not be strictly reverified"
+                )
+            self._terminal_success_verified = True
+            self._accept_committed_stage(spider)
+            spider.logger.info(
+                "completion attestation published for %s (latest_updated=%s)",
+                spider.run_id,
+                publication.latest_updated,
+            )
+        else:
+            spider.logger.error(
+                "crawl is ineligible; terminal failure attestation published for %s",
+                spider.run_id,
+            )
 
 
 def extract_title(item) -> str | None:

@@ -8,9 +8,13 @@ The scraped items use different field names per source (id is ``document_id`` /
 rest of the pipeline is source-agnostic.
 """
 
+import hashlib
+import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date as _date
+
+NORMALIZER_REVISION = "canonical-source-normalizer-v2"
 
 _DATE_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})")
 _DMY_RE = re.compile(r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{4})\b")
@@ -44,6 +48,72 @@ STATUS_STEMS = (
     ("ასამოქმედებ", "pending"),     # ასამოქმედებელი — adopted, not yet in force
     ("ძალაში", "in_force"),         # ძალაში მყოფი — currently in force
 )
+
+_REGISTRATION_PLACEHOLDERS = frozenset(
+    {
+        "-",
+        "--",
+        "n/a",
+        "na",
+        "none",
+        "null",
+        "unknown",
+        "არ არის",
+        "არ აქვს",
+        "უცნობია",
+    }
+)
+
+
+def normalize_registration_code(value) -> str | None:
+    """Return a real registry code, mapping shared placeholders to ``None``.
+
+    Matsne uses ``000000000.00.00.000000`` for many unrelated historical acts.  Treating
+    it as a real value creates a false shared version lineage, so any punctuation-only or
+    all-zero identifier fails closed to null.
+    """
+    if value in (None, ""):
+        return None
+    text = str(value).strip()
+    if not text or text.lower() in _REGISTRATION_PLACEHOLDERS:
+        return None
+    alnum = "".join(char for char in text if char.isalnum())
+    if not alnum or not alnum.strip("0"):
+        return None
+    return text
+
+
+def _source_fingerprint(item: dict) -> str:
+    """SHA-256 fingerprint of the complete raw source record before normalization."""
+    material = json.dumps(
+        item,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def _string_tuple(value) -> tuple[str, ...]:
+    if value in (None, "", []):
+        return ()
+    values = value if isinstance(value, (list, tuple, set)) else [value]
+    return tuple(dict.fromkeys(str(item).strip() for item in values if str(item).strip()))
+
+
+def _optional_bool(value) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes"}:
+            return True
+        if lowered in {"0", "false", "no"}:
+            return False
+    return None
 
 
 def normalize_status(value) -> str | None:
@@ -150,6 +220,49 @@ class CanonicalDoc:
     extraction_status: str = "full_text"
     source_binary_url: str | None = None
     article_summary: str | None = None
+    # Reproducible source and temporal identity.  A derived ``version_id`` identifies the
+    # exact canonical body but does not claim a complete amendment lineage; callers must
+    # inspect ``version_lineage_complete`` before answering historical-law questions.
+    source_fingerprint: str | None = None
+    normalizer_revision: str = NORMALIZER_REVISION
+    version_id: str | None = None
+    version_id_kind: str = "derived"
+    supersedes: tuple[str, ...] = ()
+    effective_from: str | None = None
+    effective_to: str | None = None
+    repeal_date: str | None = None
+    consolidation_status: str | None = None
+    version_lineage_status: str = "unknown"
+    version_lineage_complete: bool = False
+    consolidated_dates: tuple[str, ...] = ()
+    official_url: str | None = None
+    official_binary_url: str | None = None
+    official_html_url: str | None = None
+    official_pdf_url: str | None = None
+    source_authority: str = "primary_official"
+    freshness_sla_met: bool | None = None
+
+
+def derived_version_id(doc: CanonicalDoc, canonical_text: str | None = None) -> str:
+    """Build an immutable version identity from source identity and exact canonical text."""
+    body = doc.body_markdown if canonical_text is None else canonical_text
+    material = {
+        "source": doc.source,
+        "document_id": doc.document_id,
+        "effective_from": doc.effective_from,
+        "effective_to": doc.effective_to,
+        "canonical_content_hash": hashlib.sha256(body.encode("utf-8")).hexdigest(),
+    }
+    blob = json.dumps(material, sort_keys=True, separators=(",", ":"))
+    return "derived:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def finalize_canonical_text(doc: CanonicalDoc, canonical_text: str) -> CanonicalDoc:
+    """Bind a normalized document to the exact cleaned text used for hashes and offsets."""
+    version_id = doc.version_id
+    if doc.version_id_kind == "derived" or not version_id:
+        version_id = derived_version_id(doc, canonical_text)
+    return replace(doc, body_markdown=canonical_text, version_id=version_id)
 
 
 @dataclass(frozen=True)
@@ -174,6 +287,7 @@ class SourceSpec:
     promote_fields: tuple[str, ...] = ()     # raw item keys copied verbatim into payload
     consolidated_field: str | None = None        # bool item key: has consolidated versions
     consolidated_count_field: str | None = None  # int item key: number of consolidated versions
+    source_authority: str = "primary_official"
 
     def declared_keys(self) -> set[str]:
         """Every raw item key this spec reads — the schema-drift baseline of handled fields."""
@@ -186,6 +300,19 @@ class SourceSpec:
             "article_summary",
             "pdf_url",
             "docx_url",
+            "official_url",
+            "official_binary_url",
+            "official_html_url",
+            "official_pdf_url",
+            "version_id",
+            "supersedes",
+            "effective_from",
+            "effective_to",
+            "repeal_date",
+            "consolidation_status",
+            "version_lineage_complete",
+            "freshness_sla_met",
+            "consolidated_dates",
         }
         for group in (self.id_fields, self.date_fields, self.title_fields, self.number_fields,
                       self.registration_fields, self.parties_fields, self.in_force_fields,
@@ -257,6 +384,16 @@ class SourceSpec:
                 except (TypeError, ValueError):
                     consolidated_count = None
 
+        consolidated_dates = tuple(
+            sorted(
+                {
+                    parsed
+                    for parsed in (_parse_date(value) for value in _string_tuple(item.get("consolidated_dates")))
+                    if parsed
+                }
+            )
+        )
+
         body_markdown = item.get("body_markdown") or ""
         raw_complete = item.get("content_complete")
         if isinstance(raw_complete, bool):
@@ -284,7 +421,57 @@ class SourceSpec:
             or ("full_text" if content_complete else "malformed")
         ).strip()
 
-        return CanonicalDoc(
+        source_url = self._first(item, self.url_fields)
+        source_url = str(source_url).strip() if source_url not in (None, "") else None
+        source_binary_url = self._first(
+            item, ("official_binary_url", "source_binary_url", "pdf_url", "docx_url")
+        )
+        source_binary_url = (
+            str(source_binary_url).strip()
+            if source_binary_url not in (None, "")
+            else None
+        )
+        official_url = self._first(item, ("official_url", "official_html_url")) or source_url
+        official_pdf_url = self._first(item, ("official_pdf_url", "pdf_url"))
+        if official_pdf_url in (None, "") and source_binary_url:
+            if source_binary_url.lower().split("?", 1)[0].endswith(".pdf"):
+                official_pdf_url = source_binary_url
+
+        in_force_date = _parse_date(self._first(item, self.in_force_fields))
+        expiry_date = _parse_date(self._first(item, self.expiry_fields))
+        explicit_effective_from = _parse_date(item.get("effective_from"))
+        explicit_effective_to = _parse_date(item.get("effective_to"))
+        if explicit_effective_from:
+            effective_from = explicit_effective_from
+        elif self.source == "matsne":
+            # The rendered consolidated body is the newest switcher version.  This gives
+            # its best-known lower bound, while ``version_lineage_complete=False`` makes
+            # clear that prior canonical texts were not scraped.
+            effective_from = max(consolidated_dates, default=in_force_date)
+        else:
+            effective_from = _parse_date(date_raw)
+        effective_to = explicit_effective_to or expiry_date
+        repeal_date = _parse_date(item.get("repeal_date")) or expiry_date
+        consolidation_status = item.get("consolidation_status")
+        if consolidation_status in (None, ""):
+            if is_consolidated is True:
+                consolidation_status = "consolidated"
+            elif is_consolidated is False:
+                consolidation_status = "unconsolidated"
+            else:
+                consolidation_status = None
+        explicit_lineage_complete = _optional_bool(item.get("version_lineage_complete"))
+        if explicit_lineage_complete is None:
+            version_lineage_complete = self.source != "matsne"
+        else:
+            version_lineage_complete = explicit_lineage_complete
+        if version_lineage_complete:
+            lineage_status = "complete" if self.source == "matsne" else "not_applicable"
+        else:
+            lineage_status = "partial" if self.source == "matsne" else "unknown"
+
+        raw_version_id = item.get("version_id")
+        doc = CanonicalDoc(
             source=self.source,
             document_id=document_id,
             title=title,
@@ -293,14 +480,14 @@ class SourceSpec:
             language=language,
             document_type=doc_type,
             court=court,
-            source_url=self._first(item, self.url_fields),
+            source_url=source_url,
             document_number=str(number_raw).strip() if number_raw not in (None, "") else None,
-            registration_code=str(registration_raw).strip() if registration_raw not in (None, "") else None,
+            registration_code=normalize_registration_code(registration_raw),
             parties=self._parties(item, title),
             status=normalize_status(status_raw),
             status_raw=status_raw,
-            in_force_date=_parse_date(self._first(item, self.in_force_fields)),
-            expiry_date=_parse_date(self._first(item, self.expiry_fields)),
+            in_force_date=in_force_date,
+            expiry_date=expiry_date,
             body_markdown=body_markdown,
             extra=item,
             promoted=promoted,
@@ -309,15 +496,41 @@ class SourceSpec:
             content_kind=content_kind,
             content_complete=content_complete,
             extraction_status=extraction_status,
-            source_binary_url=self._first(
-                item, ("source_binary_url", "pdf_url", "docx_url")
-            ),
+            source_binary_url=source_binary_url,
             article_summary=(
                 str(item["article_summary"])
                 if item.get("article_summary") not in (None, "")
                 else None
             ),
+            source_fingerprint=_source_fingerprint(item),
+            version_id=(
+                str(raw_version_id).strip()
+                if raw_version_id not in (None, "")
+                else None
+            ),
+            version_id_kind="official" if raw_version_id not in (None, "") else "derived",
+            supersedes=_string_tuple(item.get("supersedes")),
+            effective_from=effective_from,
+            effective_to=effective_to,
+            repeal_date=repeal_date,
+            consolidation_status=(
+                str(consolidation_status).strip() if consolidation_status else None
+            ),
+            version_lineage_status=lineage_status,
+            version_lineage_complete=version_lineage_complete,
+            consolidated_dates=consolidated_dates,
+            official_url=str(official_url).strip() if official_url else None,
+            official_binary_url=source_binary_url,
+            official_html_url=str(official_url).strip() if official_url else None,
+            official_pdf_url=(
+                str(official_pdf_url).strip() if official_pdf_url else None
+            ),
+            source_authority=self.source_authority,
+            freshness_sla_met=_optional_bool(item.get("freshness_sla_met")),
         )
+        if doc.version_id is None:
+            doc = replace(doc, version_id=derived_version_id(doc))
+        return doc
 
 
 SOURCES: dict[str, SourceSpec] = {

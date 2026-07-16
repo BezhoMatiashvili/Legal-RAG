@@ -98,11 +98,23 @@ uv run python -m ingest search "ბს-543" --document-type court_decision      
 uv run python -m ingest search "..." --language ka --date-from 2020-01-01 --date-to 2020-12-31
 ```
 
-## MCP server (use the corpus as RAG inside Claude)
+## MCP server (strict answering plus research retrieval)
 `ingest/ingest/mcp_server.py` is a stdio MCP server that wraps the same hybrid retrieval
-as `ingest search`, exposing three read-only tools to an MCP client (e.g. Claude Code):
-`legal_search`, `legal_get_document` (reassemble a full doc by `source` + `document_id`),
-and `legal_collection_info`.
+as `ingest search` and adds a server-owned answer contract. The primary tools are:
+
+- `legal_ask`: answer, clarify, or abstain after original+Georgian retrieval, canonical
+  evidence packing, atomic-claim generation, deterministic citation/version validation,
+  one repair, and selective-risk calibration;
+- `legal_get_context`: resolve a content-bound evidence ID to exact stored text and
+  bounded neighbors (no Markdown-preview truncation);
+- `legal_search`: research/debug retrieval only; its reranker scores are relevance, not
+  legal confidence;
+- `legal_lookup`, `legal_browse`, `legal_get_document`,
+  `legal_get_document_versions`, `legal_collection_info`, `ingest_status`, `legal_health`.
+
+The repository never silently calls an external generator or translator. A deployment
+must inject pinned private providers and a held-out calibrator. Until then `legal_ask`
+returns a structured abstention. See `docs/accuracy-first.md`.
 
 It is registered for this repo via the checked-in `.mcp.json` at the repo root, which runs
 `uv run --directory ingest python -m ingest.mcp_server` — so it uses this `ingest` env and

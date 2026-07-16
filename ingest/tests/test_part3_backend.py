@@ -20,9 +20,17 @@ class FakeEmb:
         )
 
 
-def _pt(doc, ci, score):
+def _pt(doc, ci, score, *, version=None):
+    payload = {
+        "document_id": doc,
+        "source": "matsne",
+        "chunk_index": ci,
+        "text": f"{doc}-{ci}",
+    }
+    if version is not None:
+        payload["version_id"] = version
     return SimpleNamespace(
-        payload={"document_id": doc, "source": "matsne", "chunk_index": ci, "text": f"{doc}-{ci}"},
+        payload=payload,
         score=score, vector={"dense": [0.1, 0.2, 0.3]},
     )
 
@@ -52,6 +60,16 @@ def test_fake_backend_handles_every_mode_including_routed():
     for m in MODES:
         hits, lat = fb.search("law georgia", m, 2)
         assert isinstance(hits, list)
+
+
+def test_backend_hits_retain_optional_canonical_version_identity():
+    records = [ChunkRecord("matsne", "law", 0, "operative rule", version_id="v1")]
+    fake_hits, _ = FakeBackend(records).search("operative", "bm25", 1)
+    assert fake_hits[0].version_id == "v1"
+
+    client = FakeQdrant([_pt("law", 0, 0.9, version="v1")])
+    qdrant_hits, _ = QdrantBackend(_cfg(), client, FakeEmb()).search("operative", "dense", 1)
+    assert qdrant_hits[0].version_id == "v1"
 
 
 def test_qdrant_routed_drops_sparse_for_english():

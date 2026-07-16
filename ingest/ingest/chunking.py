@@ -17,9 +17,14 @@ stay exact regardless of NFC form or stray ``\\r``. The synthetic heading-contex
 is not part of the span.
 """
 
+import hashlib
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
+
+from . import structure
+
+STRUCTURAL_CHUNKER_REVISION = "structural-article-clause-v2"
 
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*\S)\s*$")
 _PARA_RE = re.compile(r"\n\s*\n")
@@ -29,7 +34,16 @@ _SENT_RE = re.compile(r"(?<=[.!?…])\s+")
 # — the marker stays in the body (kept visible for citations, unlike consumed `#` headings).
 # Same-line whitespace only ([ \t], never \s) so a bare line-final "მუხლი" can't bind to a
 # digit on the next line (mirrors structure.py's regression-tested rule).
-_ARTICLE_LINE_RE = re.compile(r"^[ \t]*მუხლი[ \t]*\d")
+_ARTICLE_LINE_RE = re.compile(
+    rf"^[ \t]*(?:[*_]+[ \t]*)?"
+    rf"(?P<label>მუხლი[ \t]*{structure.ARTICLE_ID_PATTERN}[^\n]*)",
+    re.IGNORECASE,
+)
+_CHAPTER_LINE_RE = re.compile(
+    r"^[ \t]*(?:[*_]+[ \t]*)?"
+    r"(?P<label>(?:თავი|კარი|ნაწილი)[ \t]+[IVXLCDMა-ჰ0-9]+[^\n]*)",
+    re.IGNORECASE,
+)
 
 
 def default_token_counter(text: str) -> int:
@@ -48,6 +62,26 @@ class Chunk:
     # real values. See module docstring.
     char_start: int = -1
     char_end: int = -1
+    # Exact canonical substring at ``[char_start:char_end)``.  ``text`` is kept equal to
+    # this value for chunks produced by :func:`chunk_document`; the optional field keeps
+    # hand-constructed legacy/test chunks backwards-compatible.
+    canonical_text: str | None = None
+    passage_hash: str | None = None
+    article_id: str | None = None
+    article_label: str | None = None
+    article_start: int | None = None
+    clause: str | None = None
+    clause_id: str | None = None
+    subarticle: str | None = None
+    chapter: str | None = None
+    parent_id: str | None = None
+    clause_ids: tuple[str, ...] = ()
+    subarticle_ids: tuple[str, ...] = ()
+    page_start: int | None = None
+    page_end: int | None = None
+    article_start_chunk_index: int | None = None
+    parent_chunk_index: int | None = None
+    chunker_revision: str = STRUCTURAL_CHUNKER_REVISION
 
 
 def _split_keep_pos(s: str, pattern: re.Pattern) -> list[tuple[str, int, int]]:
@@ -84,6 +118,7 @@ def _split_sections(text: str) -> list[tuple[list[str], str, int]]:
     sections: list[tuple[list[str], str, int]] = []
     stack: list[tuple[int, str]] = []
     cur_path: list[str] = []
+    chapter_label: str | None = None
     buf: list[tuple[int, int]] = []  # (line_start, content_end) per buffered line
 
     def flush():
@@ -111,11 +146,23 @@ def _split_sections(text: str) -> list[tuple[list[str], str, int]]:
             stack[:] = [(lv, t) for (lv, t) in stack if lv < level]
             stack.append((level, m.group(2).strip()))
             cur_path = [t for (_, t) in stack]
-        elif _ARTICLE_LINE_RE.match(content) and buf:
+            # An explicit Markdown hierarchy supersedes a preceding plain chapter marker.
+            chapter_label = None
+        elif (chapter_match := _CHAPTER_LINE_RE.match(content)):
+            flush()
+            chapter_label = chapter_match.group("label").rstrip("#*_ ").strip()
+            cur_path = [t for (_, t) in stack] + [chapter_label]
+            buf[:] = [(start, content_end)]
+        elif (article_match := _ARTICLE_LINE_RE.match(content)):
             # Article boundary: start a fresh section but keep the marker line in the body
             # (so "მუხლი 5 …" stays visible for citations). ``buf`` guard avoids a spurious
             # empty flush when a section already begins with an article line.
             flush()
+            article_label = article_match.group("label").rstrip("#*_ ").strip()
+            cur_path = [t for (_, t) in stack]
+            if chapter_label:
+                cur_path.append(chapter_label)
+            cur_path.append(article_label)
             buf[:] = [(start, content_end)]
         else:
             buf.append((start, content_end))
@@ -265,10 +312,20 @@ def _pack(
             seed: list[tuple[str, int, int, int]] = []
             seed_tok = 0
             for a in reversed(cur):
-                if seed_tok + a[1] > overlap:
+                atom_count = token_count([a])
+                remaining = overlap - seed_tok
+                if atom_count > remaining:
+                    partial = _tail_overlap_atom(
+                        a,
+                        remaining,
+                        count or default_token_counter,
+                    )
+                    if partial is not None:
+                        seed.insert(0, partial)
+                        seed_tok += token_count([partial])
                     break
                 seed.insert(0, a)
-                seed_tok += a[1]
+                seed_tok += atom_count
             # An atom may itself consume most/all of the budget. Retain only as much overlap
             # as fits beside it; overlap is a recall aid, never permission to exceed the model
             # input contract.
@@ -306,6 +363,32 @@ def _pack(
     ]
 
 
+def _tail_overlap_atom(
+    atom: tuple[str, int, int, int],
+    budget: int,
+    count: Callable[[str], int],
+) -> tuple[str, int, int, int] | None:
+    """Take an exact, tokenizer-bounded word suffix from an oversized final atom.
+
+    Legacy overlap retained whole paragraph/sentence atoms only, so a 100-token sentence
+    with an 80-token overlap budget contributed *no* overlap.  This helper retains the
+    largest exact suffix that fits.  It only slices when atom text maps byte-for-byte to
+    its source span; normalized word-window atoms fall back to no partial seed rather than
+    inventing an offset.
+    """
+    text, _, start, end = atom
+    if budget <= 0 or not text or len(text) != end - start:
+        return None
+    best: tuple[str, int, int, int] | None = None
+    for match in reversed(list(re.finditer(r"\S+", text))):
+        candidate = text[match.start() :]
+        tokens = count(candidate)
+        if tokens > budget:
+            break
+        best = (candidate, tokens, start + match.start(), end)
+    return best
+
+
 def chunk_document(
     text: str,
     *,
@@ -323,22 +406,70 @@ def chunk_document(
     """
     chunks: list[Chunk] = []
     idx = 0
+    article_starts: dict[tuple[str, int | None], int] = {}
+    parent_starts: dict[tuple[str, int | None], int] = {}
+    structural_index = structure.build_index(text or "")
     for path, body, body_start in _split_sections(text or ""):
-        for piece, tok, cstart, cend in _pack(
+        for _piece, _tok, cstart, cend in _pack(
             _atoms(body, max_tokens, count_tokens),
             max_tokens,
             overlap,
             min_tokens,
             count_tokens,
         ):
+            char_start = body_start + cstart
+            char_end = body_start + cend
+            canonical_text = text[char_start:char_end]
+            token_count = count_tokens(canonical_text)
+            if token_count > max_tokens:
+                raise AssertionError(
+                    "exact canonical passage exceeds the configured token budget "
+                    f"({token_count} > {max_tokens})"
+                )
+            context = structure.context_for_span(
+                text,
+                char_start,
+                char_end,
+                index=structural_index,
+            )
+            heading_path = list(path)
+            if context.chapter and context.chapter not in heading_path:
+                heading_path.append(context.chapter)
+            if context.article_label and context.article_label not in heading_path:
+                heading_path.append(context.article_label)
+            parent_id = context.parent_id
+            if parent_id is None and heading_path:
+                parent_id = f"heading:{heading_path[-1]}"
+            article_start_chunk_index = None
+            if context.article_id:
+                article_key = (context.article_id, context.article_start)
+                article_start_chunk_index = article_starts.setdefault(article_key, idx)
+            parent_chunk_index = None
+            if parent_id:
+                parent_key = (parent_id, context.article_start)
+                parent_chunk_index = parent_starts.setdefault(parent_key, idx)
             chunks.append(
                 Chunk(
-                    text=piece,
+                    text=canonical_text,
                     chunk_index=idx,
-                    heading_path=path,
-                    token_count=count_tokens(piece),
-                    char_start=body_start + cstart,
-                    char_end=body_start + cend,
+                    heading_path=heading_path,
+                    token_count=token_count,
+                    char_start=char_start,
+                    char_end=char_end,
+                    canonical_text=canonical_text,
+                    passage_hash=hashlib.sha256(canonical_text.encode("utf-8")).hexdigest(),
+                    article_id=context.article_id,
+                    article_label=context.article_label,
+                    article_start=context.article_start,
+                    clause=context.clause,
+                    clause_id=context.clause,
+                    subarticle=context.subarticle,
+                    chapter=context.chapter,
+                    parent_id=parent_id,
+                    clause_ids=context.clause_ids,
+                    subarticle_ids=context.subarticle_ids,
+                    article_start_chunk_index=article_start_chunk_index,
+                    parent_chunk_index=parent_chunk_index,
                 )
             )
             idx += 1

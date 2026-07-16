@@ -31,6 +31,7 @@ from ingest.integrity import (  # noqa: E402
     verify_generation_artifacts,
     write_verification_report,
 )
+from ingest.promotion import physical_collection_name  # noqa: E402
 from ingest.qdrant_store import make_client  # noqa: E402
 
 DEFAULT_PAGE_SIZE = 256
@@ -147,6 +148,12 @@ def verify_loaded_generation(
     max_examples: int = DEFAULT_MAX_EXAMPLES,
 ) -> VerificationReport:
     """Run compatibility and streamed point verification for loaded artifacts."""
+    expected_collection = physical_collection_name(artifacts.manifest.generation_id)
+    if collection_name != expected_collection:
+        raise ValueError(
+            "generation verification requires the exact physical collection "
+            f"{expected_collection!r}; got {collection_name!r}"
+        )
     compatibility = check_collection_compatibility(
         client,
         collection_name,
@@ -160,6 +167,7 @@ def verify_loaded_generation(
             page_size=page_size,
         ),
         max_examples=max_examples,
+        physical_collection=collection_name,
     )
     return _merge_compatibility(
         report,
@@ -200,7 +208,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--collection",
         default=None,
-        help="collection or alias to verify; defaults to COLLECTION_NAME",
+        help="exact physical generation collection; defaults to COLLECTION_NAME",
     )
     parser.add_argument("--page-size", type=int, default=DEFAULT_PAGE_SIZE)
     parser.add_argument("--max-examples", type=int, default=DEFAULT_MAX_EXAMPLES)
@@ -238,7 +246,7 @@ def main(argv: list[str] | None = None) -> int:
                 "ok": report.ok,
                 "generation_id": report.generation_id,
                 "manifest_sha256": report.manifest_sha256,
-                "collection": collection_name,
+                "physical_collection": collection_name,
                 "report": str(report_path),
             },
             sort_keys=True,
