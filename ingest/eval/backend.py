@@ -12,16 +12,22 @@ rerank, seconds). Two implementations:
 import math
 import time
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
-from ingest.retrieval import RetrievalRequest, execute_retrieval
+from ingest.config import retrieval_fingerprint
+from ingest.retrieval import (
+    RetrievalOutcome,
+    RetrievalRequest,
+    execute_accuracy_retrieval,
+    execute_retrieval,
+)
 
 from .bm25 import BM25Index, tokenize
 from .metrics import Hit
 
 MODES = ("bm25", "dense", "sparse", "hybrid", "rerank", "routed")
-PRODUCTION_MODES = ("production", "client_translated")
+PRODUCTION_MODES = ("production", "client_translated", "accuracy_strict")
 _RRF_K = 60
 
 
@@ -31,6 +37,29 @@ class ChunkRecord:
     document_id: str
     chunk_index: int
     text: str
+    version_id: str | None = None
+
+
+def _chunk_record_key(record: ChunkRecord) -> tuple:
+    if record.version_id is None:
+        return (record.source, record.document_id, record.chunk_index)
+    return (record.source, record.document_id, record.version_id, record.chunk_index)
+
+
+def _ranked_key_hit(key: tuple, score: float) -> Hit:
+    if len(key) == 3:
+        source, document_id, chunk_index = key
+        return Hit(source, document_id, int(chunk_index), float(score))
+    if len(key) == 4:
+        source, document_id, version_id, chunk_index = key
+        return Hit(
+            source,
+            document_id,
+            int(chunk_index),
+            float(score),
+            version_id=str(version_id),
+        )
+    raise ValueError(f"invalid evaluator chunk key: {key!r}")
 
 
 def _rrf_fuse(*rankings: Sequence) -> list:
@@ -50,9 +79,11 @@ class FakeBackend:
     token Jaccard. Distinct enough that the modes produce genuinely different rankings.
     """
 
+    supports_candidate_depth = True
+
     def __init__(self, records: Sequence[ChunkRecord]):
         self.records = list(records)
-        self.keys = [(r.source, r.document_id, r.chunk_index) for r in self.records]
+        self.keys = [_chunk_record_key(record) for record in self.records]
         toks = [tokenize(r.text) for r in self.records]
         n = len(toks) or 1
         df: Counter = Counter()
@@ -65,6 +96,8 @@ class FakeBackend:
         self.bm25 = BM25Index.from_pairs(
             [(k, r.text) for k, r in zip(self.keys, self.records)]
         )
+        self.last_candidate_hits = None
+        self.last_outcome = None
 
     def _to_dense(self, tf: Counter) -> dict:
         vec = {term: tf[term] * self._idf.get(term, 0.0) for term in tf}
@@ -73,7 +106,13 @@ class FakeBackend:
 
     def _hit(self, i: int, score: float) -> Hit:
         r = self.records[i]
-        return Hit(r.source, r.document_id, r.chunk_index, float(score))
+        return Hit(
+            r.source,
+            r.document_id,
+            r.chunk_index,
+            float(score),
+            version_id=r.version_id,
+        )
 
     def _dense_rank(self, q_dense: dict) -> list[int]:
         scored = [
@@ -95,13 +134,16 @@ class FakeBackend:
 
     def search(self, query: str, mode: str, k: int) -> tuple[list[Hit], dict[str, float]]:
         lat = {"embed": 0.0, "search": 0.0, "rerank": 0.0}
+        self.last_candidate_hits = None
 
         if mode == "bm25":
             t0 = time.perf_counter()
             ranked = self.bm25.search(query, k)  # [(key, score)]
             lat["search"] = time.perf_counter() - t0
             idx = {key: i for i, key in enumerate(self.keys)}
-            return [self._hit(idx[key], sc) for key, sc in ranked], lat
+            hits = [self._hit(idx[key], sc) for key, sc in ranked]
+            self.last_candidate_hits = list(hits)
+            return hits, lat
 
         t0 = time.perf_counter()
         q_toks = tokenize(query)
@@ -130,6 +172,10 @@ class FakeBackend:
             raise ValueError(f"unknown mode: {mode}")
         lat["search"] = time.perf_counter() - t0
 
+        # Candidate metrics are measured before cross-encoder/diversity truncation.
+        self.last_candidate_hits = [self._hit(i, 1.0 / (rank + 1))
+                                    for rank, i in enumerate(order)]
+
         if mode == "rerank":
             t0 = time.perf_counter()
             qset = set(q_toks)
@@ -153,12 +199,40 @@ class ProductionBackend:
     supplied artifact; it is never silently mixed into the direct production metrics.
     """
 
-    def __init__(self, cfg, client, embedder, reranker=None, *, translations=None):
+    supports_candidate_depth = True
+    # Serving outcomes already carry the ordered pre-rerank pool.  Asking this backend
+    # for 80 final hits would change the production request itself instead of merely
+    # collecting candidate-depth telemetry.
+    candidate_depth_via_native_trace = True
+
+    def __init__(
+        self,
+        cfg,
+        client,
+        embedder,
+        reranker=None,
+        *,
+        translations=None,
+        translator=None,
+        release_index_info: Mapping | None = None,
+    ):
         self.cfg = cfg
         self.client = client
         self.embedder = embedder
         self.reranker = reranker
         self.translations = translations or {}
+        if translator is None and translations:
+            from ingest.query_planner import StaticMappingTranslator
+
+            translator = StaticMappingTranslator(translations)
+        self.translator = translator
+        # Only the immutable release runner consumes this binding.  It must come from
+        # ``qdrant_deps`` after generation-sidecar and live-collection compatibility
+        # checks, and lets that runner derive provenance instead of trusting an
+        # independently supplied claim.
+        self.release_index_info = (
+            dict(release_index_info) if release_index_info is not None else None
+        )
         self.last_outcome = None
 
     @staticmethod
@@ -172,6 +246,8 @@ class ProductionBackend:
                     payload.get("document_id"),
                     payload.get("chunk_index", -1),
                     float(point.score),
+                    version_id=payload.get("version_id"),
+                    point_id=(str(point.id) if getattr(point, "id", None) is not None else None),
                 )
             )
         return hits
@@ -179,7 +255,72 @@ class ProductionBackend:
     def search(self, query: str, mode: str, k: int) -> tuple[list[Hit], dict[str, float]]:
         if mode not in PRODUCTION_MODES:
             raise ValueError(f"production backend does not implement ablation mode {mode!r}")
+        if mode == "accuracy_strict":
+            from ingest.query_planner import detect_supported_language
+
+            # The checked-in translation artifact is also an explicit language declaration
+            # for its English keys; this avoids re-detecting identifier-heavy eval queries.
+            language = (
+                "en" if query in self.translations else detect_supported_language(query).value
+            )
+            request = RetrievalRequest(
+                query=query,
+                requested_limit=k,
+                query_language=language,
+                route=True,
+                track=mode,
+            )
+            outcome = execute_accuracy_retrieval(
+                self.cfg,
+                self.client,
+                self.embedder,
+                self.reranker,
+                request,
+                translator=self.translator,
+                candidate_depth=80,
+            )
+            self.last_outcome = outcome
+            timings = {
+                "embed": 0.0,
+                "search": outcome.timings_ms.get("candidate_branches", 0.0) / 1000.0,
+                "rerank": outcome.timings_ms.get("rerank", 0.0) / 1000.0,
+            }
+            return self._hits(outcome.hits), timings
         if mode == "client_translated":
+            from ingest.query_planner import plan_query
+
+            query_plan = plan_query(query)
+            if (
+                query not in self.translations
+                and (
+                    not query_plan.answerable_language
+                    or query_plan.needs_translation
+                )
+            ):
+                # Authored/private translation is this track's defining dependency.  A
+                # silent original-query fallback would inflate a mixed, irreproducible
+                # metric, so retain the row as a degraded failure instead.
+                self.last_outcome = RetrievalOutcome(
+                    hits=(),
+                    timings_ms={"embed": 0.0, "search": 0.0, "rerank": 0.0, "total": 0.0},
+                    degraded=True,
+                    degraded_reason=(
+                        "unsupported_language"
+                        if not query_plan.answerable_language
+                        else "missing_authored_translation"
+                    ),
+                    service_abstention=True,
+                    abstention_reason=(
+                        "unsupported_language"
+                        if not query_plan.answerable_language
+                        else "translator_degraded"
+                    ),
+                    retrieval_fingerprint=retrieval_fingerprint(self.cfg),
+                    effective_route="translation_required",
+                    generation_id=getattr(self.cfg, "generation_id", None),
+                    track=mode,
+                )
+                return [], {"embed": 0.0, "search": 0.0, "rerank": 0.0}
             effective_query = self.translations.get(query, query)
         else:
             effective_query = query
@@ -211,6 +352,8 @@ class QdrantBackend:
     same chunk set the neural modes see.
     """
 
+    supports_candidate_depth = True
+
     def __init__(self, cfg, client, embedder, reranker=None, rerank_candidates: int | None = None,
                  *, fusion: str = "rrf", prefetch_limit: int | None = None,
                  hnsw_ef: int | None = None, rescore: bool | None = None,
@@ -237,6 +380,8 @@ class QdrantBackend:
         self.citation_route = citation_route  # I1: pin exact citation hits ("ids" | "full")
         self._bm25 = None  # BM25Index | FullCorpusBM25, built lazily in _ensure_bm25
         self._filter = None
+        self.last_candidate_hits = None
+        self.last_outcome = None
 
     @property
     def _diversity_on(self) -> bool:
@@ -305,7 +450,14 @@ class QdrantBackend:
         for p in points:
             pl = p.payload or {}
             hits.append(
-                Hit(pl.get("source"), pl.get("document_id"), pl.get("chunk_index", -1), float(p.score))
+                Hit(
+                    pl.get("source"),
+                    pl.get("document_id"),
+                    pl.get("chunk_index", -1),
+                    float(p.score),
+                    version_id=pl.get("version_id"),
+                    point_id=(str(p.id) if getattr(p, "id", None) is not None else None),
+                )
             )
         return hits
 
@@ -338,7 +490,20 @@ class QdrantBackend:
                 )
                 for pt in batch:
                     pl = pt.payload or {}
-                    key = (pl.get("source"), pl.get("document_id"), pl.get("chunk_index", -1))
+                    key = (
+                        (
+                            pl.get("source"),
+                            pl.get("document_id"),
+                            pl.get("version_id"),
+                            pl.get("chunk_index", -1),
+                        )
+                        if pl.get("version_id") is not None
+                        else (
+                            pl.get("source"),
+                            pl.get("document_id"),
+                            pl.get("chunk_index", -1),
+                        )
+                    )
                     pairs.append((key, pl.get("text") or ""))
                 if offset is None:
                     break
@@ -347,6 +512,8 @@ class QdrantBackend:
 
     def search(self, query: str, mode: str, k: int) -> tuple[list[Hit], dict[str, float]]:
         from qdrant_client import models
+
+        self.last_candidate_hits = None
 
         if self.translations:
             query = self.translations.get(query, query)
@@ -358,7 +525,9 @@ class QdrantBackend:
             t0 = time.perf_counter()
             ranked = bm25.search(query, k)
             lat["search"] = time.perf_counter() - t0
-            return [Hit(s, d, c, sc) for (s, d, c), sc in ranked], lat
+            hits = [_ranked_key_hit(key, score) for key, score in ranked]
+            self.last_candidate_hits = list(hits)
+            return hits, lat
 
         t0 = time.perf_counter()
         emb = self.embedder.encode_query(query)
@@ -418,12 +587,19 @@ class QdrantBackend:
                 points = res.points
         lat["search"] += time.perf_counter() - t0  # += : citation lookup time added above
 
+        # Preserve the pre-rerank candidate order for candidate recall@50/@80.  This is
+        # evaluation-only state and does not alter serving output.
+        self.last_candidate_hits = self._points_to_hits(points)
+
         if mode == "rerank" and self.reranker is not None and points:
             from ingest.search import rerank_points
 
             t0 = time.perf_counter()
             # Rerank the whole pool; final top_k is chosen by diversity (or [:k]) below.
-            points = rerank_points(self.reranker, query, points, top_k=len(points), min_score=None)
+            points = rerank_points(
+                self.reranker, query, points, top_k=len(points), min_score=None,
+                enrich_context=getattr(self.cfg, "rerank_context_enriched", False),
+            )
             lat["rerank"] = time.perf_counter() - t0
 
         if self._diversity_on:

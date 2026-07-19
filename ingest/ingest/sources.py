@@ -8,9 +8,33 @@ The scraped items use different field names per source (id is ``document_id`` /
 rest of the pipeline is source-agnostic.
 """
 
+import hashlib
+import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date as _date
+
+from .court_extract import (
+    EXTRACTOR_REVISION,
+    disposition_from_scraped_result,
+    extract_disposition_from_body,
+    extract_judges,
+)
+
+NORMALIZER_REVISION = "canonical-source-normalizer-v2"
+
+COURT_EXTRACTION_SOURCES = frozenset({"ecd", "supremecourt"})
+COURT_CANONICAL_FIELDS = (
+    "judges",
+    "judges_raw",
+    "reporting_judge",
+    "judge_extraction_confidence",
+    "disposition",
+    "disposition_source",
+    "disposition_confidence",
+    "disposition_mixed",
+    "court_extractor_revision",
+)
 
 _DATE_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})")
 _DMY_RE = re.compile(r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{4})\b")
@@ -44,6 +68,72 @@ STATUS_STEMS = (
     ("ასამოქმედებ", "pending"),     # ასამოქმედებელი — adopted, not yet in force
     ("ძალაში", "in_force"),         # ძალაში მყოფი — currently in force
 )
+
+_REGISTRATION_PLACEHOLDERS = frozenset(
+    {
+        "-",
+        "--",
+        "n/a",
+        "na",
+        "none",
+        "null",
+        "unknown",
+        "არ არის",
+        "არ აქვს",
+        "უცნობია",
+    }
+)
+
+
+def normalize_registration_code(value) -> str | None:
+    """Return a real registry code, mapping shared placeholders to ``None``.
+
+    Matsne uses ``000000000.00.00.000000`` for many unrelated historical acts.  Treating
+    it as a real value creates a false shared version lineage, so any punctuation-only or
+    all-zero identifier fails closed to null.
+    """
+    if value in (None, ""):
+        return None
+    text = str(value).strip()
+    if not text or text.lower() in _REGISTRATION_PLACEHOLDERS:
+        return None
+    alnum = "".join(char for char in text if char.isalnum())
+    if not alnum or not alnum.strip("0"):
+        return None
+    return text
+
+
+def _source_fingerprint(item: dict) -> str:
+    """SHA-256 fingerprint of the complete raw source record before normalization."""
+    material = json.dumps(
+        item,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def _string_tuple(value) -> tuple[str, ...]:
+    if value in (None, "", []):
+        return ()
+    values = value if isinstance(value, (list, tuple, set)) else [value]
+    return tuple(dict.fromkeys(str(item).strip() for item in values if str(item).strip()))
+
+
+def _optional_bool(value) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes"}:
+            return True
+        if lowered in {"0", "false", "no"}:
+            return False
+    return None
 
 
 def normalize_status(value) -> str | None:
@@ -111,6 +201,128 @@ def _parse_date(value):
 
 
 @dataclass(frozen=True)
+class PageBoundary:
+    """One exact half-open page range in a canonical document body."""
+
+    page: int
+    char_start: int
+    char_end: int
+
+    def to_dict(self) -> dict[str, int]:
+        return {
+            "page": self.page,
+            "char_start": self.char_start,
+            "char_end": self.char_end,
+        }
+
+
+def _page_boundaries(value: object, body: str) -> tuple[PageBoundary, ...]:
+    """Strictly parse ordered page coordinates emitted by PDF extractors."""
+
+    if value in (None, []):
+        return ()
+    if not isinstance(value, list):
+        raise ValueError("page_boundaries must be an array")
+    out: list[PageBoundary] = []
+    previous_end = 0
+    for index, raw in enumerate(value):
+        if not isinstance(raw, dict):
+            raise ValueError(f"page_boundaries[{index}] must be an object")
+        if set(raw) == {"page", "char_start", "char_end"}:
+            page_value = raw["page"]
+        elif set(raw) == {"page_number", "char_start", "char_end"}:
+            page_value = raw["page_number"]
+        else:
+            raise ValueError(
+                f"page_boundaries[{index}] must contain page/char_start/char_end"
+            )
+        start = raw["char_start"]
+        end = raw["char_end"]
+        if any(
+            isinstance(item, bool) or not isinstance(item, int)
+            for item in (page_value, start, end)
+        ):
+            raise ValueError(f"page_boundaries[{index}] values must be integers")
+        if page_value != index + 1:
+            raise ValueError("page_boundaries page numbers must be contiguous from one")
+        if start < previous_end or end < start or end > len(body):
+            raise ValueError(f"page_boundaries[{index}] range is invalid")
+        out.append(PageBoundary(page_value, start, end))
+        previous_end = end
+    return tuple(out)
+
+
+def remap_page_boundaries(
+    doc: "CanonicalDoc", canonical_text: str, clean_prefix
+) -> tuple[PageBoundary, ...]:
+    """Map raw extractor offsets through the exact hygiene transform.
+
+    ``clean_prefix`` must be the same deterministic cleaner used to produce
+    ``canonical_text``.  Prefix lengths preserve half-open offsets even when control
+    characters or NFC composition change the number of Unicode code points.
+    """
+
+    raw = doc.body_markdown
+    mapped = tuple(
+        PageBoundary(
+            boundary.page,
+            len(clean_prefix(raw[: boundary.char_start])),
+            len(clean_prefix(raw[: boundary.char_end])),
+        )
+        for boundary in doc.page_boundaries
+    )
+    if mapped and mapped[-1].char_end > len(canonical_text):
+        raise ValueError("canonical page boundaries escape the cleaned body")
+    for left, right in zip(mapped, mapped[1:], strict=False):
+        if left.char_end > right.char_start:
+            raise ValueError("canonical page boundaries overlap after hygiene")
+    return mapped
+
+
+def court_metadata_for_document(
+    source: str,
+    body: str,
+    promoted: dict | None = None,
+) -> dict[str, object]:
+    """Compute the complete revisioned court bundle for one canonical body."""
+
+    if source not in COURT_EXTRACTION_SOURCES:
+        return {
+            "judges": (),
+            "judges_raw": (),
+            "reporting_judge": None,
+            "judge_extraction_confidence": "low",
+            "disposition": "unknown",
+            "disposition_source": "none",
+            "disposition_confidence": "low",
+            "disposition_mixed": False,
+            "court_extractor_revision": None,
+        }
+
+    panel = extract_judges(body)
+    body_result = extract_disposition_from_body(body)
+    result = body_result
+    if source == "supremecourt":
+        raw_result = (promoted or {}).get("result")
+        scraped_result = disposition_from_scraped_result(
+            str(raw_result) if raw_result not in (None, "") else ""
+        )
+        if scraped_result.disposition != "unknown":
+            result = scraped_result
+    return {
+        "judges": panel.judges,
+        "judges_raw": panel.judges_raw,
+        "reporting_judge": panel.reporting_judge,
+        "judge_extraction_confidence": panel.confidence,
+        "disposition": result.disposition,
+        "disposition_source": result.disposition_source,
+        "disposition_confidence": result.disposition_confidence,
+        "disposition_mixed": result.disposition_mixed,
+        "court_extractor_revision": EXTRACTOR_REVISION,
+    }
+
+
+@dataclass(frozen=True)
 class CanonicalDoc:
     source: str
     document_id: str
@@ -150,6 +362,82 @@ class CanonicalDoc:
     extraction_status: str = "full_text"
     source_binary_url: str | None = None
     article_summary: str | None = None
+    # Reproducible source and temporal identity.  A derived ``version_id`` identifies the
+    # exact canonical body but does not claim a complete amendment lineage; callers must
+    # inspect ``version_lineage_complete`` before answering historical-law questions.
+    source_fingerprint: str | None = None
+    normalizer_revision: str = NORMALIZER_REVISION
+    version_id: str | None = None
+    version_id_kind: str = "derived"
+    supersedes: tuple[str, ...] = ()
+    effective_from: str | None = None
+    effective_to: str | None = None
+    repeal_date: str | None = None
+    consolidation_status: str | None = None
+    version_lineage_status: str = "unknown"
+    version_lineage_complete: bool = False
+    consolidated_dates: tuple[str, ...] = ()
+    official_url: str | None = None
+    official_binary_url: str | None = None
+    official_html_url: str | None = None
+    official_pdf_url: str | None = None
+    source_authority: str = "primary_official"
+    freshness_sla_met: bool | None = None
+    # Admission and page-coordinate provenance.  Incomplete TAS/Tbilisi Appeal rows are
+    # retained only in quarantine as non-authoritative summaries.  Paginated sources must
+    # carry exact ranges; HTML/DOCX/API sources explicitly say why coordinates are null.
+    admissible: bool = True
+    page_boundaries: tuple[PageBoundary, ...] = ()
+    page_coordinate_reason: str = "source_not_paginated"
+    # Deterministic court metadata.  These payload-only fields are populated for ECD and
+    # Supreme Court records and deliberately do not participate in retrieval identity.
+    judges: tuple[str, ...] = ()
+    judges_raw: tuple[str, ...] = ()
+    reporting_judge: str | None = None
+    judge_extraction_confidence: str = "low"
+    disposition: str = "unknown"
+    disposition_source: str = "none"
+    disposition_confidence: str = "low"
+    disposition_mixed: bool = False
+    court_extractor_revision: str | None = None
+
+
+def derived_version_id(doc: CanonicalDoc, canonical_text: str | None = None) -> str:
+    """Build an immutable version identity from source identity and exact canonical text."""
+    body = doc.body_markdown if canonical_text is None else canonical_text
+    material = {
+        "source": doc.source,
+        "document_id": doc.document_id,
+        "effective_from": doc.effective_from,
+        "effective_to": doc.effective_to,
+        "canonical_content_hash": hashlib.sha256(body.encode("utf-8")).hexdigest(),
+    }
+    blob = json.dumps(material, sort_keys=True, separators=(",", ":"))
+    return "derived:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def finalize_canonical_text(
+    doc: CanonicalDoc,
+    canonical_text: str,
+    *,
+    page_boundaries: tuple[PageBoundary, ...] | None = None,
+) -> CanonicalDoc:
+    """Bind a normalized document to the exact cleaned text used for hashes and offsets."""
+    version_id = doc.version_id
+    if doc.version_id_kind == "derived" or not version_id:
+        version_id = derived_version_id(doc, canonical_text)
+    court_metadata = court_metadata_for_document(
+        doc.source,
+        canonical_text,
+        doc.promoted,
+    )
+    return replace(
+        doc,
+        body_markdown=canonical_text,
+        version_id=version_id,
+        page_boundaries=(doc.page_boundaries if page_boundaries is None else page_boundaries),
+        **court_metadata,
+    )
 
 
 @dataclass(frozen=True)
@@ -174,6 +462,7 @@ class SourceSpec:
     promote_fields: tuple[str, ...] = ()     # raw item keys copied verbatim into payload
     consolidated_field: str | None = None        # bool item key: has consolidated versions
     consolidated_count_field: str | None = None  # int item key: number of consolidated versions
+    source_authority: str = "primary_official"
 
     def declared_keys(self) -> set[str]:
         """Every raw item key this spec reads — the schema-drift baseline of handled fields."""
@@ -186,6 +475,24 @@ class SourceSpec:
             "article_summary",
             "pdf_url",
             "docx_url",
+            "official_url",
+            "official_binary_url",
+            "official_html_url",
+            "official_pdf_url",
+            "version_id",
+            "supersedes",
+            "effective_from",
+            "effective_to",
+            "repeal_date",
+            "consolidation_status",
+            "version_lineage_complete",
+            "freshness_sla_met",
+            "consolidated_dates",
+            "admissible",
+            "source_authority",
+            "page_boundaries",
+            "page_coordinate_reason",
+            "pagination_reason",
         }
         for group in (self.id_fields, self.date_fields, self.title_fields, self.number_fields,
                       self.registration_fields, self.parties_fields, self.in_force_fields,
@@ -257,7 +564,22 @@ class SourceSpec:
                 except (TypeError, ValueError):
                     consolidated_count = None
 
+        consolidated_dates = tuple(
+            sorted(
+                {
+                    parsed
+                    for parsed in (_parse_date(value) for value in _string_tuple(item.get("consolidated_dates")))
+                    if parsed
+                }
+            )
+        )
+
         body_markdown = item.get("body_markdown") or ""
+        court_metadata = court_metadata_for_document(
+            self.source,
+            body_markdown,
+            promoted,
+        )
         raw_complete = item.get("content_complete")
         if isinstance(raw_complete, bool):
             content_complete = raw_complete
@@ -284,7 +606,98 @@ class SourceSpec:
             or ("full_text" if content_complete else "malformed")
         ).strip()
 
-        return CanonicalDoc(
+        source_url = self._first(item, self.url_fields)
+        source_url = str(source_url).strip() if source_url not in (None, "") else None
+        source_binary_url = self._first(
+            item, ("official_binary_url", "source_binary_url", "pdf_url", "docx_url")
+        )
+        source_binary_url = (
+            str(source_binary_url).strip()
+            if source_binary_url not in (None, "")
+            else None
+        )
+        official_url = self._first(item, ("official_url", "official_html_url")) or source_url
+        official_pdf_url = self._first(item, ("official_pdf_url", "pdf_url"))
+        if official_pdf_url in (None, "") and source_binary_url:
+            if source_binary_url.lower().split("?", 1)[0].endswith(".pdf"):
+                official_pdf_url = source_binary_url
+
+        page_boundaries = _page_boundaries(item.get("page_boundaries"), body_markdown)
+        binary_url = str(official_pdf_url or source_binary_url or "").lower().split("?", 1)[0]
+        is_paginated = binary_url.endswith(".pdf")
+        raw_pagination_reason = item.get("page_coordinate_reason")
+        if raw_pagination_reason in (None, ""):
+            raw_pagination_reason = item.get("pagination_reason")
+        if page_boundaries:
+            page_coordinate_reason = "exact_pdf_text"
+            if raw_pagination_reason not in (
+                None,
+                "",
+                page_coordinate_reason,
+                "exact_page_boundaries",
+            ):
+                raise ValueError("page coordinate reason conflicts with exact boundaries")
+        elif is_paginated:
+            page_coordinate_reason = "page_boundaries_unavailable"
+            if raw_pagination_reason not in (None, "", page_coordinate_reason):
+                raise ValueError("page coordinate reason conflicts with a paginated source")
+        else:
+            page_coordinate_reason = "source_not_paginated"
+            if raw_pagination_reason not in (None, "", page_coordinate_reason):
+                raise ValueError("non-paginated sources require source_not_paginated")
+
+        explicit_admissible = _optional_bool(item.get("admissible"))
+        admissible = content_complete if explicit_admissible is None else explicit_admissible
+        admissible = bool(admissible and content_complete)
+        source_authority = str(item.get("source_authority") or self.source_authority).strip()
+        summary_kind = content_kind in {
+            "article_summary",
+            "non_authoritative_summary",
+            "metadata_only",
+            "legacy_unlabeled",
+        }
+        if self.source in {"tas", "tbappeal"} and (not content_complete or summary_kind):
+            admissible = False
+            source_authority = "non_authoritative_summary"
+            content_kind = "non_authoritative_summary"
+        if is_paginated and not page_boundaries:
+            admissible = False
+
+        in_force_date = _parse_date(self._first(item, self.in_force_fields))
+        expiry_date = _parse_date(self._first(item, self.expiry_fields))
+        explicit_effective_from = _parse_date(item.get("effective_from"))
+        explicit_effective_to = _parse_date(item.get("effective_to"))
+        if explicit_effective_from:
+            effective_from = explicit_effective_from
+        elif self.source == "matsne":
+            # The rendered consolidated body is the newest switcher version.  This gives
+            # its best-known lower bound, while ``version_lineage_complete=False`` makes
+            # clear that prior canonical texts were not scraped.
+            effective_from = max(consolidated_dates, default=in_force_date)
+        else:
+            effective_from = _parse_date(date_raw)
+        effective_to = explicit_effective_to or expiry_date
+        repeal_date = _parse_date(item.get("repeal_date")) or expiry_date
+        consolidation_status = item.get("consolidation_status")
+        if consolidation_status in (None, ""):
+            if is_consolidated is True:
+                consolidation_status = "consolidated"
+            elif is_consolidated is False:
+                consolidation_status = "unconsolidated"
+            else:
+                consolidation_status = None
+        explicit_lineage_complete = _optional_bool(item.get("version_lineage_complete"))
+        if explicit_lineage_complete is None:
+            version_lineage_complete = self.source != "matsne"
+        else:
+            version_lineage_complete = explicit_lineage_complete
+        if version_lineage_complete:
+            lineage_status = "complete" if self.source == "matsne" else "not_applicable"
+        else:
+            lineage_status = "partial" if self.source == "matsne" else "unknown"
+
+        raw_version_id = item.get("version_id")
+        doc = CanonicalDoc(
             source=self.source,
             document_id=document_id,
             title=title,
@@ -293,14 +706,14 @@ class SourceSpec:
             language=language,
             document_type=doc_type,
             court=court,
-            source_url=self._first(item, self.url_fields),
+            source_url=source_url,
             document_number=str(number_raw).strip() if number_raw not in (None, "") else None,
-            registration_code=str(registration_raw).strip() if registration_raw not in (None, "") else None,
+            registration_code=normalize_registration_code(registration_raw),
             parties=self._parties(item, title),
             status=normalize_status(status_raw),
             status_raw=status_raw,
-            in_force_date=_parse_date(self._first(item, self.in_force_fields)),
-            expiry_date=_parse_date(self._first(item, self.expiry_fields)),
+            in_force_date=in_force_date,
+            expiry_date=expiry_date,
             body_markdown=body_markdown,
             extra=item,
             promoted=promoted,
@@ -309,15 +722,45 @@ class SourceSpec:
             content_kind=content_kind,
             content_complete=content_complete,
             extraction_status=extraction_status,
-            source_binary_url=self._first(
-                item, ("source_binary_url", "pdf_url", "docx_url")
-            ),
+            source_binary_url=source_binary_url,
             article_summary=(
                 str(item["article_summary"])
                 if item.get("article_summary") not in (None, "")
                 else None
             ),
+            source_fingerprint=_source_fingerprint(item),
+            version_id=(
+                str(raw_version_id).strip()
+                if raw_version_id not in (None, "")
+                else None
+            ),
+            version_id_kind="official" if raw_version_id not in (None, "") else "derived",
+            supersedes=_string_tuple(item.get("supersedes")),
+            effective_from=effective_from,
+            effective_to=effective_to,
+            repeal_date=repeal_date,
+            consolidation_status=(
+                str(consolidation_status).strip() if consolidation_status else None
+            ),
+            version_lineage_status=lineage_status,
+            version_lineage_complete=version_lineage_complete,
+            consolidated_dates=consolidated_dates,
+            official_url=str(official_url).strip() if official_url else None,
+            official_binary_url=source_binary_url,
+            official_html_url=str(official_url).strip() if official_url else None,
+            official_pdf_url=(
+                str(official_pdf_url).strip() if official_pdf_url else None
+            ),
+            source_authority=source_authority,
+            freshness_sla_met=_optional_bool(item.get("freshness_sla_met")),
+            admissible=admissible,
+            page_boundaries=page_boundaries,
+            page_coordinate_reason=page_coordinate_reason,
+            **court_metadata,
         )
+        if doc.version_id is None:
+            doc = replace(doc, version_id=derived_version_id(doc))
+        return doc
 
 
 SOURCES: dict[str, SourceSpec] = {
@@ -386,6 +829,7 @@ SOURCES: dict[str, SourceSpec] = {
         title_fields=("subject", "case_number"),
         number_fields=("case_number",),
         court="supremecourt",
+        promote_fields=("result", "appeal_type"),
     ),
     "tas": SourceSpec(
         source="tas",
@@ -413,8 +857,13 @@ SOURCES: dict[str, SourceSpec] = {
 PROMOTED_KEYWORD_FIELDS = (
     "applicant_personal_no", "applicant_passport", "applicant_phone",
     "executor_personal_no", "executor_phone", "applicant_birth_date",
+    "result", "appeal_type",
 )
 PROMOTED_TEXT_FIELDS = ("applicant_address", "address")
+
+# Only these legacy TAS values affect document-state identity.  Supreme Court's newly
+# promoted result/appeal metadata is payload-only and must never trigger re-embedding.
+STATEFUL_PROMOTED_FIELDS = SOURCES["tas"].promote_fields
 
 
 def normalize(source: str, item: dict) -> CanonicalDoc:

@@ -19,13 +19,15 @@ from ingest.generation import (
     load_manifest,
     validate_generation_id,
 )
+from ingest.qdrant_store import point_id
 
 GENERATION_ID = "20260713t120000z_core"
 HASH_A = "a" * 64
 HASH_B = "b" * 64
 HASH_C = "c" * 64
 REVISION = "d" * 40
-POINT_ID = "4b03e467-21f7-5a78-86bf-ecf595fb5b0a"
+VERSION_ID = "derived:" + "f" * 64
+POINT_ID = point_id("matsne", "doc-1", 0, version_id=VERSION_ID)
 
 
 def manifest_data(**overrides):
@@ -64,6 +66,7 @@ def manifest_data(**overrides):
             {"source": "matsne", "run_id": "20260713t100000z"},
             {"source": "tas", "run_id": "20260713t110000z"},
         ],
+        "retrieval_fingerprint_revision": 2,
         "retrieval_fingerprint": HASH_B,
         "code": {"git_sha": "e" * 40, "dirty_patch_sha256": None},
         "dependency": {"lock_sha256": HASH_C, "image_digest": None},
@@ -83,6 +86,7 @@ def document_data(*, excluded=False):
         "generation_id": GENERATION_ID,
         "source": "matsne",
         "document_id": "doc-1" if not excluded else "doc-excluded",
+        "version_id": VERSION_ID if not excluded else "derived:" + "e" * 64,
         "source_identity": HASH_A if not excluded else HASH_B,
         "content_hash": HASH_B,
         "document_state_hash": HASH_C,
@@ -103,6 +107,7 @@ def sample_data():
         "generation_id": GENERATION_ID,
         "source": "matsne",
         "document_id": "doc-1",
+        "version_id": VERSION_ID,
         "chunk_index": 0,
         "point_id": POINT_ID,
         "text_sha256": HASH_A,
@@ -214,6 +219,10 @@ def test_manifest_rejects_unknown_duplicate_and_mutable_identity_fields(tmp_path
 
 
 def test_manifest_requires_canonical_covered_runs_and_exact_counts():
+    legacy = manifest_data(schema_version=GENERATION_SCHEMA_VERSION - 1)
+    with pytest.raises(GenerationFormatError, match="unsupported generation schema_version"):
+        GenerationManifest.from_dict(legacy)
+
     missing_runs = manifest_data(covered_runs=[])
     with pytest.raises(GenerationFormatError, match="covered raw run"):
         GenerationManifest.from_dict(missing_runs)

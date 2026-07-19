@@ -62,7 +62,7 @@ DOWNLOADER_MIDDLEWARES = {
 # Enable or disable extensions
 # See https://docs.scrapy.org/en/latest/topics/extensions.html
 EXTENSIONS = {
-    "legal_scrapers.extensions.DurableDedupCommitExtension": 10,
+    "legal_scrapers.extensions.CompletionAttestationExtension": 10,
     "legal_scrapers.extensions.RotatingSpiderLogExtension": 20,
     "legal_scrapers.extensions.LiveProgressExtension": 100,
 }

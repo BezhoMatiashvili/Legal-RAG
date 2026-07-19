@@ -424,7 +424,10 @@ class TasDetailTests(unittest.TestCase):
         self.assertNotIn("decision", item)
         self.assertNotIn("applicant_name", item)
         self.assertNotIn("parcels", item)
-        self.assertEqual(item["content_kind"], "list_metadata")
+        self.assertEqual(item["content_kind"], "non_authoritative_summary")
+        self.assertFalse(item["admissible"])
+        self.assertEqual(item["source_authority"], "non_authoritative_summary")
+        self.assertEqual(item["quarantine_reason"], "list_metadata")
         self.assertFalse(item["content_complete"])
         self.assertEqual(item["extraction_status"], "malformed")
 
@@ -437,7 +440,9 @@ class TasDetailTests(unittest.TestCase):
         self.assertEqual(item["document_no"], "AR125755")
         self.assertNotIn("decision", item)
         self.assertNotIn("applicant_name", item)
-        self.assertEqual(item["content_kind"], "draft_metadata")
+        self.assertEqual(item["content_kind"], "non_authoritative_summary")
+        self.assertFalse(item["admissible"])
+        self.assertEqual(item["quarantine_reason"], "draft_metadata")
         self.assertFalse(item["content_complete"])
         self.assertEqual(item["extraction_status"], "malformed")
 
@@ -448,7 +453,9 @@ class TasDetailTests(unittest.TestCase):
 
         item = spider.build_item(_tas_list_record(), detail)
 
-        self.assertEqual(item["content_kind"], "detail_metadata")
+        self.assertEqual(item["content_kind"], "non_authoritative_summary")
+        self.assertFalse(item["admissible"])
+        self.assertEqual(item["quarantine_reason"], "missing_decision_text")
         self.assertFalse(item["content_complete"])
         self.assertEqual(item["extraction_status"], "malformed")
 

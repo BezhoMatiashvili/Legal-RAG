@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from eval import explog
 from eval.backend import QdrantBackend
 from ingest.config import load_config, retrieval_fingerprint
+from ingest.citations import RESOLUTION_SCAN_LIMIT
 from ingest.search import hybrid_search
 
 
@@ -64,17 +65,18 @@ def test_hybrid_search_no_citation_is_byte_identical():
     assert len(on.calls) == len(off.calls) == 1  # no extra lookup issued
 
 
-def test_hybrid_search_prepends_pinned_hit():
+def test_hybrid_search_prepends_identity_hit_without_score_pinning():
     sem = [_pt("s1", "A", 0, 0.9), _pt("s2", "B", 0, 0.8)]
     exact = [_pt("x1", "GOLD", 0, 0.001)]
     client = FakeQdrant(sem, filtered_points=exact)
     out = hybrid_search(_cfg("ids"), client, FakeEmb(), _CITE_Q, top_k=2)
     assert [p.id for p in out] == ["x1", "s1"]
-    assert out[0].score == 1.0
+    assert out[0].score == 0.001
+    assert out[0].payload["identity_priority"] is True
     assert client.calls[0].get("query_filter") is not None  # lookup ran first
 
 
-def test_hybrid_search_pins_survive_rerank_and_min_score():
+def test_hybrid_search_identity_priority_survives_rerank_and_min_score():
     sem = [_pt("s1", "A", 0, 0.9), _pt("s2", "B", 0, 0.8)]
     exact = [_pt("x1", "GOLD", 0, 0.001)]
     client = FakeQdrant(sem, filtered_points=exact)
@@ -85,7 +87,8 @@ def test_hybrid_search_pins_survive_rerank_and_min_score():
 
     out = hybrid_search(_cfg("ids"), client, FakeEmb(), _CITE_Q, top_k=2,
                         reranker=HostileReranker(), rerank_min_score=0.3)
-    assert out and out[0].id == "x1" and out[0].score == 1.0
+    assert out and out[0].id == "x1" and out[0].score == 0.001
+    assert out[0].payload["identity_priority"] is True
 
 
 def test_hybrid_search_empty_lookup_falls_through():
@@ -114,7 +117,7 @@ def test_backend_citation_route_pins_and_issues_filtered_call():
         _CITE_Q, "hybrid", 2)
     assert (hits[0].document_id, hits[0].chunk_index) == ("GOLD", 5)
     lookup = client.calls[0]
-    assert lookup["using"] == "dense" and lookup["limit"] == 3
+    assert lookup["using"] == "dense" and lookup["limit"] == RESOLUTION_SCAN_LIMIT
 
 
 def test_backend_citation_route_off_no_extra_calls():

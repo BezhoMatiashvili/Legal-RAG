@@ -212,9 +212,7 @@ def _write_resume_child(runs: Path, parent: Path) -> Path:
             },
             "resume_parent": {
                 "run_id": parent.name,
-                "manifest_file": str(
-                    (parent / "partial_manifest.json").absolute()
-                ),
+                "manifest_file": str((parent / "partial_manifest.json").absolute()),
                 "manifest_sha256": hashlib.sha256(
                     (parent / "partial_manifest.json").read_bytes()
                 ).hexdigest(),
@@ -416,7 +414,7 @@ def test_resume_chain_rejects_self_cycles_and_cursor_drift(tmp_path):
 @pytest.mark.parametrize(
     ("field", "bad_value", "match"),
     [
-        ("finish_reason", "finished", "four-hour timeout"),
+        ("finish_reason", "finished", "natural finish"),
         ("max_runtime_seconds", 14399, "14400"),
         ("partial_by_design", False, "partial_by_design"),
         ("finished_at", None, "final ISO timestamp"),
@@ -432,6 +430,28 @@ def test_final_timeout_manifest_is_mandatory(tmp_path, field, bad_value, match):
 
     with pytest.raises(validator.ValidationError, match=match):
         validator.validate_run(run)
+
+
+def test_natural_finish_requires_and_accepts_derived_terminal_exhaustion(tmp_path):
+    run, _rows, _journal = _write_run(tmp_path)
+    manifest = _manifest(run)
+    manifest["finish_reason"] = "finished"
+    manifest["elapsed_time_seconds"] = 3.5
+    for window in manifest["completed_windows"]:
+        window["start"] = "1900-01-01"
+    for chamber in CHAMBERS:
+        manifest["per_chamber"][chamber]["resume_cursor"] = None
+    manifest["per_chamber_resume_cursors"] = {chamber: None for chamber in CHAMBERS}
+    manifest["oldest_fully_completed_global_date_frontier"] = "1900-01-01"
+    _write_manifest(run, manifest)
+
+    report = validator.validate_run(run)
+
+    assert report["finish_reason"] == "finished"
+    assert report["oldest_fully_completed_global_date_frontier"] == "1900-01-01"
+    assert all(
+        cursor is None for cursor in report["per_chamber_resume_cursors"].values()
+    )
 
 
 def test_exact_items_sha_is_mandatory(tmp_path):

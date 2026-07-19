@@ -383,9 +383,7 @@ class TasSpider(BaseLegalSpider):
             # so it is safe to issue this bounded slice before listing pagination.
             for doc_id in self.iter_refresh_keys():
                 detail = await self._fetch_detail(page, doc_id)
-                if detail is None:
-                    continue
-                document = detail.get("document") or {}
+                document = (detail or {}).get("document") or {}
                 record = {
                     "documentId": doc_id,
                     "documentNo": document.get("documentNo"),
@@ -491,8 +489,6 @@ class TasSpider(BaseLegalSpider):
                         self.crawler.stats.inc_value("dedup/skipped")
                         continue
                     detail = await self._fetch_detail(page, record.get("documentId"))
-                    if detail is None:
-                        continue
                     yield self.build_item(record, detail)
                     await page.wait_for_timeout(self.DETAIL_DELAY_MS)
 
@@ -532,15 +528,17 @@ class TasSpider(BaseLegalSpider):
             )
             return None
         if not detail or not detail.get("ok"):
+            reason = str((detail or {}).get("reason") or "empty detail response")
             self.logger.info(
                 "tas: no detail for %s (%s)", doc_id, (detail or {}).get("reason")
             )
-            self.record_quality_failure(
-                "detail_fetch_failed",
-                DETAIL_URL.format(doc_id),
-                detail=str((detail or {}).get("reason") or "empty detail response"),
-                context={"document_id": doc_id},
-            )
+            if reason != "not-success":
+                self.record_quality_failure(
+                    "detail_fetch_failed",
+                    DETAIL_URL.format(doc_id),
+                    detail=reason,
+                    context={"document_id": doc_id},
+                )
             return None
         return detail
 
@@ -569,12 +567,19 @@ class TasSpider(BaseLegalSpider):
             # List-only item: detail unavailable or the draft was never submitted.
             loader.add_value(
                 "content_kind",
-                "draft_metadata"
-                if document.get("documentStatusId") == _DRAFT_STATUS_ID
-                else "list_metadata",
+                "non_authoritative_summary",
             )
             loader.add_value("content_complete", False)
             loader.add_value("extraction_status", "malformed")
+            loader.add_value("source_authority", "non_authoritative_summary")
+            loader.add_value("admissible", False)
+            quarantine_reason = (
+                "draft_metadata"
+                if document.get("documentStatusId") == _DRAFT_STATUS_ID
+                else "list_metadata"
+            )
+            loader.add_value("quarantine_reason", quarantine_reason)
+            self.record_quarantine(quarantine_reason)
             loader.add_value(
                 "body_markdown",
                 self._list_body(nomenclature, stadiums, record.get("address")),
@@ -615,12 +620,22 @@ class TasSpider(BaseLegalSpider):
         has_full_decision = bool(response_markdown and response_markdown.strip())
         loader.add_value(
             "content_kind",
-            "decision_full_text" if has_full_decision else "detail_metadata",
+            "decision_full_text"
+            if has_full_decision
+            else "non_authoritative_summary",
         )
         loader.add_value("content_complete", has_full_decision)
         loader.add_value(
             "extraction_status", "full_text" if has_full_decision else "malformed"
         )
+        loader.add_value(
+            "source_authority",
+            "primary_official" if has_full_decision else "non_authoritative_summary",
+        )
+        loader.add_value("admissible", has_full_decision)
+        if not has_full_decision:
+            loader.add_value("quarantine_reason", "missing_decision_text")
+            self.record_quarantine("missing_decision_text")
 
         loader.add_value("document_type_id", document.get("documentTypeId"))
         loader.add_value("deadline_date", deadline_iso)

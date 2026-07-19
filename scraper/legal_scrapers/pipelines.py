@@ -27,21 +27,51 @@ class DedupPipeline:
         if key is None:
             # Spider predates dedup support; pass everything through.
             return item
+        if not getattr(spider, "dedup_enabled", False) and not getattr(
+            spider, "evidence_crawl", False
+        ):
+            # Ordinary ``--no-dedup`` retains its historical pass-through behavior.
+            # Evidence mode is the sole dedup-disabled mode that still reconciles and
+            # suppresses duplicate identities within the current immutable run.
+            return item
 
         identity = spider.dedup_key(item)
         if identity is None:
-            # Dedup disabled or incomplete identity — never drop.
+            if getattr(spider, "evidence_crawl", False):
+                spider.record_evidence_identity_event("missing", None)
+                spider.crawler.stats.inc_value("within_run/missing_identity_count")
+                spider.record_quality_failure(
+                    "missing_item_identity",
+                    item.get("source_url") or item.get("document_url") or "",
+                    detail="evidence-crawl item has no complete DEDUP_KEY",
+                )
             return item
 
-        if spider.is_seen(item):
+        spider.crawler.stats.inc_value("within_run/observed_identity_count")
+        is_seen = getattr(spider, "is_seen", None)
+        already_seen = (
+            bool(is_seen(item))
+            if callable(is_seen)
+            else identity in getattr(spider, "_seen_keys", ())
+        )
+        if already_seen:
+            if getattr(spider, "evidence_crawl", False) or identity in getattr(
+                spider, "_within_run_keys", ()
+            ):
+                spider.record_evidence_identity_event("duplicate", identity)
+                spider.crawler.stats.inc_value("within_run/duplicate_identity_count")
             spider.crawler.stats.inc_value("dedup/dropped")
             raise DropItem(f"already scraped: {identity}")
 
         if not spider.stage_seen(item):
+            spider.record_evidence_identity_event("duplicate", identity)
+            spider.crawler.stats.inc_value("within_run/duplicate_identity_count")
             spider.crawler.stats.inc_value("dedup/dropped")
             raise DropItem(f"already staged: {identity}")
-        staged = spider._staged_dedup_records[identity]
-        if staged["outcome"] != "success":
+        spider.record_evidence_identity_event("unique", identity)
+        spider.crawler.stats.inc_value("within_run/unique_identity_count")
+        staged = spider._staged_dedup_records.get(identity)
+        if staged is not None and staged["outcome"] != "success":
             # Export the failure artifact for audit/quarantine, but leave it retryable.
             spider.crawler.stats.inc_value("dedup/staged_incomplete")
         return item
@@ -69,7 +99,15 @@ class SupremecourtDurablePipeline:
             )
             raise DropItem("Supreme Court item has incomplete identity")
 
-        if identity in spider._seen_keys:
+        spider.crawler.stats.inc_value("within_run/observed_identity_count")
+        is_seen = getattr(spider, "is_seen", None)
+        already_seen = (
+            bool(is_seen(item))
+            if callable(is_seen)
+            else identity in getattr(spider, "_seen_keys", ())
+        )
+        if already_seen:
+            spider.crawler.stats.inc_value("within_run/duplicate_identity_count")
             spider.crawler.stats.inc_value("dedup/dropped")
             spider.item_failed(
                 identity, "duplicate_after_detail", "identity became seen"
@@ -100,4 +138,5 @@ class SupremecourtDurablePipeline:
                 context={"identity": identity},
             )
         spider.item_persisted(identity)
+        spider.crawler.stats.inc_value("within_run/unique_identity_count")
         return item

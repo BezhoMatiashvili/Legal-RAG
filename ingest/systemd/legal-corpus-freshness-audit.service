@@ -1,0 +1,19 @@
+# Offline weekly audit.  Before enabling, create the owner-only report directory:
+#   install -d -m 700 ~/.local/state/georgia-legal-search/freshness-audits
+# and set LEGAL_SEARCH_REPO, LEGAL_CORPUS_GENERATION, and LEGAL_CORPUS_FRESHNESS_INPUT
+# in ~/.config/georgia-legal-search.env.  The generation and input are never modified.
+
+[Unit]
+Description=Georgian Legal RAG immutable corpus freshness audit
+
+[Service]
+Type=oneshot
+EnvironmentFile=%h/.config/georgia-legal-search.env
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateNetwork=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/state/georgia-legal-search/freshness-audits
+ExecStart=/usr/bin/bash -lc ': "${LEGAL_SEARCH_REPO:?set LEGAL_SEARCH_REPO}" "${LEGAL_CORPUS_GENERATION:?set LEGAL_CORPUS_GENERATION}" "${LEGAL_CORPUS_FRESHNESS_INPUT:?set LEGAL_CORPUS_FRESHNESS_INPUT}"; cd "$LEGAL_SEARCH_REPO/ingest"; exec .venv/bin/python scripts/audit_corpus_freshness.py "$LEGAL_CORPUS_GENERATION" "$LEGAL_CORPUS_FRESHNESS_INPUT" --report-dir "$HOME/.local/state/georgia-legal-search/freshness-audits"'

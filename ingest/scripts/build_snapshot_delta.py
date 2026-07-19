@@ -1,6 +1,10 @@
 #!/usr/bin/env python
 """Build an ADDITIVE snapshot delta (``snapshots/v2-delta/``) for specific document ids.
 
+LEGACY-ONLY: this preserves the frozen v1/v2 evaluation lineage and its historical
+``source:document:chunk`` Qdrant IDs. It is not a v3 immutable-generation snapshot writer;
+v3 uses ``ingest.generation_snapshot`` and version-scoped point identities.
+
 Snapshot v1 is frozen (its bodies anchor every golden-set span), but ~24k documents were
 scraped/embedded after it was built and exist only in Qdrant — whose chunk payloads cannot
 reproduce the exact ``body_markdown`` a gold span must anchor into. This script materializes
@@ -88,6 +92,7 @@ def fetch_payload_hashes(client, collection: str, id_map: dict[str, list[str]]) 
 
     out: dict[tuple[str, str], str] = {}
     for source, ids in id_map.items():
+        # Deliberately legacy: this script is pinned to the frozen v2 mutable collection.
         pids = {point_id(source, did, 0): did for did in ids}
         for batch_start in range(0, len(pids), 256):
             batch = list(pids)[batch_start : batch_start + 256]

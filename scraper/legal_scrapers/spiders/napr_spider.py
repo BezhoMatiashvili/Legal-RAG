@@ -327,6 +327,10 @@ class NaprSpider(BaseLegalSpider):
         fields["content_complete"] = result.content_complete
         fields["extraction_status"] = result.status.value
         fields["source_binary_url"] = response.url
+        fields["page_boundaries"] = [
+            boundary.as_dict() for boundary in result.page_boundaries
+        ]
+        fields["page_coordinate_reason"] = result.page_coordinate_reason
         yield self.load_item(fields)
 
     @staticmethod

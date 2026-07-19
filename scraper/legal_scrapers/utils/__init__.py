@@ -10,6 +10,8 @@ from .documents import (
     ExtractionLimits,
     ExtractionResult,
     ExtractionStatus,
+    PageBoundary,
+    PAGE_COORDINATE_REASON_EXACT_PDF_TEXT,
     docx_to_markdown,
     pdf_to_markdown,
 )
@@ -27,6 +29,8 @@ __all__ = [
     "ExtractionLimits",
     "ExtractionResult",
     "ExtractionStatus",
+    "PageBoundary",
+    "PAGE_COORDINATE_REASON_EXACT_PDF_TEXT",
     "form_post",
     "generate_random_user_agent",
     "generate_start_url_batches",

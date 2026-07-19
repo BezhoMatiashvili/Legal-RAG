@@ -1,6 +1,13 @@
 import pytest
 
-from ingest.sources import SOURCES, _parse_date, normalize, normalize_status
+from ingest.sources import (
+    NORMALIZER_REVISION,
+    SOURCES,
+    _parse_date,
+    normalize,
+    normalize_registration_code,
+    normalize_status,
+)
 
 
 @pytest.mark.parametrize(
@@ -49,6 +56,20 @@ def test_matsne_number_and_registration_and_date():
 
 
 @pytest.mark.parametrize(
+    "raw",
+    ["000000000.00.00.000000", "0", "00-00", "-", "N/A", "არ არის", "   "],
+)
+def test_placeholder_registration_codes_are_null(raw):
+    assert normalize_registration_code(raw) is None
+
+
+def test_real_registration_code_is_preserved():
+    assert normalize_registration_code("040.000.000.05.001.000.223") == (
+        "040.000.000.05.001.000.223"
+    )
+
+
+@pytest.mark.parametrize(
     "raw,canonical",
     [
         ("ძალაში მყოფი აქტები", "in_force"),
@@ -73,6 +94,25 @@ def test_matsne_status_and_force_dates_indexed():
     assert doc.status_raw == "ძალადაკარგული აქტები"
     assert doc.in_force_date == "2020-01-01"
     assert doc.expiry_date == "2024-06-03"
+
+
+def test_matsne_canonical_version_metadata_uses_latest_consolidation_date():
+    doc = normalize("matsne", {
+        "document_id": "111", "document_url": "https://matsne.gov.ge/ka/document/view/111",
+        "body_markdown": "კანონის ზუსტი ტექსტი", "entry_into_force_date": "01/01/2020",
+        "consolidated_dates": ["03/02/2021", "05/04/2024"],
+        "is_consolidated": True, "registration_code": "000000000.00.00.000000",
+    })
+    assert doc.registration_code is None
+    assert doc.version_id.startswith("derived:")
+    assert doc.effective_from == "2024-04-05"
+    assert doc.consolidation_status == "consolidated"
+    assert doc.version_lineage_status == "partial"
+    assert doc.version_lineage_complete is False
+    assert doc.normalizer_revision == NORMALIZER_REVISION
+    assert len(doc.source_fingerprint) == 64
+    assert doc.official_url.endswith("/111")
+    assert doc.source_authority == "primary_official"
 
 
 def test_non_matsne_sources_have_no_status():
@@ -131,7 +171,9 @@ def test_tas_number():
     assert doc.document_number == "AR11039800"
     assert doc.date == "2024-06-03"
     assert doc.content_complete is False
-    assert doc.content_kind == "legacy_unlabeled"
+    assert doc.content_kind == "non_authoritative_summary"
+    assert doc.admissible is False
+    assert doc.source_authority == "non_authoritative_summary"
     assert doc.extraction_status == "malformed"
 
 
@@ -154,7 +196,9 @@ def test_tbappeal_has_no_number():
     })
     assert doc.document_number is None
     assert doc.date == "2017-05-19"
-    assert doc.content_kind == "article_summary"
+    assert doc.content_kind == "non_authoritative_summary"
+    assert doc.admissible is False
+    assert doc.source_authority == "non_authoritative_summary"
     assert doc.content_complete is False
     assert doc.extraction_status == "malformed"
 
@@ -227,3 +271,69 @@ def test_missing_id_raises():
 
 def test_all_spiders_have_specs():
     assert set(SOURCES) == {"matsne", "ecd", "constcourt", "napr", "tbappeal", "supremecourt", "tas"}
+
+
+def test_pdf_page_boundaries_are_exact_admission_evidence():
+    body = "page one text\n\npage two text"
+    second = body.index("page two")
+    doc = normalize(
+        "napr",
+        {
+            "document_id": "pdf-1",
+            "source_url": "https://napr.example/1",
+            "pdf_url": "https://napr.example/1.pdf",
+            "body_markdown": body,
+            "content_complete": True,
+            "extraction_status": "full_text",
+            "page_boundaries": [
+                {"page_number": 1, "char_start": 0, "char_end": second - 2},
+                {"page_number": 2, "char_start": second, "char_end": len(body)},
+            ],
+            "page_coordinate_reason": "exact_pdf_text",
+        },
+    )
+
+    assert doc.admissible is True
+    assert doc.page_coordinate_reason == "exact_pdf_text"
+    assert [(row.page, row.char_start, row.char_end) for row in doc.page_boundaries] == [
+        (1, 0, second - 2),
+        (2, second, len(body)),
+    ]
+
+
+def test_complete_pdf_without_page_boundaries_is_not_admissible():
+    doc = normalize(
+        "napr",
+        {
+            "document_id": "pdf-2",
+            "source_url": "https://napr.example/2",
+            "pdf_url": "https://napr.example/2.pdf",
+            "body_markdown": "complete-looking PDF body",
+            "content_complete": True,
+            "extraction_status": "full_text",
+        },
+    )
+
+    assert doc.admissible is False
+    assert doc.page_boundaries == ()
+    assert doc.page_coordinate_reason == "page_boundaries_unavailable"
+
+
+@pytest.mark.parametrize("source,id_field", [("tas", "document_id"), ("tbappeal", "slug")])
+def test_incomplete_summary_is_explicitly_non_authoritative(source, id_field):
+    doc = normalize(
+        source,
+        {
+            id_field: "summary-1",
+            "source_url": "https://official.example/summary-1",
+            "body_markdown": "summary text",
+            "content_kind": "article_summary",
+            "content_complete": False,
+            "extraction_status": "malformed",
+        },
+    )
+
+    assert doc.admissible is False
+    assert doc.content_kind == "non_authoritative_summary"
+    assert doc.source_authority == "non_authoritative_summary"
+    assert doc.page_coordinate_reason == "source_not_paginated"

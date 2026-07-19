@@ -14,15 +14,18 @@ from pathlib import Path
 EVAL_DIR = Path(__file__).resolve().parent
 DEFAULT_LOG = EVAL_DIR / "experiments.jsonl"
 
-# Bump when the scoring logic changes in a way that makes old numbers incomparable.
-LOGIC_REV = "eval-r1"
+# Bump when scoring semantics change.  eval-r3 keeps legacy v1/v2 keys intact but makes
+# canonical v3 document/chunk identities version-scoped and requires observed candidate
+# recall for the strict accuracy track.
+LOGIC_REV = "eval-r3"
+SCHEMA_VERSION = "accuracy-eval/v2"
 
 
 def config_hash(material: dict) -> str:
-    """Stable 16-hex digest of the retrieval-relevant config."""
+    """Stable full SHA-256 of the retrieval-relevant configuration."""
     payload = {"logic_rev": LOGIC_REV, **material}
     blob = json.dumps(payload, sort_keys=True, ensure_ascii=False)
-    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
 def now_iso() -> str:

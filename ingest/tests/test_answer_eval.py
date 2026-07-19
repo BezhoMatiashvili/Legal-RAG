@@ -19,12 +19,21 @@ from eval.answer_eval import (
     span_coverage_at_k,
     top1_doc,
     top1_score,
+    top1_top2_margin,
+    top2_score,
 )
 from eval.goldset import GoldQuery
 from eval.metrics import Hit
 
 
-def _gold(qid="q1", qtype="legal_citation", lang="ka", gsrc="matsne", gdoc="D1") -> GoldQuery:
+def _gold(
+    qid="q1",
+    qtype="legal_citation",
+    lang="ka",
+    gsrc="matsne",
+    gdoc="D1",
+    gversion=None,
+) -> GoldQuery:
     return GoldQuery(
         id=qid,
         query="…",
@@ -34,11 +43,18 @@ def _gold(qid="q1", qtype="legal_citation", lang="ka", gsrc="matsne", gdoc="D1")
         document_id=gdoc,
         gold_source=gsrc,
         gold_document_id=gdoc,
+        gold_version_id=gversion,
     )
 
 
-def _hit(doc="D1", chunk=0, score=0.9, source="matsne") -> Hit:
-    return Hit(source=source, document_id=doc, chunk_index=chunk, score=score)
+def _hit(doc="D1", chunk=0, score=0.9, source="matsne", version=None) -> Hit:
+    return Hit(
+        source=source,
+        document_id=doc,
+        chunk_index=chunk,
+        score=score,
+        version_id=version,
+    )
 
 
 # ---- citation-identity ------------------------------------------------------------------
@@ -83,6 +99,20 @@ def test_source_is_part_of_identity():
     assert identity_at_1(hits, _gold(gsrc="matsne", gdoc="D1")) is False
 
 
+def test_canonical_version_is_part_of_answer_identity_and_span_coverage():
+    wrong = [_hit("D1", 0, version="v-repealed")]
+    gold = _gold(gdoc="D1", gversion="v-current")
+    groups = {"rule": {("matsne", "D1", "v-current", 0)}}
+    assert top1_doc(wrong) == ("matsne", "D1", "v-repealed")
+    assert identity_at_1(wrong, gold) is False
+    assert identity_at_k(wrong, gold) is False
+    assert span_coverage_at_k(wrong, groups) == 0.0
+
+    correct = [_hit("D1", 0, version="v-current")]
+    assert identity_at_1(correct, gold) is True
+    assert span_coverage_at_k(correct, groups) == 1.0
+
+
 # ---- context-sufficiency / answerability@k ----------------------------------------------
 
 
@@ -105,6 +135,19 @@ def test_span_coverage_respects_k():
     gold_chunks = {("matsne", "D1", 0)}
     assert span_coverage_at_k(hits, gold_chunks, k=2) == 0.0
     assert span_coverage_at_k(hits, gold_chunks, k=3) == 1.0
+
+
+def test_span_alternative_chunks_form_one_required_evidence_group():
+    hits = [_hit("D1", 1)]
+    groups = {
+        "operative-rule": {
+            ("matsne", "D1", 0),
+            ("matsne", "D1", 1),
+            ("matsne", "D1", 2),
+        }
+    }
+    assert span_coverage_at_k(hits, groups, k=10) == 1.0
+    assert fully_grounded_at_k(hits, groups, k=10) is True
 
 
 # ---- per-query + aggregation ------------------------------------------------------------
@@ -231,3 +274,68 @@ def test_aggregate_includes_confident_wrong_and_mean_score():
     agg = aggregate_answer_scores(scores)
     assert agg["known_item_confident_wrong"] == 0.5           # q1 confident-wrong, q2 correct
     assert abs(agg["mean_top1_score"] - 0.97) < 1e-9
+
+
+# ---- top1/top2 margin (doc-reduced, not raw chunk hits) ---------------------------------
+
+
+def test_top2_score_is_doc_reduced_not_chunk_reduced():
+    # Two chunks of the SAME top document must not read as a "second candidate" — the real
+    # second candidate is D2, scored lower.
+    hits = [_hit("D1", 0, score=0.95), _hit("D1", 1, score=0.93), _hit("D2", 0, score=0.40)]
+    assert top2_score(hits) == 0.40
+    assert abs(top1_top2_margin(hits) - (0.95 - 0.40)) < 1e-9
+
+
+def test_top2_score_and_margin_with_fewer_than_two_docs():
+    hits = [_hit("D1", 0, score=0.95), _hit("D1", 1, score=0.90)]  # only one distinct doc
+    assert top2_score(hits) == 0.0
+    assert top1_top2_margin(hits) == 0.95  # no competing doc → margin reads as maximal
+    assert top2_score([]) == 0.0
+    assert top1_top2_margin([]) == 0.0
+
+
+def test_margin_separates_tight_wrong_from_wide_correct():
+    hits_wrong_tight = [_hit("WRONG", 0, score=0.93), _hit("D1", 0, score=0.92)]  # gold D1 barely 2nd
+    hits_correct_wide = [_hit("D1", 0, score=0.99), _hit("OTHER", 0, score=0.30)]
+    assert top1_top2_margin(hits_wrong_tight) < top1_top2_margin(hits_correct_wide)
+
+
+def test_aggregate_reports_margin_by_confidence_and_correctness():
+    # q1: confident + wrong, tight margin. q2: confident + correct, wide margin.
+    scores = [
+        score_answer(
+            _gold("q1", "legal_citation", gdoc="D1"),
+            [_hit("WRONG", 0, score=0.95), _hit("D1", 0, score=0.94)],
+            set(), threshold=0.92,
+        ),
+        score_answer(
+            _gold("q2", "legal_citation", gdoc="D2"),
+            [_hit("D2", 0, score=0.98), _hit("OTHER", 0, score=0.20)],
+            set(), threshold=0.92,
+        ),
+    ]
+    agg = aggregate_answer_scores(scores)
+    assert agg["n_confident_wrong"] == 1
+    assert agg["n_confident_correct"] == 1
+    assert abs(agg["mean_margin_confident_wrong"] - 0.01) < 1e-9
+    assert abs(agg["mean_margin_confident_correct"] - 0.78) < 1e-9
+    assert agg["mean_margin_confident_wrong"] < agg["mean_margin_confident_correct"]
+
+
+def test_margin_aggregation_uses_the_score_specific_threshold():
+    scores = [
+        score_answer(
+            _gold("q1", "legal_citation", gdoc="D1"),
+            [_hit("WRONG", 0, score=0.60), _hit("D1", 0, score=0.55)],
+            set(), threshold=0.50,
+        ),
+        score_answer(
+            _gold("q2", "legal_citation", gdoc="D2"),
+            [_hit("D2", 0, score=0.70), _hit("OTHER", 0, score=0.20)],
+            set(), threshold=0.50,
+        ),
+    ]
+    agg = aggregate_answer_scores(scores)
+    assert agg["n_confident_wrong"] == 1
+    assert agg["n_confident_correct"] == 1

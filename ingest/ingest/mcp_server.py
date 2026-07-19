@@ -28,6 +28,7 @@ import logging
 import os
 import signal
 import time
+from dataclasses import asdict
 from collections import OrderedDict
 from collections.abc import Callable
 from enum import Enum
@@ -44,10 +45,31 @@ from .collection_compatibility import (
     check_collection_compatibility,
     require_config_manifest_compatibility,
 )
-from .config import Config, load_config, retrieval_fingerprint
-from .generation import GenerationManifest, load_generation
+from .config import (
+    Config,
+    load_config,
+    retrieval_fingerprint,
+    retrieval_fingerprint_sha256,
+)
+from .court_extract import (
+    DISPOSITION_VALUES,
+    EXTRACTOR_REVISION,
+    normalize_judge_key,
+)
+from .court_extraction_trust import evaluate_court_extraction_trust
+from .freshness import VerifiedFreshnessGuard
+from .generation import MANIFEST_FILENAME, GenerationManifest, load_generation
+from .legal_answer import (
+    DEFAULT_EVIDENCE_TOKENS,
+    STRICT_PROMPT_VERSION,
+    AnswerOutcome,
+    LegalAnswerService,
+    fail_closed_answer_result,
+)
+from .model_policy import LicenseAttestation, ModelRole
 from .querylog import append_query_log, build_query_record
 from .retrieval import RetrievalRequest, TemporalContext, execute_retrieval
+from .risk_calibration import CalibrationBinding, HeldOutRiskCalibrator
 from .search import build_filter, detect_language
 from .sources import SOURCES
 
@@ -70,6 +92,12 @@ _reranker_lock = asyncio.Lock()
 _generation_manifest: GenerationManifest | None = None
 _generation_root: Path | None = None
 _worker_readiness_probe: Callable[[], dict] | None = None
+_answer_translator = None
+_answer_composer = None
+_answer_calibrator = None
+_answer_freshness_guard: VerifiedFreshnessGuard | None = None
+_retriever_license_attestation: LicenseAttestation | None = None
+_reranker_license_attestation: LicenseAttestation | None = None
 
 # The embed+rerank path holds the BGE-M3 + cross-encoder working set (~4.6 GB) and is
 # CPU-bound. On this RAM-tight box two concurrent searches co-thrash into swap and each
@@ -99,7 +127,85 @@ def _configured_generation_manifest(cfg: Config) -> GenerationManifest | None:
     return _generation_manifest
 
 
-def _install_verified_worker_runtime(cfg: Config, readiness_probe: Callable[[], dict]) -> None:
+def _validate_retrieval_attestation(
+    cfg: Config,
+    attestation: LicenseAttestation,
+    *,
+    role: ModelRole,
+) -> None:
+    if not isinstance(attestation, LicenseAttestation):
+        raise ValueError(f"production {role.value} license attestation is required")
+    attestation.validate()
+    if role is ModelRole.EMBEDDER:
+        model_id = cfg.embed_model
+        revision = cfg.embedding_revision
+    else:
+        model_id = cfg.rerank_model
+        revision = cfg.reranker_revision
+    expected_version = f"{model_id}@{revision}" if revision else None
+    if (
+        attestation.role is not role
+        or attestation.model_id != model_id
+        or attestation.revision != revision
+        or attestation.version != expected_version
+    ):
+        raise ValueError(
+            f"production {role.value} attestation does not match configured "
+            "role/model/revision/version"
+        )
+    if not attestation.production_eligible:
+        raise ValueError(
+            f"production {role.value} lacks a commercial/private license attestation"
+        )
+
+
+def _resolve_retrieval_attestations(
+    cfg: Config,
+    *,
+    retriever_attestation: LicenseAttestation | None,
+    reranker_attestation: LicenseAttestation | None,
+) -> tuple[LicenseAttestation, LicenseAttestation]:
+    provided = (retriever_attestation, reranker_attestation)
+    if all(value is None for value in provided):
+        provided = (
+            _retriever_license_attestation,
+            _reranker_license_attestation,
+        )
+    if any(value is None for value in provided):
+        raise ValueError(
+            "production runtime requires retriever and reranker license attestations"
+        )
+    retriever, reranker = provided
+    assert retriever is not None and reranker is not None
+    _validate_retrieval_attestation(cfg, retriever, role=ModelRole.EMBEDDER)
+    _validate_retrieval_attestation(cfg, reranker, role=ModelRole.RERANKER)
+    if (
+        _retriever_license_attestation is not None
+        and _retriever_license_attestation != retriever
+    ) or (
+        _reranker_license_attestation is not None
+        and _reranker_license_attestation != reranker
+    ):
+        raise RuntimeError("retrieval license attestations are already installed")
+    return retriever, reranker
+
+
+def _require_retrieval_attestations(cfg: Config) -> None:
+    if cfg.production_mode:
+        _resolve_retrieval_attestations(
+            cfg,
+            retriever_attestation=None,
+            reranker_attestation=None,
+        )
+
+
+def _install_verified_worker_runtime(
+    cfg: Config,
+    readiness_probe: Callable[[], dict],
+    *,
+    retriever_attestation: LicenseAttestation,
+    reranker_attestation: LicenseAttestation,
+) -> None:
     """Install handler-owned config/readiness before any worker singleton is used.
 
     The environment flag alone is intentionally insufficient: only the serverless handler
@@ -107,16 +213,206 @@ def _install_verified_worker_runtime(cfg: Config, readiness_probe: Callable[[], 
     the normal checksummed-generation readiness path.
     """
     global _cfg, _worker_readiness_probe
+    global _retriever_license_attestation, _reranker_license_attestation
     if not cfg.production_mode or not cfg.verified_worker_binding:
         raise ValueError("worker runtime requires a verified production binding")
     if not callable(readiness_probe):
         raise TypeError("readiness_probe must be callable")
     if any(value is not None for value in (_client, _embedder, _reranker)):
-        raise RuntimeError("worker runtime must be installed before clients or models load")
+        raise RuntimeError(
+            "worker runtime must be installed before clients or models load"
+        )
     if _worker_readiness_probe is not None:
         raise RuntimeError("worker runtime is already installed")
+    retrieval_attestations = _resolve_retrieval_attestations(
+        cfg,
+        retriever_attestation=retriever_attestation,
+        reranker_attestation=reranker_attestation,
+    )
     _cfg = cfg
     _worker_readiness_probe = readiness_probe
+    (
+        _retriever_license_attestation,
+        _reranker_license_attestation,
+    ) = retrieval_attestations
+
+
+def _expected_calibration_binding(
+    cfg: Config, *, translator: object, composer: object
+) -> CalibrationBinding:
+    if not cfg.generation_id:
+        raise ValueError("production calibration requires an immutable generation_id")
+    if not cfg.embedding_revision:
+        raise ValueError("production calibration requires a pinned retriever revision")
+    if not cfg.reranker_revision:
+        raise ValueError("production calibration requires a pinned reranker revision")
+    translator_version = getattr(translator, "version", None)
+    generator_version = getattr(composer, "version", None)
+    if not isinstance(translator_version, str) or not translator_version.strip():
+        raise ValueError("production calibration requires a pinned translator version")
+    if not isinstance(generator_version, str) or not generator_version.strip():
+        raise ValueError("production calibration requires a pinned generator version")
+    return CalibrationBinding(
+        generation_id=cfg.generation_id,
+        retriever=f"{cfg.embed_model}@{cfg.embedding_revision}",
+        reranker=f"{cfg.rerank_model}@{cfg.reranker_revision}",
+        translator=translator_version,
+        generator=generator_version,
+        prompt=STRICT_PROMPT_VERSION,
+        config_sha256=retrieval_fingerprint_sha256(cfg),
+    )
+
+
+def _require_provider_attestation(
+    provider: object, *, role: ModelRole, label: str
+) -> None:
+    attestation = getattr(provider, "license_attestation", None)
+    if not isinstance(attestation, LicenseAttestation):
+        raise ValueError(
+            f"{label} lacks a production-eligible commercial/private license attestation"
+        )
+    try:
+        attestation.validate_provider(provider, expected_role=role)
+    except ValueError as exc:
+        raise ValueError(f"{label} license attestation identity mismatch: {exc}") from exc
+    if not attestation.production_eligible:
+        raise ValueError(
+            f"{label} lacks a production-eligible commercial/private license attestation"
+        )
+
+
+def _install_answer_runtime(
+    *,
+    translator=None,
+    composer=None,
+    calibrator=None,
+    freshness_guard: VerifiedFreshnessGuard | None = None,
+    retriever_attestation: LicenseAttestation | None = None,
+    reranker_attestation: LicenseAttestation | None = None,
+) -> None:
+    """Install private, pinned answer-stage providers before the first ``legal_ask``.
+
+    The repository deliberately ships no implicit external provider.  A deployment must
+    inject its private translator/generator and held-out calibrator; missing components
+    produce a structured abstention rather than sending legal text off infrastructure.
+    """
+
+    global _answer_translator, _answer_composer, _answer_calibrator
+    global _answer_freshness_guard
+    global _retriever_license_attestation, _reranker_license_attestation
+    if any(
+        value is not None
+        for value in (
+            _answer_translator,
+            _answer_composer,
+            _answer_calibrator,
+            _answer_freshness_guard,
+        )
+    ):
+        raise RuntimeError("answer runtime is already installed")
+    cfg = _get_cfg()
+    retrieval_attestations: tuple[LicenseAttestation, LicenseAttestation] | None = None
+    for role, provider in (
+        ("translator", translator),
+        ("composer", composer),
+        ("calibrator", calibrator),
+    ):
+        if provider is not None and not str(getattr(provider, "version", "")).strip():
+            raise ValueError(f"{role} must expose a pinned non-empty version")
+    if cfg.production_mode:
+        retrieval_attestations = _resolve_retrieval_attestations(
+            cfg,
+            retriever_attestation=retriever_attestation,
+            reranker_attestation=reranker_attestation,
+        )
+        if translator is not None:
+            _require_provider_attestation(
+                translator, role=ModelRole.TRANSLATOR, label="translator"
+            )
+        if composer is not None:
+            _require_provider_attestation(
+                composer, role=ModelRole.GENERATOR, label="composer"
+            )
+        if calibrator is not None and not isinstance(calibrator, HeldOutRiskCalibrator):
+            raise ValueError(
+                "calibrator must be a checksum-verified HeldOutRiskCalibrator"
+            )
+        answer_providers = (translator, composer, calibrator)
+        if any(provider is not None for provider in answer_providers) and any(
+            provider is None for provider in answer_providers
+        ):
+            raise ValueError(
+                "production answer runtime requires translator, composer, and calibrator together"
+            )
+        if calibrator is not None:
+            if calibrator.artifact_hash_verified is not True:
+                raise ValueError(
+                    "calibrator artifact hash must be verified from immutable artifact bytes"
+                )
+            expected_binding = _expected_calibration_binding(
+                cfg, translator=translator, composer=composer
+            )
+            if calibrator.artifact.pipeline_binding != expected_binding:
+                raise ValueError(
+                    "calibrator artifact pipeline binding does not match the active runtime"
+                )
+    if freshness_guard is not None:
+        if not isinstance(freshness_guard, VerifiedFreshnessGuard):
+            raise ValueError(
+                "freshness_guard must be a checksum-bound VerifiedFreshnessGuard"
+            )
+        if freshness_guard.generation_id != cfg.generation_id:
+            raise ValueError(
+                "freshness_guard generation does not match configured generation"
+            )
+        expected_manifest_sha256: str | None = None
+        if cfg.generation_dir is not None:
+            artifacts = load_generation(cfg.generation_dir)
+            if artifacts.manifest.generation_id != cfg.generation_id:
+                raise ValueError(
+                    "configured generation directory does not match configured generation"
+                )
+            expected_manifest_sha256 = artifacts.checksums.files.get(MANIFEST_FILENAME)
+        elif cfg.verified_worker_binding:
+            if _worker_readiness_probe is None:
+                raise ValueError(
+                    "verified worker freshness guard requires an installed readiness probe"
+                )
+            readiness = _worker_readiness_probe()
+            if not isinstance(readiness, dict) or readiness.get("ok") is not True:
+                raise ValueError(
+                    "verified worker readiness did not prove the active generation"
+                )
+            if readiness.get("generation_id") != cfg.generation_id:
+                raise ValueError(
+                    "worker readiness generation does not match configured generation"
+                )
+            expected_manifest_sha256 = readiness.get("generation_manifest_sha256")
+        if cfg.production_mode:
+            if (
+                not isinstance(expected_manifest_sha256, str)
+                or len(expected_manifest_sha256) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in expected_manifest_sha256
+                )
+            ):
+                raise ValueError(
+                    "production freshness guard requires an exact active manifest hash"
+                )
+            if freshness_guard.active_manifest_sha256 != expected_manifest_sha256:
+                raise ValueError(
+                    "freshness_guard manifest does not match active production generation"
+                )
+    _answer_translator = translator
+    _answer_composer = composer
+    _answer_calibrator = calibrator
+    _answer_freshness_guard = freshness_guard
+    if retrieval_attestations is not None:
+        (
+            _retriever_license_attestation,
+            _reranker_license_attestation,
+        ) = retrieval_attestations
 
 
 def _local_readiness(cfg: Config, client) -> dict:
@@ -219,7 +515,14 @@ _result_cache: "OrderedDict[str, tuple[float, str]]" = OrderedDict()
 def _cache_key(cfg: Config, params) -> str:
     material = params.model_dump(mode="json")
     material["__fp"] = retrieval_fingerprint(cfg)
-    return json.dumps(material, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    # Fingerprint revision 2 intentionally excludes storage routing.  A cache entry must
+    # still be scoped to the exact corpus generation and queried Qdrant target so an alias
+    # move or a direct physical-generation request can never reuse another corpus' result.
+    material["__generation_id"] = cfg.generation_id
+    material["__collection_target"] = cfg.collection_name
+    return json.dumps(
+        material, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+    )
 
 
 def _cache_get(cfg: Config, key: str) -> str | None:
@@ -272,6 +575,7 @@ def _get_client():
 async def _get_embedder():
     """Load BGE-M3 once, off the event loop (the import + model load is blocking)."""
     global _embedder
+    _require_retrieval_attestations(_get_cfg())
     if _embedder is None:
         async with _embedder_lock:
             if _embedder is None:
@@ -287,6 +591,7 @@ async def _get_reranker():
     the event loop. ``None`` if reranking is disabled."""
     global _reranker
     cfg = _get_cfg()
+    _require_retrieval_attestations(cfg)
     if not cfg.rerank_enabled:
         return None
     if _reranker is None:
@@ -325,12 +630,16 @@ def _get_remote_client():
 
         cfg = _get_cfg()
         _remote_client = RunPodQueueClient(
-            cfg.runpod_endpoint_id or "", cfg.runpod_api_key or "",
-            timeout=cfg.runpod_api_timeout)
+            cfg.runpod_endpoint_id or "",
+            cfg.runpod_api_key or "",
+            timeout=cfg.runpod_api_timeout,
+        )
     return _remote_client
 
 
-async def _remote_op(op: str, params: dict | None = None) -> str:
+async def _remote_op(
+    op: str, params: dict | None = None, *, propagate_errors: bool = False
+) -> str:
     """One RPC to the serverless worker. The worker runs the same tool coroutine, so its
     output string IS this tool's output string. Errors come back as actionable text; there
     is deliberately NO silent fallback to the local path — loading models locally is
@@ -340,6 +649,8 @@ async def _remote_op(op: str, params: dict | None = None) -> str:
         out = await asyncio.to_thread(_get_remote_client().call, op, params or {})
         return out.get("result") or ""
     except Exception as e:  # noqa: BLE001 - surface an actionable message to the agent
+        if propagate_errors:
+            raise
         return _remote_error_text(e)
 
 
@@ -357,7 +668,8 @@ def _publish_manifest(cfg: Config) -> dict | None:
     """The locally-mirrored publish manifest — what data the worker should be serving."""
     try:
         return json.loads(
-            (cfg.state_dir / "publish" / "manifest.json").read_text(encoding="utf-8"))
+            (cfg.state_dir / "publish" / "manifest.json").read_text(encoding="utf-8")
+        )
     except (OSError, json.JSONDecodeError):
         return None
 
@@ -385,8 +697,11 @@ def _hit_dict(hit) -> dict:
     """Full payload of a search hit, plus its fusion score, for JSON output."""
     p = hit.payload or {}
     return {
+        "point_id": str(getattr(hit, "id", "") or "") or None,
         "score": round(hit.score, 4),
+        "generation_id": p.get("generation_id"),
         "source": p.get("source"),
+        "source_authority": p.get("source_authority"),
         "document_id": p.get("document_id"),
         "document_number": p.get("document_number"),
         "registration_code": p.get("registration_code"),
@@ -399,13 +714,41 @@ def _hit_dict(hit) -> dict:
         "date": p.get("date_raw"),
         "language": p.get("language"),
         "court": p.get("court"),
+        "judges": p.get("judges"),
+        "judges_raw": p.get("judges_raw"),
+        "reporting_judge": p.get("reporting_judge"),
+        "judge_extraction_confidence": p.get("judge_extraction_confidence"),
+        "disposition": p.get("disposition"),
+        "disposition_source": p.get("disposition_source"),
+        "disposition_confidence": p.get("disposition_confidence"),
+        "disposition_mixed": p.get("disposition_mixed"),
+        "court_extractor_revision": p.get("court_extractor_revision"),
+        "result": p.get("result"),
+        "appeal_type": p.get("appeal_type"),
         "source_url": p.get("source_url"),
         "chunk_index": p.get("chunk_index"),
         "heading": p.get("heading"),
+        "heading_path": p.get("heading_path"),
+        "article_id": p.get("article_id"),
+        "clause_id": p.get("clause_id"),
+        "chapter": p.get("chapter"),
+        "parent_id": p.get("parent_id"),
+        "version_id": p.get("version_id"),
+        "supersedes": p.get("supersedes"),
+        "effective_from": p.get("effective_from"),
+        "effective_to": p.get("effective_to"),
+        "consolidation_status": p.get("consolidation_status"),
+        "content_complete": p.get("content_complete"),
+        "extraction_status": p.get("extraction_status"),
+        "match_type": p.get("match_type"),
+        "identity_confidence": p.get("identity_confidence"),
+        "identity_ambiguous": p.get("identity_ambiguous"),
         # Exact evidence span [char_start, char_end) into the document body, for precise citation.
         "char_start": p.get("char_start"),
         "char_end": p.get("char_end"),
         "token_count": p.get("token_count"),
+        "content_hash": p.get("content_hash"),
+        "passage_hash": p.get("passage_hash"),
         "text": p.get("text"),
     }
 
@@ -430,10 +773,286 @@ def _format_hit_md(rank: int, hit) -> str:
     if p.get("heading"):
         lines.append(f"- section: {p.get('heading')}")
     lines.append(f"\n{snippet}\n")
+    if len(" ".join((p.get("text") or "").split())) > SNIPPET_CHARS:
+        lines.append(
+            "_Preview truncated; use legal_get_context with a validated evidence ID for answering._\n"
+        )
     return "\n".join(lines)
 
 
 # --- Tools --------------------------------------------------------------------
+
+
+class LegalAskFilters(BaseModel):
+    """Structured retrieval constraints accepted by the strict answer pipeline."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    source: str | None = None
+    document_type: str | None = None
+    court: str | None = None
+    document_id: str | None = None
+    document_number: str | None = None
+    registration_code: str | None = None
+    status: str | None = None
+    is_consolidated: bool | None = None
+    parties: str | None = None
+    contains: str | None = None
+
+
+class LegalAskInput(BaseModel):
+    """Input for evidence-validated legal question answering."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    question: str = Field(..., min_length=1, max_length=4000)
+    language: str | None = Field(
+        None,
+        description="Declared question language ('ka' or 'en'); unsupported values clarify.",
+    )
+    as_of: str | None = Field(
+        None,
+        description="Legal effective date as YYYY-MM-DD; never interpreted as publication date.",
+    )
+    filters: LegalAskFilters | None = None
+    profile: Literal["strict"] = "strict"
+
+
+class LegalGetContextInput(BaseModel):
+    """Input for resolving exact canonical evidence and bounded neighbors."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    evidence_id: str = Field(..., min_length=1)
+    neighbor_chunks: int = Field(1, ge=0, le=1)
+    max_tokens: int = Field(DEFAULT_EVIDENCE_TOKENS, ge=512, le=16000)
+
+
+def _answer_service(
+    cfg: Config, client, embedder=None, reranker=None
+) -> LegalAnswerService:
+    return LegalAnswerService(
+        cfg,
+        client,
+        embedder,
+        reranker,
+        translator=_answer_translator,
+        composer=_answer_composer,
+        calibrator=_answer_calibrator,
+        freshness_guard=_answer_freshness_guard,
+    )
+
+
+def _json_wire(value) -> str:
+    payload = value.to_dict() if hasattr(value, "to_dict") else asdict(value)
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def _answer_failure_wire(
+    cfg: Config, question: str, *, reason: str, error: Exception
+) -> str:
+    logger.exception("legal_ask failed closed: %s", reason)
+    return _json_wire(
+        fail_closed_answer_result(
+            cfg,
+            question,
+            reason=reason,
+            message=(
+                f"The answer pipeline failed safely ({type(error).__name__}); "
+                "diagnostic details are available only in server logs."
+            ),
+            translator=_answer_translator,
+            composer=_answer_composer,
+            calibrator=_answer_calibrator,
+        )
+    )
+
+
+def _validated_answer_wire(value: object) -> str:
+    """Accept only the complete typed ``AnswerResult`` contract from a worker."""
+
+    if isinstance(value, str):
+        try:
+            payload = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError("remote legal_ask returned non-JSON output") from exc
+    elif isinstance(value, dict):
+        payload = value
+    else:
+        raise ValueError("remote legal_ask returned an unsupported output type")
+    required = {
+        "outcome",
+        "answer_text",
+        "claims",
+        "evidence",
+        "clarification_question",
+        "abstention_reason",
+        "validation_issues",
+        "versions",
+        "trace",
+        "trace_id",
+    }
+    if not isinstance(payload, dict) or not required.issubset(payload):
+        raise ValueError("remote legal_ask returned an incomplete AnswerResult")
+    if payload.get("outcome") not in {outcome.value for outcome in AnswerOutcome}:
+        raise ValueError("remote legal_ask returned an invalid outcome")
+    if not isinstance(payload.get("claims"), list) or not isinstance(
+        payload.get("validation_issues"), list
+    ):
+        raise ValueError("remote legal_ask returned invalid claim or issue fields")
+    versions = payload.get("versions")
+    required_versions = {
+        "corpus_generation",
+        "retriever",
+        "reranker",
+        "translator",
+        "generator",
+        "prompt",
+        "calibrator",
+    }
+    if not isinstance(versions, dict) or not required_versions.issubset(versions):
+        raise ValueError("remote legal_ask returned incomplete pipeline versions")
+    trace = payload.get("trace")
+    trace_id = payload.get("trace_id")
+    if (
+        not isinstance(trace, dict)
+        or not isinstance(trace_id, str)
+        or len(trace_id) != 64
+        or any(character not in "0123456789abcdef" for character in trace_id)
+        or trace.get("trace_id") != trace_id
+    ):
+        raise ValueError("remote legal_ask returned an invalid trace")
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+@mcp.tool(
+    name="legal_ask",
+    annotations={
+        "title": "Ask with Canonical Legal Evidence",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def legal_ask(params: LegalAskInput) -> str:
+    """Answer, clarify, or abstain through the strict server-owned legal pipeline.
+
+    Unlike ``legal_search``, this is an answering contract.  It retrieves original and
+    protected Georgian-translation branches, resolves exact entities and effective
+    versions, constructs a bounded canonical evidence pack, emits atomic claims, verifies
+    every evidence ID/quotation/hash/version/material claim, permits one repair, and then
+    applies a held-out selective-risk calibrator.  Any degraded or unresolved stage fails
+    closed.  The JSON result always includes full version provenance and a reproducible
+    trace ID; it never treats a reranker sigmoid score as answer confidence.
+    """
+
+    cfg = _get_cfg()
+    if _use_remote():
+        try:
+            result = await _remote_op(
+                "ask",
+                params.model_dump(mode="json", exclude_none=True),
+                propagate_errors=True,
+            )
+            return _validated_answer_wire(result)
+        except Exception as exc:  # fail closed into the public answer contract
+            return _answer_failure_wire(
+                cfg,
+                params.question,
+                reason="remote_answer_pipeline_error",
+                error=exc,
+            )
+    client = None
+    try:
+        # Missing private providers are intentionally cheap structured abstentions; avoid
+        # loading BGE-M3 only to discover that drafting/calibration is unavailable.
+        if _answer_composer is None or _answer_calibrator is None:
+            # This path exits before retrieval or model work. Keeping it synchronous also
+            # avoids creating an executor thread solely to serialize a tiny typed result.
+            result = _answer_service(cfg, None).ask(
+                params.question,
+                language=params.language,
+                as_of=params.as_of,
+                filters=(
+                    params.filters.model_dump(exclude_none=True)
+                    if params.filters
+                    else None
+                ),
+                profile=params.profile,
+            )
+            return _json_wire(result)
+        client = _get_client()
+        if cfg.production_mode:
+            await asyncio.to_thread(_require_local_readiness, cfg, client)
+        embedder = await _get_embedder()
+        reranker = await _get_reranker()
+        async with _search_semaphore:
+            result = await asyncio.to_thread(
+                _answer_service(cfg, client, embedder, reranker).ask,
+                params.question,
+                language=params.language,
+                as_of=params.as_of,
+                filters=(
+                    params.filters.model_dump(exclude_none=True)
+                    if params.filters
+                    else None
+                ),
+                profile=params.profile,
+            )
+        return _json_wire(result)
+    except Exception as exc:  # every answering failure is typed and fail-closed
+        return _answer_failure_wire(
+            cfg,
+            params.question,
+            reason="answer_pipeline_error",
+            error=exc,
+        )
+
+
+@mcp.tool(
+    name="legal_get_context",
+    annotations={
+        "title": "Resolve Canonical Legal Evidence",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def legal_get_context(params: LegalGetContextInput) -> str:
+    """Resolve an evidence ID to exact hashed text plus bounded canonical neighbors.
+
+    This tool never reconstructs a document from snippets and never applies the 700
+    character Markdown preview limit.  Every returned passage is revalidated against the
+    active immutable generation and its content-bound evidence ID.
+    """
+
+    if _use_remote():
+        return await _remote_op("get_context", params.model_dump(mode="json"))
+    try:
+        cfg = _get_cfg()
+        client = _get_client()
+        if cfg.production_mode:
+            await asyncio.to_thread(_require_local_readiness, cfg, client)
+        # Bounded point-ID retrieval (center + at most one neighbor/parent), with no model
+        # work; execute directly so a trivial context read does not own an executor thread.
+        pack = _answer_service(cfg, client).get_context(
+            params.evidence_id,
+            neighbor_chunks=params.neighbor_chunks,
+            max_tokens=params.max_tokens,
+        )
+        return _json_wire(pack)
+    except Exception as exc:
+        return json.dumps(
+            {
+                "outcome": AnswerOutcome.ABSTAIN.value,
+                "abstention_reason": "evidence_resolution_failed",
+                "error": f"{type(exc).__name__}: {exc}",
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
 
 
 class SearchInput(BaseModel):
@@ -463,6 +1082,17 @@ class SearchInput(BaseModel):
         None,
         description="Exact court key, e.g. 'supremecourt', 'constcourt', 'tbappeal', or "
         "the ecd court name.",
+    )
+    judge: str | None = Field(
+        None,
+        description="Judge who sat on the deciding panel. Full names and canonical "
+        "initial-plus-surname keys are normalized deterministically.",
+    )
+    disposition: str | None = Field(
+        None, description="Exact canonical disposition extracted for the decision."
+    )
+    appeal_type: str | None = Field(
+        None, description="Exact scraped Supreme Court appeal type."
     )
     status: str | None = Field(
         None,
@@ -511,23 +1141,37 @@ class SearchInput(BaseModel):
 def _retrieval_request(params: SearchInput) -> RetrievalRequest:
     """Translate the MCP wire model into the provider-neutral production request."""
 
+    filters = {
+        "source": params.source,
+        "court": params.court,
+        "status": params.status,
+        "is_consolidated": params.is_consolidated,
+        "document_type": params.document_type,
+        "document_number": params.document_number,
+        "registration_code": params.registration_code,
+        "parties": params.parties,
+        "contains": params.contains,
+    }
+    filters.update(
+        {
+            key: value
+            for key, value in (
+                ("judges", params.judge),
+                ("disposition", params.disposition),
+                ("appeal_type", params.appeal_type),
+            )
+            if value is not None
+        }
+    )
     return RetrievalRequest(
         query=params.query,
         requested_limit=params.top_k,
         route=True,
         language=params.language,
-        temporal_context=TemporalContext(date_from=params.date_from, date_to=params.date_to),
-        filters={
-            "source": params.source,
-            "court": params.court,
-            "status": params.status,
-            "is_consolidated": params.is_consolidated,
-            "document_type": params.document_type,
-            "document_number": params.document_number,
-            "registration_code": params.registration_code,
-            "parties": params.parties,
-            "contains": params.contains,
-        },
+        temporal_context=TemporalContext(
+            date_from=params.date_from, date_to=params.date_to
+        ),
+        filters=filters,
         track="production_direct",
     )
 
@@ -583,13 +1227,19 @@ async def legal_search(params: SearchInput) -> str:
     lack consolidated base-law texts (amendment acts dominate); if a base statute doesn't
     surface, say so rather than citing an amendment as the law itself.
 
-    Abstention contract — scores are calibrated 0..1 but saturate high: a top score
-    below ~0.92 is a strong not-found signal (measured on the golden set: every
-    gold-hitting query's top score was ≥0.926, while 10% of misses fell below it), and a
-    HIGH score does NOT prove the right document — always check that the returned
-    title / document_number actually matches the ask. If the top score is below ~0.92 or
-    no hit's title/number matches the asked-for law, report that the document was not
-    found rather than citing the nearest match — the corpus may lack it.
+    Paraphrase caution — naturally-phrased, conversational questions measurably retrieve
+    worse than the law's own wording (on the golden set, paraphrased questions score far
+    below citation/keyword lookups). When the ask is a paraphrase of a legal question
+    rather than a citation or exact term, prefer retry step (a) immediately rather than as
+    a last resort: rewrite toward the statute's defined terms and article-style phrasing
+    (official terminology in place of everyday synonyms) before judging whether the first
+    results are sufficient.
+
+    Search-score caution — the reranker score is passage relevance, not an answer
+    probability or legal confidence. A high value cannot prove document identity,
+    effective version, completeness, citation support, or answer correctness. Use
+    ``legal_ask`` for the validated answer/clarify/abstain contract; do not turn any raw
+    score threshold into a legal answer.
 
     Before emitting any citation in an answer, verify it resolves via ``legal_lookup``
     (document_number or registration_code); never cite an identifier that does not
@@ -621,13 +1271,16 @@ async def legal_search(params: SearchInput) -> str:
     if key is not None:
         cached = _cache_get(cfg, key)
         if cached is not None:
-            return cached  # identical query already answered — skip the whole round-trip
+            return (
+                cached  # identical query already answered — skip the whole round-trip
+            )
 
     if _use_remote():
         t0 = time.perf_counter()
         try:
             out = await asyncio.to_thread(
-                _get_remote_client().call, "search", params.model_dump(mode="json"))
+                _get_remote_client().call, "search", params.model_dump(mode="json")
+            )
             result, ok = (out.get("result") or ""), True
         except Exception as e:  # noqa: BLE001 - surface an actionable message to the agent
             result, ok = _remote_error_text(e), False
@@ -669,7 +1322,9 @@ async def legal_search(params: SearchInput) -> str:
     fp = outcome.retrieval_fingerprint
     if params.response_format is ResponseFormat.JSON:
         payload = {
-            "count": len(hits), "collection": cfg.collection_name, "fingerprint": fp,
+            "count": len(hits),
+            "collection": cfg.collection_name,
+            "fingerprint": fp,
             "hits": [_hit_dict(h) for h in hits],
         }
         if degraded:
@@ -700,15 +1355,33 @@ def _log_query_remote(params, elapsed_ms: float) -> None:
         return
     try:
         filters = {
-            k: getattr(params, k) for k in (
-                "source", "language", "document_type", "court", "status", "document_number",
-                "registration_code", "parties", "contains", "date_from", "date_to",
+            k: getattr(params, k)
+            for k in (
+                "source",
+                "language",
+                "document_type",
+                "court",
+                "judge",
+                "disposition",
+                "appeal_type",
+                "status",
+                "document_number",
+                "registration_code",
+                "parties",
+                "contains",
+                "date_from",
+                "date_to",
             )
         }
         rec = build_query_record(
-            query=params.query, filters=filters, top_k=params.top_k, hits=[],
-            latency_ms=elapsed_ms, fingerprint=retrieval_fingerprint(cfg),
-            mode="remote", route=detect_language(params.query),
+            query=params.query,
+            filters=filters,
+            top_k=params.top_k,
+            hits=[],
+            latency_ms=elapsed_ms,
+            fingerprint=retrieval_fingerprint(cfg),
+            mode="remote",
+            route=detect_language(params.query),
         )
         append_query_log(rec, cfg.query_log_path)
     except Exception as e:  # noqa: BLE001 - logging must never break search
@@ -721,15 +1394,32 @@ def _log_query(cfg: Config, params, hits, elapsed_ms: float) -> None:
         return
     try:
         filters = {
-            k: getattr(params, k) for k in (
-                "source", "language", "document_type", "court", "status", "document_number",
-                "registration_code", "parties", "contains", "date_from", "date_to",
+            k: getattr(params, k)
+            for k in (
+                "source",
+                "language",
+                "document_type",
+                "court",
+                "judge",
+                "disposition",
+                "appeal_type",
+                "status",
+                "document_number",
+                "registration_code",
+                "parties",
+                "contains",
+                "date_from",
+                "date_to",
             )
         }
         rec = build_query_record(
-            query=params.query, filters=filters, top_k=params.top_k,
-            hits=[_hit_dict(h) for h in hits], latency_ms=elapsed_ms,
-            fingerprint=retrieval_fingerprint(cfg), route=detect_language(params.query),
+            query=params.query,
+            filters=filters,
+            top_k=params.top_k,
+            hits=[_hit_dict(h) for h in hits],
+            latency_ms=elapsed_ms,
+            fingerprint=retrieval_fingerprint(cfg),
+            route=detect_language(params.query),
         )
         append_query_log(rec, cfg.query_log_path)
     except Exception as e:  # noqa: BLE001 - logging must never break search
@@ -742,7 +1432,9 @@ class GetDocumentInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
 
     source: str = Field(
-        ..., description="Source key, e.g. 'matsne' (as returned in a search hit).", min_length=1
+        ...,
+        description="Source key, e.g. 'matsne' (as returned in a search hit).",
+        min_length=1,
     )
     document_id: str = Field(
         ..., description="The document_id from a search hit's payload.", min_length=1
@@ -839,7 +1531,9 @@ async def legal_get_document(params: GetDocumentInput) -> str:
         client = _get_client()
         flt = models.Filter(
             must=[
-                models.FieldCondition(key="source", match=models.MatchValue(value=params.source)),
+                models.FieldCondition(
+                    key="source", match=models.MatchValue(value=params.source)
+                ),
                 models.FieldCondition(
                     key="document_id", match=models.MatchValue(value=params.document_id)
                 ),
@@ -925,6 +1619,19 @@ def _dedup_documents(points) -> list[dict]:
                 "date_sort": p.get("date") or "",
                 "court": p.get("court"),
                 "language": p.get("language"),
+                "judges": p.get("judges"),
+                "judges_raw": p.get("judges_raw"),
+                "reporting_judge": p.get("reporting_judge"),
+                "judge_extraction_confidence": p.get(
+                    "judge_extraction_confidence"
+                ),
+                "disposition": p.get("disposition"),
+                "disposition_source": p.get("disposition_source"),
+                "disposition_confidence": p.get("disposition_confidence"),
+                "disposition_mixed": p.get("disposition_mixed"),
+                "court_extractor_revision": p.get("court_extractor_revision"),
+                "result": p.get("result"),
+                "appeal_type": p.get("appeal_type"),
                 "source_url": p.get("source_url"),
                 "chunk_count": p.get("document_chunk_count") or entry["chunk_count"],
             }
@@ -945,6 +1652,17 @@ _DOCUMENT_PAYLOAD_FIELDS = (
     "date_raw",
     "court",
     "language",
+    "judges",
+    "judges_raw",
+    "reporting_judge",
+    "judge_extraction_confidence",
+    "disposition",
+    "disposition_source",
+    "disposition_confidence",
+    "disposition_mixed",
+    "court_extractor_revision",
+    "result",
+    "appeal_type",
     "source_url",
     "chunk_index",
     "document_chunk_count",
@@ -957,17 +1675,26 @@ def _condition_list(value) -> list:
     return value if isinstance(value, list) else [value]
 
 
-def _document_scroll_filter(flt: models.Filter | None) -> models.Filter:
-    """Add the indexed chunk-zero condition while preserving every caller filter."""
-    chunk_zero = models.FieldCondition(key="chunk_index", match=models.MatchValue(value=0))
+def _and_filter(
+    flt: models.Filter | None, *conditions: models.Condition
+) -> models.Filter:
+    """Append AND conditions without dropping nested/negative caller constraints."""
     if flt is None:
-        return models.Filter(must=[chunk_zero])
+        return models.Filter(must=list(conditions))
     return models.Filter(
         should=flt.should,
         min_should=flt.min_should,
-        must=[*_condition_list(flt.must), chunk_zero],
+        must=[*_condition_list(flt.must), *conditions],
         must_not=flt.must_not,
     )
+
+
+def _document_scroll_filter(flt: models.Filter | None) -> models.Filter:
+    """Add the indexed chunk-zero condition while preserving every caller filter."""
+    chunk_zero = models.FieldCondition(
+        key="chunk_index", match=models.MatchValue(value=0)
+    )
+    return _and_filter(flt, chunk_zero)
 
 
 def _iter_document_points(
@@ -1006,6 +1733,13 @@ def _format_doc_line(rank: int, d: dict) -> str:
     ]
     if d.get("parties"):
         lines.append(f"- parties: {d['parties']}")
+    if d.get("judges"):
+        lines.append(f"- panel: {', '.join(d['judges'])}")
+    if d.get("disposition"):
+        lines.append(
+            f"- disposition: {d['disposition']} "
+            f"({d.get('disposition_confidence') or 'unknown'} confidence)"
+        )
     if d.get("source_url"):
         lines.append(f"- url: {d['source_url']}")
     return "\n".join(lines)
@@ -1022,7 +1756,8 @@ class LookupInput(BaseModel):
         "documents share a number across years/agencies — pass 'source' to narrow.",
     )
     registration_code: str | None = Field(
-        None, description="Exact registry code (unique), e.g. matsne '140130000.22.034.017712'."
+        None,
+        description="Exact registry code (unique), e.g. matsne '140130000.22.034.017712'.",
     )
     document_id: str | None = Field(
         None, description="Exact internal document_id (unique within a source)."
@@ -1086,7 +1821,9 @@ async def legal_lookup(params: LookupInput) -> str:
         return "No documents found for that identifier. Check the value or drop the source filter."
 
     if params.response_format is ResponseFormat.JSON:
-        return json.dumps({"count": len(docs), "documents": docs}, ensure_ascii=False, indent=2)
+        return json.dumps(
+            {"count": len(docs), "documents": docs}, ensure_ascii=False, indent=2
+        )
 
     blocks = [f"# {len(docs)} document(s) found", ""]
     blocks.extend(_format_doc_line(rank, d) for rank, d in enumerate(docs, 1))
@@ -1098,11 +1835,28 @@ class BrowseInput(BaseModel):
 
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
 
-    source: str | None = Field(None, description="Source key, e.g. 'matsne', 'constcourt'.")
+    source: str | None = Field(
+        None, description="Source key, e.g. 'matsne', 'constcourt'."
+    )
     document_type: str | None = Field(None, description="Exact document_type value.")
-    court: str | None = Field(None, description="Exact court value, e.g. 'supremecourt'.")
+    court: str | None = Field(
+        None, description="Exact court value, e.g. 'supremecourt'."
+    )
+    judge: str | None = Field(
+        None,
+        description="Judge who sat on the deciding panel; normalized to the canonical "
+        "initial-plus-surname key.",
+    )
+    disposition: str | None = Field(
+        None, description="Exact canonical disposition."
+    )
+    appeal_type: str | None = Field(
+        None, description="Exact scraped Supreme Court appeal type."
+    )
     language: str | None = Field(None, description="Language code, e.g. 'ka'.")
-    document_number: str | None = Field(None, description="Exact official document number.")
+    document_number: str | None = Field(
+        None, description="Exact official document number."
+    )
     status: str | None = Field(
         None,
         description="Legal status (matsne acts only): 'in_force', 'repealed', or "
@@ -1115,11 +1869,16 @@ class BrowseInput(BaseModel):
         "(matsne's 'ძირითადი (კონსოლიდირებული)' filter), false = an amendment or "
         "informational act.",
     )
-    parties: str | None = Field(None, description="Full-text match on party/person names.")
-    contains: str | None = Field(
-        None, description="Full-text keyword/phrase that must appear in the document body."
+    parties: str | None = Field(
+        None, description="Full-text match on party/person names."
     )
-    date_from: str | None = Field(None, description="Earliest date, inclusive, YYYY-MM-DD.")
+    contains: str | None = Field(
+        None,
+        description="Full-text keyword/phrase that must appear in the document body.",
+    )
+    date_from: str | None = Field(
+        None, description="Earliest date, inclusive, YYYY-MM-DD."
+    )
     date_to: str | None = Field(None, description="Latest date, inclusive, YYYY-MM-DD.")
     limit: int = Field(20, description="Max documents to return.", ge=1, le=200)
     offset: int = Field(0, description="Documents to skip (pagination).", ge=0)
@@ -1161,7 +1920,9 @@ async def legal_browse(params: BrowseInput) -> str:
         # worker built before status/is_consolidated existed (its BrowseInput is
         # extra="forbid"); calls that USE the new filters fail loudly there until the
         # image is redeployed — the correct signal.
-        return await _remote_op("browse", params.model_dump(mode="json", exclude_none=True))
+        return await _remote_op(
+            "browse", params.model_dump(mode="json", exclude_none=True)
+        )
     try:
         cfg = _get_cfg()
         client = _get_client()
@@ -1169,6 +1930,9 @@ async def legal_browse(params: BrowseInput) -> str:
             source=params.source,
             document_type=params.document_type,
             court=params.court,
+            judges=params.judge,
+            disposition=params.disposition,
+            appeal_type=params.appeal_type,
             language=params.language,
             document_number=params.document_number,
             status=params.status,
@@ -1202,15 +1966,314 @@ async def legal_browse(params: BrowseInput) -> str:
 
     if params.response_format is ResponseFormat.JSON:
         return json.dumps(
-            {"count": len(page), "offset": params.offset, "limit": params.limit, "documents": page},
+            {
+                "count": len(page),
+                "offset": params.offset,
+                "limit": params.limit,
+                "documents": page,
+            },
             ensure_ascii=False,
             indent=2,
         )
 
-    header = f"# {len(page)} document(s) (of {len(docs)} matched), offset {params.offset}"
+    header = (
+        f"# {len(page)} document(s) (of {len(docs)} matched), offset {params.offset}"
+    )
     blocks = [header, ""]
-    blocks.extend(_format_doc_line(params.offset + rank, d) for rank, d in enumerate(page, 1))
+    blocks.extend(
+        _format_doc_line(params.offset + rank, d) for rank, d in enumerate(page, 1)
+    )
     return "\n\n".join(blocks)
+
+
+StatsOutcome = Literal[
+    "any_overturn",
+    "upheld",
+    "overturned",
+    "overturned_remanded",
+    "partially_overturned",
+    "modified",
+    "granted",
+    "remanded",
+    "terminated",
+    "settled",
+]
+
+_OVERTURN_OUTCOMES = (
+    "overturned",
+    "overturned_remanded",
+    "partially_overturned",
+)
+_PROCEDURAL_OUTCOMES = ("inadmissible", "not_considered")
+_STATS_MIN_COVERAGE = 0.80
+
+
+class StatsInput(BaseModel):
+    """Input for exact document-level panel/outcome statistics."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    judge: str = Field(
+        ...,
+        min_length=1,
+        description="Judge who sat on the deciding panel. Full names are normalized "
+        "to the canonical initial-plus-surname key.",
+    )
+    outcome: StatsOutcome = Field(
+        "any_overturn",
+        description="Substantive outcome used for the numerator. 'any_overturn' groups "
+        "overturned, overturned-and-remanded, and partially-overturned decisions.",
+    )
+    source: str | None = Field(None, description="Optional exact source key.")
+    court: str | None = Field(None, description="Optional exact court value.")
+    appeal_type: str | None = Field(
+        None, description="Optional exact Supreme Court appeal type."
+    )
+    date_from: str | None = Field(
+        None, description="Earliest decision date, inclusive, as YYYY-MM-DD."
+    )
+    date_to: str | None = Field(
+        None, description="Latest decision date, inclusive, as YYYY-MM-DD."
+    )
+
+
+def _exact_count(client, collection: str, flt: models.Filter) -> int:
+    result = client.count(
+        collection_name=collection,
+        count_filter=flt,
+        exact=True,
+    )
+    return int(result.count)
+
+
+def _exact_facet(
+    client, collection: str, *, key: str, flt: models.Filter
+) -> dict[str, int]:
+    result = client.facet(
+        collection_name=collection,
+        key=key,
+        facet_filter=flt,
+        limit=max(32, len(DISPOSITION_VALUES) + 4),
+        exact=True,
+    )
+    return {str(hit.value): int(hit.count) for hit in result.hits}
+
+
+def _stats_outcomes(outcome: StatsOutcome) -> tuple[str, ...]:
+    return _OVERTURN_OUTCOMES if outcome == "any_overturn" else (outcome,)
+
+
+def _stats_statement(
+    *,
+    judge: str,
+    outcome: StatsOutcome,
+    numerator: int,
+    confident: int,
+    total: int,
+    unknown: int,
+    procedural: dict[str, int],
+    supreme_court_context: bool,
+) -> str:
+    label = "overturned" if outcome == "any_overturn" else outcome.replace("_", " ")
+    statement = (
+        f"{numerator} of {confident} confidently-classified decisions on "
+        f"{judge}'s panel were {label} ({total} total; {unknown} unknown). "
+        "Procedural outcomes are separate: "
+        f"{procedural['inadmissible']} inadmissible and "
+        f"{procedural['not_considered']} not considered. "
+        "This measures the reviewing panel's disposition of the decision below, not "
+        "decisions authored by the judge that were later overturned."
+    )
+    if supreme_court_context:
+        statement += (
+            " Georgia's Supreme Court acts in cassation: its panel reviews the lower "
+            "decision, while the panel's own ruling is final."
+        )
+    return statement
+
+
+def _legal_stats_payload(client, collection: str, params: StatsInput) -> dict:
+    judge_key = normalize_judge_key(params.judge)
+    if not judge_key:
+        raise ValueError(
+            "judge must be a Georgian surname or first-name/initial plus surname"
+        )
+    base_filter = build_filter(
+        source=params.source,
+        court=params.court,
+        judges=judge_key,
+        appeal_type=params.appeal_type,
+        date_from=params.date_from,
+        date_to=params.date_to,
+    )
+    document_filter = _document_scroll_filter(base_filter)
+    current_revision_filter = _and_filter(
+        document_filter,
+        models.FieldCondition(
+            key="court_extractor_revision",
+            match=models.MatchValue(value=EXTRACTOR_REVISION),
+        ),
+    )
+    high_filter = _and_filter(
+        current_revision_filter,
+        models.FieldCondition(
+            key="disposition_confidence", match=models.MatchValue(value="high")
+        ),
+    )
+    supported_court_filter = _document_scroll_filter(
+        models.Filter(
+            must=[
+                models.FieldCondition(
+                    key="source",
+                    match=models.MatchAny(any=["ecd", "supremecourt"]),
+                )
+            ]
+        )
+    )
+    supported_current_filter = _and_filter(
+        supported_court_filter,
+        models.FieldCondition(
+            key="court_extractor_revision",
+            match=models.MatchValue(value=EXTRACTOR_REVISION),
+        ),
+    )
+
+    total = _exact_count(client, collection, document_filter)
+    current_revision = _exact_count(client, collection, current_revision_filter)
+    supported_total = _exact_count(client, collection, supported_court_filter)
+    supported_current = _exact_count(client, collection, supported_current_filter)
+    observed_high = _exact_facet(
+        client,
+        collection,
+        key="disposition",
+        flt=high_filter,
+    )
+    buckets = {value: observed_high.get(value, 0) for value in DISPOSITION_VALUES}
+    unexpected = {
+        value: count
+        for value, count in observed_high.items()
+        if value not in DISPOSITION_VALUES
+    }
+    high_classified = sum(
+        buckets[value] for value in DISPOSITION_VALUES if value != "unknown"
+    )
+    procedural = {
+        value: buckets[value]
+        for value in _PROCEDURAL_OUTCOMES
+    }
+    procedural["total"] = sum(procedural.values())
+    confident = max(0, high_classified - procedural["total"])
+    unknown = max(0, total - high_classified)
+    coverage = round(high_classified / total, 6) if total else 0.0
+    numerator_outcomes = _stats_outcomes(params.outcome)
+    numerator = sum(buckets[value] for value in numerator_outcomes)
+
+    query_revision_complete = total > 0 and current_revision == total
+    collection_revision_complete = (
+        supported_total > 0 and supported_current == supported_total
+    )
+    trust = evaluate_court_extraction_trust(
+        collection_revision=(
+            EXTRACTOR_REVISION if collection_revision_complete else None
+        )
+    )
+    trust_reasons = list(trust.reasons)
+    if total == 0:
+        trust_reasons.append("no_matching_decisions")
+    if current_revision != total:
+        trust_reasons.append("query_extractor_revision_incomplete")
+    if not collection_revision_complete:
+        trust_reasons.append("collection_extractor_revision_incomplete")
+    if coverage < _STATS_MIN_COVERAGE:
+        trust_reasons.append("query_slice_coverage_below_0.80")
+    if confident == 0:
+        trust_reasons.append("no_confident_substantive_decisions")
+    if unexpected:
+        trust_reasons.append("unexpected_disposition_values")
+    trust_reasons = list(dict.fromkeys(trust_reasons))
+    trusted = bool(
+        trust.trusted
+        and query_revision_complete
+        and collection_revision_complete
+        and coverage >= _STATS_MIN_COVERAGE
+        and confident > 0
+        and not unexpected
+    )
+
+    supreme_court_context = (
+        params.source == "supremecourt"
+        or params.court == "supremecourt"
+        or judge_key == "ნ. სხირტლაძე"
+    )
+    return {
+        "judge_key": judge_key,
+        "numerator_outcomes": list(numerator_outcomes),
+        "numerator": numerator,
+        "confident_denominator": confident,
+        "total_denominator": total,
+        "coverage": coverage,
+        "trusted": trusted,
+        "trust_reasons": trust_reasons,
+        "unknown": unknown,
+        "procedural": procedural,
+        "buckets": buckets,
+        "unexpected_dispositions": unexpected,
+        "court_extractor_revision": EXTRACTOR_REVISION,
+        "revision_coverage": {
+            "query_current": current_revision,
+            "query_total": total,
+            "collection_current": supported_current,
+            "collection_total": supported_total,
+        },
+        "eval_set_hash": trust.eval_set_hash,
+        "statement": _stats_statement(
+            judge=judge_key,
+            outcome=params.outcome,
+            numerator=numerator,
+            confident=confident,
+            total=total,
+            unknown=unknown,
+            procedural=procedural,
+            supreme_court_context=supreme_court_context,
+        ),
+    }
+
+
+@mcp.tool(
+    name="legal_stats",
+    annotations={
+        "title": "Count Judge-Panel Decision Outcomes",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def legal_stats(params: StatsInput) -> str:
+    """Return exact document-level disposition statistics for a judge's panel.
+
+    Every Qdrant query is constrained to ``chunk_index == 0`` so a multi-chunk decision
+    counts once. The numerator includes only high-confidence classifications, procedural
+    outcomes are separated from the substantive denominator, and missing/low-confidence
+    classifications remain visible in ``unknown``. ``trusted`` fails closed unless the
+    checked-in extraction evaluation attestation and collection revision both validate.
+
+    This is a reviewer statistic: it says what a panel containing the judge did to the
+    decision under review. It cannot answer whether decisions authored by that judge were
+    later overturned; that requires the explicitly out-of-scope cross-instance join.
+    """
+    if _use_remote():
+        return await _remote_op(
+            "stats", params.model_dump(mode="json", exclude_none=True)
+        )
+    try:
+        cfg = _get_cfg()
+        payload = await asyncio.to_thread(
+            _legal_stats_payload, _get_client(), cfg.collection_name, params
+        )
+    except Exception as e:  # noqa: BLE001
+        return _handle_error(e)
+    return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
 def _source_counts(client, collection: str) -> dict | None:
@@ -1256,7 +2319,9 @@ async def legal_collection_info() -> str:
 
     vectors = info.config.params.vectors
     dense_dim = (
-        vectors["dense"].size if isinstance(vectors, dict) else getattr(vectors, "size", None)
+        vectors["dense"].size
+        if isinstance(vectors, dict)
+        else getattr(vectors, "size", None)
     )
 
     lines = [
@@ -1267,7 +2332,11 @@ async def legal_collection_info() -> str:
         f"- dense_dim: {dense_dim} (cosine, hybrid dense + sparse)",
         f"- embed_model: {cfg.embed_model}",
         f"- reranker: {cfg.rerank_model if cfg.rerank_enabled else 'disabled'}"
-        + (f" (gate ≥ {cfg.rerank_min_score})" if cfg.rerank_enabled and cfg.rerank_min_score is not None else ""),
+        + (
+            f" (legacy search relevance filter ≥ {cfg.rerank_min_score}; not answer confidence)"
+            if cfg.rerank_enabled and cfg.rerank_min_score is not None
+            else ""
+        ),
         f"- known sources: {', '.join(sorted(SOURCES))}",
     ]
     if counts:
@@ -1279,12 +2348,18 @@ async def legal_collection_info() -> str:
     lines += [
         "",
         "## Retrieval tools",
+        "- legal_ask: strict answer/clarify/abstain with canonical evidence, deterministic "
+        "citation/version validation, one repair, and selective-risk calibration.",
+        "- legal_get_context: resolve a content-bound evidence ID to exact text and bounded neighbors.",
         "- legal_search: hybrid (dense+sparse) recall + cross-encoder rerank; optional filters "
         "source, court, status (in_force/repealed/pending), language, document_type, "
-        "document_number, registration_code, parties, contains, date_from/date_to.",
+        "document_number, registration_code, judge, disposition, appeal_type, parties, "
+        "contains, date_from/date_to.",
         "- legal_lookup: exact, no embedding — by document_number, registration_code, or document_id.",
         "- legal_browse: non-semantic document-level listing by source/type/court/date range/"
         "number/parties/contains, paginated and date-sorted.",
+        "- legal_stats: exact chunk-zero judge-panel disposition counts with coverage and "
+        "a fail-closed extraction-evaluation trust gate.",
         "- legal_get_document: full text by source + document_id.",
         "",
         "## Per-source 'document_number' meaning",
@@ -1349,8 +2424,15 @@ async def ingest_status(params: StatusInput | None = None) -> str:
         st = pipeline._load_watch_state(cfg, src)
         if st.get("updated_at"):
             watch[src] = {
-                k: st.get(k) for k in (
-                    "docs", "chunks", "added", "updated", "unchanged", "skipped", "updated_at",
+                k: st.get(k)
+                for k in (
+                    "docs",
+                    "chunks",
+                    "added",
+                    "updated",
+                    "unchanged",
+                    "skipped",
+                    "updated_at",
                 )
             }
     report = _latest_report(cfg)
@@ -1358,10 +2440,18 @@ async def ingest_status(params: StatusInput | None = None) -> str:
     fp = retrieval_fingerprint(cfg)
 
     if fmt is ResponseFormat.JSON:
-        return json.dumps({
-            "collection": cfg.collection_name, "points": points, "fingerprint": fp,
-            "per_source": counts, "watchers": watch, "latest_report": report,
-        }, ensure_ascii=False, indent=2)
+        return json.dumps(
+            {
+                "collection": cfg.collection_name,
+                "points": points,
+                "fingerprint": fp,
+                "per_source": counts,
+                "watchers": watch,
+                "latest_report": report,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
 
     lines = [
         f"# Ingest status: {cfg.collection_name}",
@@ -1369,8 +2459,13 @@ async def ingest_status(params: StatusInput | None = None) -> str:
         f"- points: {points} · fingerprint: {fp}",
     ]
     if counts:
-        lines.append("- per-source points: " + ", ".join(
-            f"{s}={n}" for s, n in sorted(counts.items(), key=lambda kv: kv[1], reverse=True)))
+        lines.append(
+            "- per-source points: "
+            + ", ".join(
+                f"{s}={n}"
+                for s, n in sorted(counts.items(), key=lambda kv: kv[1], reverse=True)
+            )
+        )
     if watch:
         lines += ["", "## Watchers (last drain)"]
         for src, w in sorted(watch.items()):
@@ -1378,14 +2473,21 @@ async def ingest_status(params: StatusInput | None = None) -> str:
                 f"- {src}: {w.get('docs', 0)} docs / {w.get('chunks', 0)} chunks · "
                 f"added {w.get('added', 0)} · updated {w.get('updated', 0)} · "
                 f"unchanged {w.get('unchanged', 0)} · skipped {w.get('skipped', 0)} · "
-                f"@ {w.get('updated_at')}")
+                f"@ {w.get('updated_at')}"
+            )
     else:
-        lines += ["", "_No watcher state found (the daily watcher has not run on this box)._"]
+        lines += [
+            "",
+            "_No watcher state found (the daily watcher has not run on this box)._",
+        ]
     if report:
         drift = report.get("schema_drift") or {}
-        lines += ["", f"## Latest report ({report.get('generated_at')})",
-                  f"- totals: {report.get('totals')}",
-                  f"- schema drift: {drift or 'none'}"]
+        lines += [
+            "",
+            f"## Latest report ({report.get('generated_at')})",
+            f"- totals: {report.get('totals')}",
+            f"- schema drift: {drift or 'none'}",
+        ]
     return "\n".join(lines)
 
 
@@ -1394,8 +2496,12 @@ class GetVersionsInput(BaseModel):
 
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
 
-    source: str = Field(..., description="Source key (as returned in a search hit).", min_length=1)
-    document_id: str = Field(..., description="The document_id from a search hit.", min_length=1)
+    source: str = Field(
+        ..., description="Source key (as returned in a search hit).", min_length=1
+    )
+    document_id: str = Field(
+        ..., description="The document_id from a search hit.", min_length=1
+    )
     response_format: ResponseFormat = Field(
         ResponseFormat.MARKDOWN, description="'markdown' or 'json'."
     )
@@ -1425,25 +2531,41 @@ async def legal_get_document_versions(params: GetVersionsInput) -> str:
     try:
         cfg = _get_cfg()
         client = _get_client()
-        flt = models.Filter(must=[
-            models.FieldCondition(key="source", match=models.MatchValue(value=params.source)),
-            models.FieldCondition(key="document_id", match=models.MatchValue(value=params.document_id)),
-        ])
+        flt = models.Filter(
+            must=[
+                models.FieldCondition(
+                    key="source", match=models.MatchValue(value=params.source)
+                ),
+                models.FieldCondition(
+                    key="document_id", match=models.MatchValue(value=params.document_id)
+                ),
+            ]
+        )
         points = await asyncio.to_thread(_scroll_all, client, cfg.collection_name, flt)
     except Exception as e:  # noqa: BLE001
         return _handle_error(e)
 
     if not points:
-        return (f"No document found for source={params.source!r} "
-                f"document_id={params.document_id!r}.")
+        return (
+            f"No document found for source={params.source!r} "
+            f"document_id={params.document_id!r}."
+        )
 
-    reg = next(((pt.payload or {}).get("registration_code") for pt in points
-                if (pt.payload or {}).get("registration_code")), None)
+    reg = next(
+        (
+            (pt.payload or {}).get("registration_code")
+            for pt in points
+            if (pt.payload or {}).get("registration_code")
+        ),
+        None,
+    )
 
     if reg:
         try:
             vflt = build_filter(source=params.source, registration_code=reg)
-            vpoints = await asyncio.to_thread(_scroll_all, client, cfg.collection_name, vflt)
+            vpoints = await asyncio.to_thread(
+                _scroll_all, client, cfg.collection_name, vflt
+            )
         except Exception as e:  # noqa: BLE001
             return _handle_error(e)
         versions = _dedup_documents(vpoints)
@@ -1462,17 +2584,29 @@ async def legal_get_document_versions(params: GetVersionsInput) -> str:
             v["is_current"] = None
 
     if params.response_format is ResponseFormat.JSON:
-        return json.dumps({
-            "registration_code": reg, "count": len(versions), "versions": versions,
-        }, ensure_ascii=False, indent=2)
+        return json.dumps(
+            {
+                "registration_code": reg,
+                "count": len(versions),
+                "versions": versions,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
 
     if not reg:
-        return (f"# 1 version\n\nNo registry-code lineage for source={params.source!r} "
-                f"(this source doesn't group amendments). Single document:\n\n"
-                + _format_doc_line(1, versions[0]))
+        return (
+            f"# 1 version\n\nNo registry-code lineage for source={params.source!r} "
+            f"(this source doesn't group amendments). Single document:\n\n"
+            + _format_doc_line(1, versions[0])
+        )
     lines = [f"# {len(versions)} version(s) · registration_code `{reg}`", ""]
     for rank, v in enumerate(versions, 1):
-        tag = " **[in force]**" if v.get("is_current") else (f" ({v['status']})" if v.get("status") else "")
+        tag = (
+            " **[in force]**"
+            if v.get("is_current")
+            else (f" ({v['status']})" if v.get("status") else "")
+        )
         lines.append(_format_doc_line(rank, v) + tag)
     return "\n\n".join(lines)
 
@@ -1501,12 +2635,16 @@ async def legal_health() -> str:
         try:
             h = await asyncio.to_thread(_get_remote_client().health)
         except Exception as e:  # noqa: BLE001
-            return json.dumps({
-                "ok": False, "backend": "remote",
-                "error": f"{type(e).__name__}: {e}",
-                "hint": "Check RUNPOD_ENDPOINT_ID / RUNPOD_API_KEY in ingest/.env, or flip "
-                        "SEARCH_BACKEND=local to serve from the local Qdrant.",
-            }, ensure_ascii=False)
+            return json.dumps(
+                {
+                    "ok": False,
+                    "backend": "remote",
+                    "error": f"{type(e).__name__}: {e}",
+                    "hint": "Check RUNPOD_ENDPOINT_ID / RUNPOD_API_KEY in ingest/.env, or flip "
+                    "SEARCH_BACKEND=local to serve from the local Qdrant.",
+                },
+                ensure_ascii=False,
+            )
         published = _publish_manifest(cfg)
         publish_is_generation = bool(
             isinstance(published, dict)
@@ -1514,22 +2652,25 @@ async def legal_health() -> str:
             and published.get("generation_id")
             and published.get("generation_manifest_sha256")
         )
-        return json.dumps({
-            "ok": False,
-            "platform_ok": True,
-            "backend": "remote",
-            "code": (
-                "worker_generation_not_probed"
-                if publish_is_generation
-                else "generation_publish_manifest_missing_or_legacy"
-            ),
-            "endpoint_id": cfg.runpod_endpoint_id,
-            "workers": h.get("workers"),
-            "jobs": h.get("jobs"),
-            "published": published,
-            "hint": "Use the worker health operation/readiness gate before promotion; "
-                    "control-plane liveness cannot prove corpus identity.",
-        }, ensure_ascii=False)
+        return json.dumps(
+            {
+                "ok": False,
+                "platform_ok": True,
+                "backend": "remote",
+                "code": (
+                    "worker_generation_not_probed"
+                    if publish_is_generation
+                    else "generation_publish_manifest_missing_or_legacy"
+                ),
+                "endpoint_id": cfg.runpod_endpoint_id,
+                "workers": h.get("workers"),
+                "jobs": h.get("jobs"),
+                "published": published,
+                "hint": "Use the worker health operation/readiness gate before promotion; "
+                "control-plane liveness cannot prove corpus identity.",
+            },
+            ensure_ascii=False,
+        )
     try:
         cfg = _get_cfg()
         client = _get_client()
@@ -1542,10 +2683,14 @@ async def legal_health() -> str:
         )
         return json.dumps(readiness, ensure_ascii=False)
     except Exception as e:  # noqa: BLE001
-        return json.dumps({
-            "ok": False, "error": f"{type(e).__name__}: {e}",
-            "hint": "Start Qdrant (cd ingest && docker compose up -d) and check COLLECTION_NAME.",
-        }, ensure_ascii=False)
+        return json.dumps(
+            {
+                "ok": False,
+                "error": f"{type(e).__name__}: {e}",
+                "hint": "Start Qdrant (cd ingest && docker compose up -d) and check COLLECTION_NAME.",
+            },
+            ensure_ascii=False,
+        )
 
 
 def _is_our_server(pid: int) -> bool:

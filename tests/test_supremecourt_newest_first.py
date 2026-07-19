@@ -1,7 +1,9 @@
 import asyncio
 import hashlib
 import json
+import logging
 import sqlite3
+import stat
 import sys
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -16,13 +18,21 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SCRAPER_ROOT = PROJECT_ROOT / "scraper"
 sys.path.insert(0, str(SCRAPER_ROOT))
 
+from legal_scrapers import completion  # noqa: E402
 from legal_scrapers.middlewares import (  # noqa: E402
     SupremecourtRetryAfterMiddleware,
     _retry_after_seconds,
 )
-from legal_scrapers.extensions import RotatingSpiderLogExtension  # noqa: E402
+from legal_scrapers.extensions import (  # noqa: E402
+    CompletionAttestationExtension,
+    RotatingSpiderLogExtension,
+)
 from legal_scrapers.pipelines import SupremecourtDurablePipeline  # noqa: E402
-from legal_scrapers.run import crawl_quality_issues, parse_args  # noqa: E402
+from legal_scrapers.run import (  # noqa: E402
+    crawl_attestation_issues,
+    crawl_quality_issues,
+    parse_args,
+)
 from legal_scrapers.spiders.supremecourt_spider import (  # noqa: E402
     CHAMBER_NAMES,
     DateWindow,
@@ -30,6 +40,7 @@ from legal_scrapers.spiders.supremecourt_spider import (  # noqa: E402
     SupremecourtSpider,
     parse_authoritative_total,
 )
+from legal_scrapers.spiders import supremecourt_spider as supremecourt_module  # noqa: E402
 
 
 class _Stats:
@@ -382,6 +393,46 @@ def test_durable_pipeline_persists_before_marking_seen():
     assert events == ["persist", "seen", "settled"]
 
 
+def test_journal_persist_rejects_a_symlinked_ancestor(tmp_path):
+    real_parent = tmp_path / "real" / "run"
+    real_parent.mkdir(parents=True)
+    alias = tmp_path / "run-alias"
+    alias.symlink_to(real_parent, target_is_directory=True)
+    spider = SupremecourtSpider(start_date="2026-07-13", end_date="2026-07-13")
+    spider.crawler = _crawler()
+    spider.journal_path = alias / "items.journal.jsonl"
+
+    with pytest.raises(PermissionError, match="symlinked Supreme Court directory"):
+        spider.persist_item(
+            _artifact_item("1", "0", "2026-07-13"),
+            f"1:{CHAMBER_NAMES['0']}",
+        )
+
+    assert not (real_parent / "items.journal.jsonl").exists()
+
+
+def test_atomic_artifact_write_rejects_a_symlinked_ancestor(tmp_path):
+    real_parent = tmp_path / "real" / "run"
+    real_parent.mkdir(parents=True)
+    alias = tmp_path / "run-alias"
+    alias.symlink_to(real_parent, target_is_directory=True)
+
+    with pytest.raises(PermissionError, match="symlinked Supreme Court directory"):
+        supremecourt_module._atomic_write(alias / "items.jsonl", b"{}\n")
+
+    assert not (real_parent / "items.jsonl").exists()
+
+
+def test_directory_fsync_rejects_a_symlinked_ancestor(tmp_path):
+    real_parent = tmp_path / "real" / "run"
+    real_parent.mkdir(parents=True)
+    alias = tmp_path / "run-alias"
+    alias.symlink_to(real_parent, target_is_directory=True)
+
+    with pytest.raises(PermissionError, match="symlinked Supreme Court directory"):
+        supremecourt_module._fsync_directory(alias)
+
+
 def test_empty_modal_retries_then_stays_unseen_and_unresolved():
     spider = SupremecourtSpider(start_date="2026-07-13", end_date="2026-07-13")
     spider.crawler = _crawler()
@@ -450,7 +501,7 @@ def test_failure_manifest_retains_exact_count_with_bounded_examples():
     assert len(manifest["unresolved_failures"]) == 100
 
 
-def test_graceful_timeout_is_an_expected_partial_finish():
+def test_timeout_and_partial_boolean_alone_are_not_completion_evidence():
     args = parse_args(["--only", "supremecourt", "--max-runtime-seconds", "14400"])
     assert args.max_runtime_seconds == 14400
     crawler = SimpleNamespace(
@@ -460,7 +511,12 @@ def test_graceful_timeout_is_an_expected_partial_finish():
             get_stats=lambda: {"finish_reason": "closespider_timeout"}
         ),
     )
+    # The timeout is the expected *quality* reason, but the runner also requires the
+    # run-scoped strict-validator attestation.  A boolean cannot substitute for it.
     assert crawl_quality_issues([crawler]) == []
+    issues = crawl_attestation_issues([crawler])
+    assert len(issues) == 1
+    assert "completion paths are unavailable" in issues[0]
 
 
 def test_rotating_log_close_accepts_scrapy_signal_keyword_names():
@@ -563,6 +619,191 @@ def _write_finalized_parent(root, run_id="20260713T100000Z_parent"):
     for path in (items_path, journal_path, manifest_path):
         path.chmod(0o600)
     return run
+
+
+def _supreme_attestation_crawler(run: Path):
+    source_root = run.parents[1]
+    latest_dir = source_root / "latest"
+    for directory in (source_root, source_root / "runs", run, latest_dir):
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        directory.chmod(0o700)
+    latest_items_path = latest_dir / "items.jsonl"
+    latest_items_path.write_bytes((run / "items.jsonl").read_bytes())
+    latest_items_path.chmod(0o600)
+
+    stats = _Stats()
+    spider = SimpleNamespace(
+        name="supremecourt",
+        run_id=run.name,
+        source_root=source_root,
+        run_dir=run,
+        latest_dir=latest_dir,
+        items_path=run / "items.jsonl",
+        latest_items_path=latest_items_path,
+        log_path=run / "spider.log",
+        run_metadata_path=run / "run.json",
+        latest_metadata_path=latest_dir / "run.json",
+        scraping_start_date=date(2026, 7, 1),
+        scraping_end_date=date(2026, 7, 13),
+        started_at=datetime(2026, 7, 13, 10, tzinfo=UTC),
+        partial_by_design=True,
+        _pagination_reconcilers={},
+        logger=logging.getLogger(f"test.supremecourt.{run.name}"),
+    )
+
+    def record_quality_failure(kind, _url, **_kwargs):
+        stats.inc_value("quality/failures")
+        stats.inc_value(f"quality/{kind}")
+
+    spider.record_quality_failure = record_quality_failure
+    crawler = SimpleNamespace(
+        spider=spider,
+        stats=stats,
+        settings=Settings({"FEEDS": {}}),
+    )
+    spider.crawler = crawler
+    startup = completion.build_startup_record(spider)
+    completion.publish_startup_metadata(
+        spider.run_metadata_path,
+        spider.latest_metadata_path,
+        startup,
+    )
+    return crawler
+
+
+def _rewrite_supreme_manifest(run: Path, mutate) -> dict:
+    path = run / "partial_manifest.json"
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    mutate(manifest)
+    path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o600)
+    return manifest
+
+
+def test_completion_extension_accepts_real_strict_supreme_validator(tmp_path):
+    run = _write_finalized_parent(tmp_path / "artifacts")
+    crawler = _supreme_attestation_crawler(run)
+
+    extension = CompletionAttestationExtension(crawler)
+    extension.spider_closed(crawler.spider, "closespider_timeout")
+
+    record = completion.verify_terminal_record(
+        crawler.spider.run_metadata_path,
+        expected_source="supremecourt",
+        expected_run_id=run.name,
+        expected_items_path=run / "items.jsonl",
+    )
+    validation = record["source_validation"]
+    assert record["outcome"] == "success"
+    assert record["finish_reason"] == "closespider_timeout"
+    assert validation["kind"] == "supremecourt_partial_v1"
+    assert validation["passed"] is True
+    assert validation["run_id"] == run.name
+    assert validation["items_sha256"] == hashlib.sha256(
+        (run / "items.jsonl").read_bytes()
+    ).hexdigest()
+    assert validation["manifest_sha256"] == hashlib.sha256(
+        (run / "partial_manifest.json").read_bytes()
+    ).hexdigest()
+    assert validation["journal_sha256"] == hashlib.sha256(
+        (run / "items.journal.jsonl").read_bytes()
+    ).hexdigest()
+    assert extension._terminal_success_verified is True
+
+
+@pytest.mark.parametrize(
+    "failure_kind",
+    [
+        "validator_failure",
+        "validator_unavailable",
+        "identity_drift",
+        "items_drift",
+        "manifest_drift",
+        "journal_drift",
+        "unresolved_failures",
+        "timeout_boolean_only",
+    ],
+)
+def test_completion_extension_rejects_incomplete_supreme_proof(
+    tmp_path, monkeypatch, failure_kind
+):
+    run = _write_finalized_parent(tmp_path / "artifacts")
+    real_validator = completion._load_supremecourt_validator()
+
+    if failure_kind == "validator_failure":
+        _rewrite_supreme_manifest(
+            run, lambda manifest: manifest.__setitem__("max_runtime_seconds", 14399)
+        )
+    elif failure_kind == "validator_unavailable":
+
+        def unavailable():
+            raise completion.CompletionError("validator deliberately unavailable")
+
+        monkeypatch.setattr(completion, "_load_supremecourt_validator", unavailable)
+    elif failure_kind in {
+        "identity_drift",
+        "items_drift",
+        "manifest_drift",
+        "journal_drift",
+    }:
+
+        def validate_then_drift(run_dir):
+            report = real_validator.validate_run(run_dir)
+            if failure_kind == "identity_drift":
+                report = dict(report)
+                report["run_id"] = f"{report['run_id']}_other"
+                return report
+            filenames = {
+                "items_drift": "items.jsonl",
+                "manifest_drift": "partial_manifest.json",
+                "journal_drift": "items.journal.jsonl",
+            }
+            target = Path(run_dir) / filenames[failure_kind]
+            target.write_bytes(target.read_bytes() + b" ")
+            return report
+
+        monkeypatch.setattr(
+            completion,
+            "_load_supremecourt_validator",
+            lambda: SimpleNamespace(validate_run=validate_then_drift),
+        )
+    elif failure_kind == "unresolved_failures":
+
+        def retain_unresolved_failure(manifest):
+            manifest["unresolved_failure_count"] = 1
+            manifest["unresolved_failures_truncated"] = False
+            manifest["unresolved_failures"] = [
+                {"kind": "retained", "detail": "operator review required"}
+            ]
+
+        _rewrite_supreme_manifest(run, retain_unresolved_failure)
+        assert real_validator.validate_run(run)["unresolved_failure_count"] == 1
+    else:
+        # The expected timeout and the spider's partial-by-design boolean are not
+        # acceptance evidence without the strict manifest/journal proof.
+        (run / "partial_manifest.json").unlink()
+        (run / "items.journal.jsonl").unlink()
+
+    crawler = _supreme_attestation_crawler(run)
+    extension = CompletionAttestationExtension(crawler)
+    extension.spider_closed(crawler.spider, "closespider_timeout")
+
+    record = json.loads(crawler.spider.run_metadata_path.read_text(encoding="utf-8"))
+    assert record["outcome"] == "failure"
+    assert record["quality_passed"] is False
+    assert record["feeds_durable"] is False
+    assert record["failure_count"] >= 1
+    assert record["source_validation"] == {
+        "kind": "supremecourt_partial_v1",
+        "passed": False,
+    }
+    assert crawler.stats.values["quality/source_validation_failed"] == 1
+    assert extension._terminal_success_verified is False
+    with pytest.raises(completion.CompletionError, match="required terminal state"):
+        completion.verify_terminal_record(crawler.spider.run_metadata_path)
 
 
 def test_validated_final_parent_seeds_each_chamber_and_advances_child_cursors(
@@ -742,7 +983,7 @@ def test_partial_manifest_and_cumulative_items_are_atomic_and_exact(
         spider._completed_intervals[chamber].append(
             (date(2026, 7, 10), date(2026, 7, 13))
         )
-    spider.closed("closespider_timeout")
+    spider.prepare_completion("closespider_timeout")
 
     payload = spider.items_path.read_bytes()
     manifest = json.loads(spider.partial_manifest_path.read_text())
@@ -759,6 +1000,47 @@ def test_partial_manifest_and_cumulative_items_are_atomic_and_exact(
     assert not list(spider.run_dir.glob(".*.tmp"))
 
 
+def test_completion_hook_creates_and_fsyncs_an_empty_private_journal(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "artifacts"
+    monkeypatch.setattr(SupremecourtSpider, "ARTIFACTS_ROOT", root)
+    settings = Settings({"DEDUP_ENABLED": True, "CLOSESPIDER_TIMEOUT": 14400})
+    spider = SupremecourtSpider(start_date="2026-07-01", end_date="2026-07-13")
+    spider.crawler = _crawler(settings)
+    spider.crawler.stats.set_value("elapsed_time_seconds", 14400.4)
+    spider.configure_run_outputs(settings)
+
+    assert not spider.journal_path.exists()
+    spider.prepare_completion("closespider_timeout")
+
+    assert spider.journal_path.read_bytes() == b""
+    assert stat.S_IMODE(spider.journal_path.stat().st_mode) == 0o600
+    first_manifest = spider.partial_manifest_path.read_bytes()
+    first_items = spider.items_path.read_bytes()
+    spider.prepare_completion("closespider_timeout")
+    assert spider.partial_manifest_path.read_bytes() == first_manifest
+    assert spider.items_path.read_bytes() == first_items
+
+
+def test_completion_hook_rejects_a_symlinked_journal_ancestor(tmp_path):
+    real_parent = tmp_path / "real" / "run"
+    real_parent.mkdir(parents=True)
+    alias = tmp_path / "run-alias"
+    alias.symlink_to(real_parent, target_is_directory=True)
+    spider = SupremecourtSpider(start_date="2026-07-01", end_date="2026-07-13")
+    spider.crawler = _crawler(Settings({"CLOSESPIDER_TIMEOUT": 14400}))
+    spider._run_ready = True
+    spider.journal_path = alias / "items.journal.jsonl"
+
+    with pytest.raises(PermissionError, match="symlinked Supreme Court directory"):
+        spider.prepare_completion("closespider_timeout")
+
+    assert spider._artifacts_finalized is False
+    assert spider._completion_preparing is False
+    assert not (real_parent / "items.journal.jsonl").exists()
+
+
 def test_final_manifest_has_monotonic_elapsed_before_corestats_close(
     monkeypatch,
 ):
@@ -772,3 +1054,60 @@ def test_final_manifest_has_monotonic_elapsed_before_corestats_close(
     manifest = spider._manifest(final=True)
 
     assert manifest["elapsed_time_seconds"] == 14400.5
+
+
+def test_evidence_parent_loader_binds_exact_feed_hash_and_rejects_drift(tmp_path):
+    spider = SupremecourtSpider(start_date="1900-01-01", end_date="2026-07-15")
+    path = tmp_path / "parent" / "items.jsonl"
+    path.parent.mkdir(mode=0o700)
+    rows = [_artifact_item("100"), _artifact_item("200", "1")]
+    payload = b"".join(
+        (json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
+        for row in rows
+    )
+    path.write_bytes(payload)
+    path.chmod(0o600)
+
+    loaded = spider._load_exact_parent_items(
+        path, expected_sha256=hashlib.sha256(payload).hexdigest()
+    )
+    assert set(loaded) == {
+        f"100:{CHAMBER_NAMES['0']}",
+        f"200:{CHAMBER_NAMES['1']}",
+    }
+
+    with pytest.raises(RuntimeError, match="hash does not match"):
+        spider._load_exact_parent_items(path, expected_sha256="0" * 64)
+
+
+def test_evidence_parent_loader_rejects_duplicate_identity(tmp_path):
+    spider = SupremecourtSpider(start_date="1900-01-01", end_date="2026-07-15")
+    path = tmp_path / "parent" / "items.jsonl"
+    path.parent.mkdir(mode=0o700)
+    row = _artifact_item("100")
+    payload = (
+        (json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n") * 2
+    ).encode()
+    path.write_bytes(payload)
+    path.chmod(0o600)
+
+    with pytest.raises(RuntimeError, match="repeats identity"):
+        spider._load_exact_parent_items(
+            path, expected_sha256=hashlib.sha256(payload).hexdigest()
+        )
+
+
+def test_explicit_no_parent_is_rejected_after_any_evidence_run_exists(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "evidence"
+    (root / "supremecourt" / "runs" / "interrupted-run").mkdir(parents=True)
+    monkeypatch.setattr(supremecourt_module, "EVIDENCE_ARTIFACTS_ROOT", root)
+    spider = SupremecourtSpider(
+        start_date="1900-01-01",
+        end_date="2026-07-15",
+        parent_run_id="none",
+    )
+
+    with pytest.raises(RuntimeError, match="only before the first"):
+        spider._discover_resume_state(evidence=True)

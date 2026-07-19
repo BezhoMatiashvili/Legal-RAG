@@ -63,11 +63,12 @@ def test_executor_forwards_current_production_policy_and_request(monkeypatch):
         "max_per_doc": None,
         "mmr_lambda": None,
         "timings_ms": {"embed": 0.0, "search": 0.0, "rerank": 0.0},
+        "trace": {},
         "source": "matsne",
         "status": "in_force",
         "language": "ka",
         "date_from": "2020-01-01",
-        "date_to": "2026-01-01",
+        "as_of": "2026-01-01",
     }
     assert outcome.hits == (point,)
     assert outcome.effective_route == "dense_only"
@@ -175,11 +176,22 @@ def test_request_rejects_conflicting_filter_context():
 
     request = RetrievalRequest(
         query="q",
-        filters={"date_to": "2025-01-01"},
+        filters={"as_of": "2025-01-01"},
         temporal_context=TemporalContext(as_of="2026-01-01"),
     )
     with pytest.raises(ValueError, match="temporal context conflicts"):
         request.search_kwargs()
+
+
+def test_publication_date_and_effective_as_of_are_independent_filters():
+    request = RetrievalRequest(
+        query="q",
+        temporal_context=TemporalContext(date_to="2025-01-01", as_of="2026-01-01"),
+    )
+    assert request.search_kwargs() == {
+        "date_to": "2025-01-01",
+        "as_of": "2026-01-01",
+    }
 
 
 def test_policy_records_the_existing_candidate_floor():
@@ -192,7 +204,10 @@ def test_policy_records_the_existing_candidate_floor():
 def _provenance(**overrides):
     values = {
         "collection_alias": "georgian_legal",
+        "serving_alias": "georgian_legal",
         "physical_collection": "georgian_legal__gen_20260713",
+        "queried_collection": "georgian_legal",
+        "access_kind": "serving_alias",
         "generation_id": "20260713",
         "points_count": 12,
         "corpus_hash": "1" * 64,
@@ -206,6 +221,7 @@ def _provenance(**overrides):
         "vector_space_id": "3" * 64,
         "chunk_config_id": "4" * 64,
         "header_config_id": "5" * 64,
+        "retrieval_fingerprint_revision": 2,
         "retrieval_fingerprint": "6" * 64,
         "frozen_set_hashes": {"v2": "7" * 64},
         "dependency_identity": "8" * 64,
@@ -229,6 +245,13 @@ def test_evaluation_provenance_fails_closed_on_missing_identity():
         _provenance(snapshot_hash="not-a-hash").validate_complete()
     with pytest.raises(ValueError, match="physical_collection"):
         _provenance(physical_collection="georgian_legal").validate_complete()
+    with pytest.raises(ValueError, match="retrieval_fingerprint_revision"):
+        _provenance(retrieval_fingerprint_revision=1).validate_complete()
+    with pytest.raises(ValueError, match="queried_collection"):
+        _provenance(
+            access_kind="direct_physical",
+            queried_collection="georgian_legal",
+        ).validate_complete()
 
 
 @pytest.mark.parametrize(
@@ -274,16 +297,78 @@ def test_production_eval_backend_uses_shared_executor_and_separate_translation_t
     assert backend.last_outcome.retrieval_fingerprint == "fp"
 
 
+def test_client_translated_track_never_falls_back_for_missing_english_translation(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        eval_backend,
+        "execute_retrieval",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("degraded translation must not retrieve")
+        ),
+    )
+    backend = ProductionBackend(_cfg(), "client", "embedder", "reranker", translations={})
+
+    hits, latency = backend.search("What does the current law require?", "client_translated", 10)
+
+    assert hits == []
+    assert latency == {"embed": 0.0, "search": 0.0, "rerank": 0.0}
+    assert backend.last_outcome.degraded is True
+    assert backend.last_outcome.degraded_reason == "missing_authored_translation"
+
+
+def test_accuracy_strict_eval_backend_uses_branch_traced_executor_and_static_translator(
+    monkeypatch,
+):
+    captured = []
+    point = SimpleNamespace(
+        payload={"source": "matsne", "document_id": "1", "chunk_index": 2},
+        score=0.91,
+    )
+
+    def fake_execute(cfg, client, embedder, reranker, request, *, translator, candidate_depth):
+        captured.append((cfg, client, embedder, reranker, request, translator, candidate_depth))
+        return SimpleNamespace(
+            hits=(point,),
+            timings_ms={"candidate_branches": 4.0, "rerank": 5.0, "total": 10.0},
+            degraded=False,
+            degraded_reason=None,
+            service_abstention=False,
+            abstention_reason=None,
+            branches=(),
+            result_hash="strict-hash",
+        )
+
+    monkeypatch.setattr(eval_backend, "execute_accuracy_retrieval", fake_execute)
+    backend = ProductionBackend(
+        _cfg(), "client", "embedder", "reranker",
+        translations={"What is the law": "რა არის კანონი"},
+    )
+    hits, latency = backend.search("What is the law", "accuracy_strict", 10)
+
+    request = captured[0][4]
+    translator = captured[0][5]
+    assert request.query == "What is the law"
+    assert request.query_language == "en" and request.track == "accuracy_strict"
+    assert captured[0][6] == 80
+    assert translator.version.startswith("static-map:")
+    assert hits[0].document_id == "1"
+    assert latency == {"embed": 0.0, "search": 0.004, "rerank": 0.005}
+    assert backend.last_outcome.result_hash == "strict-hash"
+
+
 def test_production_is_primary_and_translation_is_a_separate_track():
     assert selected_modes("qdrant", None, has_translations=False) == ["production"]
     assert selected_modes("fake", None, has_translations=False) == list(eval_backend.MODES)
     all_tracks = selected_modes("qdrant", "all", has_translations=True)
-    assert all_tracks[:2] == ["production", "client_translated"]
+    assert all_tracks[:3] == ["production", "accuracy_strict", "client_translated"]
     with pytest.raises(ValueError, match="requires --translate-queries"):
         selected_modes("qdrant", "client_translated", has_translations=False)
+    with pytest.raises(ValueError, match="requires --translate-queries"):
+        selected_modes("qdrant", "accuracy_strict", has_translations=False)
 
 
-def test_degraded_execution_is_excluded_and_reported_separately():
+def test_degraded_execution_is_counted_as_failure_and_reported_separately():
     gold = [
         SimpleNamespace(id="q1", query="one", query_type="keyword", query_language="en"),
         SimpleNamespace(id="q2", query="two", query_type="keyword", query_language="en"),
@@ -315,9 +400,28 @@ def test_degraded_execution_is_excluded_and_reported_separately():
             }
 
     scores, latency = run_mode(Backend(), gold, rel, "production", "chunk", 10)
-    assert [score.id for score in scores] == ["q2"]
+    assert [score.id for score in scores] == ["q1", "q2"]
+    assert scores[0].failed is True
+    assert scores[0].success10 == 0.0
+    # An abstention on an answerable frozen query is a persisted zero-score failure.
+    assert scores[1].failed is True
+    assert scores[1].failure_reason == "answerable_abstention:no_results_after_policy"
     assert latency["degraded"] == [{
         "query_id": "q1",
         "reason": "remote down",
         "timings_ms": {"embed": 1, "search": 2, "rerank": 3, "total": 6},
     }]
+
+
+def test_production_backend_hit_adapter_retains_version_identity():
+    point = SimpleNamespace(
+        payload={
+            "source": "matsne",
+            "document_id": "law",
+            "version_id": "law@2026",
+            "chunk_index": 4,
+        },
+        score=0.9,
+    )
+    (hit,) = ProductionBackend._hits((point,))
+    assert hit.version_id == "law@2026"

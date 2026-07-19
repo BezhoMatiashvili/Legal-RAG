@@ -1,14 +1,10 @@
 #!/usr/bin/env python3
-"""Scan an already-indexed Qdrant collection and emit generation-candidate inputs.
+"""NON-PRODUCTION diagnostic scan of an already-indexed Qdrant collection.
 
-READ-ONLY: this only calls ``scroll`` against Qdrant — it never upserts, deletes, or
-recreates anything. Writes exactly the three local files
-``scripts/create_generation.py`` needs beyond a hand-authored manifest:
-``documents.jsonl``, ``sample_checks.jsonl``, and a ``source_state.json`` placeholder
-(the real source-state ledger lives in the scraper's success-state, not in Qdrant; this
-placeholder simply names which collection/generation the scan covers so
-``create_generation.py``'s required ``--source-state`` argument has a real, honestly-
-labeled file rather than a guess masquerading as scrape provenance).
+READ-ONLY: this only calls ``scroll`` against Qdrant.  It emits diagnostic document and
+sample reconstructions, never source-state or publisher inputs.  Production preparation
+is exclusively ``scripts/prepare_generation.py`` against a sealed attested snapshot and
+an exact physical generation collection.
 
 Building a full ``GenerationManifest`` additionally needs the model/tokenizer/reranker
 revision pins and a dependency lock hash that do not exist in this repo yet — see
@@ -80,11 +76,21 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--source", default=None, help="scan only this source (bounds memory/time)")
     parser.add_argument("--collection", default=None, help="override Config.collection_name")
     parser.add_argument("--batch-size", type=int, default=10_000)
+    parser.add_argument(
+        "--diagnostic",
+        action="store_true",
+        help="required acknowledgement that output is not publishable production evidence",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if not args.diagnostic:
+        raise SystemExit(
+            "refusing production-like candidate scan: pass --diagnostic to acknowledge "
+            "that this output cannot be published"
+        )
     cfg = load_config()
     collection = args.collection or cfg.collection_name
     client = store.make_client(cfg)
@@ -99,7 +105,6 @@ def main(argv: list[str] | None = None) -> int:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     documents_path = args.output_dir / "documents.jsonl"
     samples_path = args.output_dir / "sample_checks.jsonl"
-    source_state_path = args.output_dir / "source_state.json"
 
     with documents_path.open("w", encoding="utf-8") as fh:
         for record in result.documents:
@@ -107,28 +112,10 @@ def main(argv: list[str] | None = None) -> int:
     with samples_path.open("w", encoding="utf-8") as fh:
         for sample in result.samples:
             fh.write(json.dumps(sample, sort_keys=True, ensure_ascii=False) + "\n")
-    source_state_path.write_text(
-        json.dumps(
-            {
-                "derived_from_collection": collection,
-                "source_filter": args.source,
-                "generation_id": args.generation_id,
-                "note": (
-                    "Derived by scanning the live Qdrant collection, not from the scraper's "
-                    "success-state ledger — this collection predates the generation system."
-                ),
-            },
-            indent=2,
-            sort_keys=True,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
 
     print(f"documents:  {len(result.documents)} -> {documents_path}", file=sys.stderr)
     print(f"samples:    {len(result.samples)} -> {samples_path}", file=sys.stderr)
     print(f"chunks:     {result.chunk_count}", file=sys.stderr)
-    print(f"source_state: {source_state_path}", file=sys.stderr)
     if result.issues:
         print(f"ISSUES: {len(result.issues)} (first 20 shown)", file=sys.stderr)
         for issue in result.issues[:20]:
@@ -136,9 +123,8 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print("No issues.", file=sys.stderr)
     print(
-        "NOTE: this does not build a manifest.json — model/tokenizer/reranker revisions "
-        "and a dependency lock hash are still missing external evidence "
-        "(ingest/serverless/runtime-identity.unconfigured.json). Do not fabricate them.",
+        "DIAGNOSTIC ONLY: no source_state.json or publishable prepared directory was "
+        "emitted. Use scripts/prepare_generation.py for production.",
         file=sys.stderr,
     )
     return 0

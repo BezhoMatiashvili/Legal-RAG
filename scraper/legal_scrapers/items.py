@@ -141,6 +141,8 @@ class NaprItem(scrapy.Item):
     content_kind = _f()
     content_complete = _f()
     extraction_status = _f()
+    page_boundaries = _list()
+    page_coordinate_reason = _f()
     body_markdown = _body()
 
 
@@ -158,6 +160,11 @@ class TbappealItem(scrapy.Item):
     content_kind = _f()
     content_complete = _f()
     extraction_status = _f()
+    page_boundaries = _list()
+    page_coordinate_reason = _f()
+    source_authority = _f()
+    admissible = _f()
+    quarantine_reason = _f()
     body_markdown = _body()
 
 
@@ -199,6 +206,9 @@ class TasItem(scrapy.Item):
     content_kind = _f()
     content_complete = _f()
     extraction_status = _f()
+    source_authority = _f()
+    admissible = _f()
+    quarantine_reason = _f()
     body_markdown = _body()
 
     # --- detail: document / decision ----------------------------------------

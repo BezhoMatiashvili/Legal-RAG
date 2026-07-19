@@ -82,7 +82,12 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):  # noqa: N802
-        self._send(200, {"ok": True, "device": DEVICE, "model": MODEL})
+        # max_length is part of the score-parity contract (memory-bank
+        # reranker-score-parity): clients verify it against their local config.
+        self._send(
+            200,
+            {"ok": True, "device": DEVICE, "model": MODEL, "max_length": MAX_LENGTH},
+        )
 
     def do_POST(self):  # noqa: N802
         try:

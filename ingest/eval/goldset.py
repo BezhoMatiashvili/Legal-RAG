@@ -16,7 +16,7 @@ load we:
 import hashlib
 import json
 import unicodedata
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -60,6 +60,13 @@ def _nfc(text: str) -> str:
     return unicodedata.normalize("NFC", text)
 
 
+def _evidence_group_id(record: dict) -> str | None:
+    for field_name in ("evidence_group", "equivalence_group", "group_id"):
+        if record.get(field_name) is not None:
+            return str(record[field_name])
+    return None
+
+
 @dataclass(frozen=True)
 class Relevance:
     document_id: str
@@ -67,6 +74,18 @@ class Relevance:
     char_start: int
     char_end: int
     grade: int
+    # Spans with the same explicit group id are alternative acceptable evidence.  With no
+    # id, each annotation becomes its own required evidence unit in build_query_relevance.
+    evidence_group: str | None = None
+    required: bool = True
+    source: str | None = None
+    # v3 provenance.  Frozen v1/v2 records leave these unset, preserving their exact
+    # historical interpretation while allowing the v3 adapter to retain canonical version
+    # identity all the way to qrel construction.
+    version_id: str | None = None
+    lineage_family_id: str | None = None
+    evidence_id: str | None = None
+    article_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -82,6 +101,20 @@ class GoldQuery:
     relevance: list[Relevance] = field(default_factory=list)
     answer: str = ""
     doc_title: str = ""
+    # Bootstrap/permutation cluster.  v3 may provide an amendment/version-lineage family;
+    # frozen v1/v2 default to the gold document family.
+    cluster_id: str = ""
+    # Optional v3 policy/slice metadata.  Defaults keep every v1/v2 constructor and loader
+    # backward compatible.
+    as_of: str | None = None
+    split: str = ""
+    risk_level: str = ""
+    tags: tuple[str, ...] = ()
+    expected_outcome: str = "answer"
+    partition_family_ids: tuple[str, ...] = ()
+    dataset_id: str = ""
+    corpus_generation: str = ""
+    gold_version_id: str | None = None
 
 
 def load_golden_set(path: Path = DEFAULT_GOLD) -> list[GoldQuery]:
@@ -93,6 +126,7 @@ def load_golden_set(path: Path = DEFAULT_GOLD) -> list[GoldQuery]:
             if not line or line.startswith("#"):
                 continue
             r = json.loads(line)
+            gold_record = r["gold"]
             rels = [
                 Relevance(
                     document_id=x["document_id"],
@@ -100,9 +134,24 @@ def load_golden_set(path: Path = DEFAULT_GOLD) -> list[GoldQuery]:
                     char_start=x["char_start"],
                     char_end=x["char_end"],
                     grade=int(x["grade"]),
+                    evidence_group=_evidence_group_id(x),
+                    required=bool(x.get("required", True)),
+                    source=x.get("source"),
+                    version_id=x.get("version_id"),
+                    lineage_family_id=x.get("lineage_family_id"),
+                    evidence_id=x.get("evidence_id"),
+                    article_id=x.get("article_id"),
                 )
                 for x in r.get("relevance", [])
             ]
+            family = (
+                r.get("cluster_id")
+                or r.get("version_family")
+                or r.get("document_family")
+                or gold_record.get("version_family")
+                or gold_record.get("document_family")
+                or f"{gold_record['source']}:{gold_record['document_id']}"
+            )
             out.append(
                 GoldQuery(
                     id=r["id"],
@@ -111,11 +160,23 @@ def load_golden_set(path: Path = DEFAULT_GOLD) -> list[GoldQuery]:
                     query_language=r["query_language"],
                     source=r["source"],
                     document_id=r["document_id"],
-                    gold_source=r["gold"]["source"],
-                    gold_document_id=r["gold"]["document_id"],
+                    gold_source=gold_record["source"],
+                    gold_document_id=gold_record["document_id"],
                     relevance=rels,
                     answer=r.get("answer", ""),
                     doc_title=r.get("doc_title", ""),
+                    cluster_id=str(family),
+                    as_of=r.get("as_of"),
+                    split=str(r.get("split", "")),
+                    risk_level=str(r.get("risk_level", "")),
+                    tags=tuple(str(tag) for tag in r.get("tags", ())),
+                    expected_outcome=str(r.get("expected_outcome", "answer")),
+                    partition_family_ids=tuple(
+                        str(item) for item in r.get("partition_family_ids", ())
+                    ),
+                    dataset_id=str(r.get("dataset_id", "")),
+                    corpus_generation=str(r.get("corpus_generation", "")),
+                    gold_version_id=gold_record.get("version_id"),
                 )
             )
     return out
@@ -127,18 +188,31 @@ def load_holdout(path: Path = DEFAULT_HOLDOUT) -> set[tuple[str, str]]:
 
 
 def eval_set_hash(path: Path = DEFAULT_GOLD) -> str:
-    """Short content hash of the eval-set file, for stamping every score."""
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()[:16]
+    """Full content SHA-256 of the eval-set file, for stamping every score."""
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
 # Module-level cache: (root, source) → {doc_id: body}. Shared across SnapshotBodies
 # instances so the huge per-source jsonl (matsne is multi-GB) is read at most once.
 _SOURCE_CACHE: dict[tuple[str, str], dict[str, str]] = {}
+# Full canonical/raw records are kept separately: answer/retrieval evaluation continues to
+# pay only for body strings, while deterministic field extractors can inspect promoted/raw
+# metadata such as the Supreme Court ``result`` without reparsing the same multi-GB file.
+_SOURCE_RECORD_CACHE: dict[tuple[str, str, tuple[str, ...]], dict[str, dict]] = {}
 
 
 def gold_docs(gold: list[GoldQuery]) -> set[tuple[str, str]]:
-    """The ``(source, document_id)`` set the gold queries cite (also the eval-source set)."""
-    return {(q.gold_source, q.gold_document_id) for q in gold}
+    """All ``(source, document_id)`` pairs referenced by required evidence.
+
+    Frozen v1/v2 use one source/document per query.  The general form matters for v3
+    multi-document questions and prevents secondary evidence documents from being omitted
+    from snapshot loading or holdout enforcement.
+    """
+    out: set[tuple[str, str]] = set()
+    for q in gold:
+        out.add((q.gold_source, q.gold_document_id))
+        out.update((rel.source or q.gold_source, rel.document_id) for rel in q.relevance)
+    return out
 
 
 class SnapshotBodies:
@@ -161,9 +235,21 @@ class SnapshotBodies:
         needed: set[tuple[str, str]] | None = None,
         *,
         extra_roots: Sequence[Path] = (),
+        source_files: Mapping[str, Path | Sequence[Path]] | None = None,
+        document_id_fields: Mapping[str, Sequence[str]] | None = None,
     ):
         self.roots = [Path(root), *(Path(r) for r in extra_roots)]
         self.root = self.roots[0]
+        self._source_files: dict[str, tuple[Path, ...]] = {}
+        for source, paths in (source_files or {}).items():
+            values = (paths,) if isinstance(paths, Path) else tuple(paths)
+            if not values:
+                raise ValueError(f"source_files[{source!r}] must not be empty")
+            self._source_files[str(source)] = tuple(Path(path) for path in values)
+        self._document_id_fields = {
+            str(source): tuple(str(field_name) for field_name in fields)
+            for source, fields in (document_id_fields or {}).items()
+        }
         self._needed: dict[str, set[str]] | None = None
         if needed is not None:
             self._needed = {}
@@ -172,7 +258,51 @@ class SnapshotBodies:
 
     def source_files(self, source: str) -> list[Path]:
         """Existing per-root docs files for ``source``, primary root first."""
+        if source in self._source_files:
+            return [path for path in self._source_files[source] if path.exists()]
         return [r / f"{source}.jsonl" for r in self.roots if (r / f"{source}.jsonl").exists()]
+
+    def _load_source_records(self, source: str) -> dict[str, dict]:
+        """Load full JSONL records with the same primary-first precedence as bodies."""
+
+        want = None if self._needed is None else self._needed.get(source, set())
+        paths = self.source_files(source)
+        if not paths:
+            candidates = self._source_files.get(
+                source, tuple(root / f"{source}.jsonl" for root in self.roots)
+            )
+            raise FileNotFoundError(
+                f"no docs file for source {source!r}: {[str(path) for path in candidates]}"
+            )
+        merged: dict[str, dict] = {}
+        for path in reversed(paths):  # primary applied last -> wins on collision
+            fields = self._document_id_fields.get(source, ("document_id",))
+            key = (str(path), source, fields)
+            cached = _SOURCE_RECORD_CACHE.get(key, {})
+            if want is None or not want <= set(cached):
+                table = dict(cached)
+                with open(path, encoding="utf-8") as handle:
+                    for line in handle:
+                        if not line.strip():
+                            continue
+                        record = json.loads(line)
+                        try:
+                            parts = [str(record[field_name]).strip() for field_name in fields]
+                        except KeyError as exc:
+                            raise KeyError(
+                                f"{path}: source {source!r} lacks identity field {exc.args[0]!r}"
+                            ) from exc
+                        if not parts or any(not part for part in parts):
+                            raise ValueError(
+                                f"{path}: source {source!r} has an empty document identity"
+                            )
+                        document_id = ":".join(parts)
+                        if want is None or document_id in want:
+                            table[document_id] = record
+                _SOURCE_RECORD_CACHE[key] = table
+                cached = table
+            merged.update(cached)
+        return merged
 
     def _merged_cache(self, source: str) -> dict[str, str]:
         merged: dict[str, str] = {}
@@ -181,6 +311,11 @@ class SnapshotBodies:
         return merged
 
     def _load_source(self, source: str) -> dict[str, str]:
+        if source in self._source_files:
+            return {
+                document_id: str(record["body_markdown"])
+                for document_id, record in self._load_source_records(source).items()
+            }
         want = None if self._needed is None else self._needed.get(source, set())
         if len(self.roots) == 1:
             key = (str(self.root), source)
@@ -225,6 +360,24 @@ class SnapshotBodies:
         except KeyError as e:
             raise KeyError(f"doc not in snapshot: {source}:{document_id}") from e
 
+    def record(self, source: str, document_id: str) -> dict:
+        """Return a copy of the full source record for deterministic metadata evals."""
+
+        try:
+            return dict(self._load_source_records(source)[document_id])
+        except KeyError as e:
+            raise KeyError(f"doc not in snapshot: {source}:{document_id}") from e
+
+
+def relevance_body(bodies: object, source: str, relevance: Relevance) -> str:
+    """Resolve the exact canonical version for v3, with a v1/v2-compatible fallback."""
+
+    body_version = getattr(bodies, "body_version", None)
+    if relevance.version_id is not None and callable(body_version):
+        return body_version(source, relevance.document_id, relevance.version_id)
+    body = getattr(bodies, "body")
+    return body(source, relevance.document_id)
+
 
 def reground(gold: list[GoldQuery], bodies: SnapshotBodies) -> int:
     """Assert every evidence span slices back exactly (NFC). Returns #spans checked.
@@ -236,7 +389,8 @@ def reground(gold: list[GoldQuery], bodies: SnapshotBodies) -> int:
     for q in gold:
         for rel in q.relevance:
             checked += 1
-            body = bodies.body(q.gold_source, rel.document_id)
+            source = rel.source or q.gold_source
+            body = relevance_body(bodies, source, rel)
             got = _nfc(body[rel.char_start : rel.char_end])
             if got != _nfc(rel.evidence_quote):
                 drift.append(f"{q.id}[{rel.char_start}:{rel.char_end}]")
@@ -250,10 +404,7 @@ def reground(gold: list[GoldQuery], bodies: SnapshotBodies) -> int:
 
 def enforce_holdout(gold: list[GoldQuery], holdout: set[tuple[str, str]]) -> None:
     """Every gold document must be in the reserved holdout set."""
-    missing = sorted(
-        {(q.gold_source, q.gold_document_id) for q in gold}
-        - holdout
-    )
+    missing = sorted(gold_docs(gold) - holdout)
     if missing:
         raise ValueError(f"gold docs missing from holdout ({len(missing)}): {missing}")
 
@@ -276,11 +427,12 @@ def lint_span_coverage(
     linted = 0
     for q in gold:
         # group spans by their (gold) document so we chunk each body once
-        by_doc: dict[str, list[Relevance]] = {}
+        by_doc: dict[tuple[str, str, str | None], list[Relevance]] = {}
         for rel in q.relevance:
-            by_doc.setdefault(rel.document_id, []).append(rel)
-        for document_id, rels in by_doc.items():
-            body = bodies.body(q.gold_source, document_id)
+            source = rel.source or q.gold_source
+            by_doc.setdefault((source, rel.document_id, rel.version_id), []).append(rel)
+        for (source, _document_id, _version_id), rels in by_doc.items():
+            body = relevance_body(bodies, source, rels[0])
             mapping = map_spans_to_chunks(
                 body,
                 [(r.char_start, r.char_end) for r in rels],

@@ -86,8 +86,8 @@ class TbappealWindowTests(unittest.TestCase):
         spider = TbappealSpider(start_date="2018-01-01", end_date="2018-12-31")
         self.assertTrue(spider._in_window("05-02-2018"))
         self.assertFalse(spider._in_window("19-05-2017"))
-        # Unparseable dates are kept rather than dropped.
-        self.assertTrue(spider._in_window(""))
+        # Unparseable dates cannot be admitted to an unbounded interval.
+        self.assertFalse(spider._in_window(""))
 
 
 if __name__ == "__main__":

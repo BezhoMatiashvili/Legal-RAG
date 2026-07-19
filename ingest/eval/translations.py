@@ -18,7 +18,7 @@ DEFAULT_TRANSLATIONS = Path(__file__).parent / "query_translations_v1.json"
 
 
 def load_query_translations(path: Path, gold) -> tuple[dict[str, str], str]:
-    """Load ``{original_query: georgian_query}`` + a 16-hex content hash (for config_hash).
+    """Load ``{original_query: georgian_query}`` plus its full content SHA-256.
 
     Fails loud (mirrors ``goldset.reground``) so the artifact can't silently drift:
     every entry's ``query`` must byte-match the golden query for its id, every source
@@ -40,5 +40,5 @@ def load_query_translations(path: Path, gold) -> tuple[dict[str, str], str]:
         if detect_language(entry["ka"]) != "ka":
             raise ValueError(f"translations: {qid} target carries no Georgian script")
         mapping[q.query] = entry["ka"]
-    digest = hashlib.sha256(raw).hexdigest()[:16]
+    digest = hashlib.sha256(raw).hexdigest()
     return mapping, digest

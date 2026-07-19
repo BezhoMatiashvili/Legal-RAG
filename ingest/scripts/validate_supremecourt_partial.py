@@ -34,6 +34,9 @@ from typing import BinaryIO, Iterator
 SCHEMA_VERSION = 1
 EXPECTED_RUNTIME_SECONDS = 14_400
 EXPECTED_FINISH_REASON = "closespider_timeout"
+NATURAL_FINISH_REASON = "finished"
+ALLOWED_FINISH_REASONS = frozenset({EXPECTED_FINISH_REASON, NATURAL_FINISH_REASON})
+TERMINAL_LOWER_BOUND = "1900-01-01"
 TARGET_LITERAL = "330100122006207137"
 BASE_URL = "https://www.supremecourt.ge"
 
@@ -383,7 +386,8 @@ def _resume_start_state(
     required = {"run_id", "manifest_file", "manifest_sha256", "items_sha256"}
     if set(parent) != required:
         errors.append(
-            "manifest.resume_parent: keys must be exactly " + ", ".join(sorted(required))
+            "manifest.resume_parent: keys must be exactly "
+            + ", ".join(sorted(required))
         )
         return starts, True, None
 
@@ -443,7 +447,9 @@ def _resume_start_state(
             "manifest.resume_parent: validated parent date scope differs from child"
         )
     if parent.get("items_sha256") != parent_report.get("items_sha256"):
-        errors.append("manifest.resume_parent.items_sha256: parent items digest differs")
+        errors.append(
+            "manifest.resume_parent.items_sha256: parent items digest differs"
+        )
     parent_cursors = parent_report.get("per_chamber_resume_cursors")
     declared_starts = {
         chamber: value.isoformat() if value is not None else None
@@ -460,7 +466,9 @@ def _resume_start_state(
         and isinstance(parent_finished, str)
         and datetime.fromisoformat(parent_finished) >= started_at
     ):
-        errors.append("manifest.resume_parent: parent did not finish before child started")
+        errors.append(
+            "manifest.resume_parent: parent did not finish before child started"
+        )
     parent_fingerprints: dict[str, str] | None = None
     try:
         parent_records, parent_items_sha = _read_jsonl(
@@ -470,7 +478,9 @@ def _resume_start_state(
         errors.extend(f"resume parent: {error}" for error in exc.errors)
     else:
         if parent_items_sha != parent_report.get("items_sha256"):
-            errors.append("manifest.resume_parent: parent items changed during validation")
+            errors.append(
+                "manifest.resume_parent: parent items changed during validation"
+            )
         else:
             parent_fingerprints = {
                 record.identity: record.fingerprint for record in parent_records
@@ -561,10 +571,7 @@ def _validate_completed_windows(
             chamber is not None
             and start is not None
             and end is not None
-            and (
-                chamber_start is None
-                or end > chamber_start
-            )
+            and (chamber_start is None or end > chamber_start)
         ):
             errors.append(
                 f"{label}: interval exceeds the chamber's recorded start cursor"
@@ -735,10 +742,10 @@ def validate_run(
         errors.append(f"manifest.schema_version: expected {SCHEMA_VERSION}")
     if manifest.get("run_id") != run_path.name:
         errors.append("manifest.run_id: must exactly match the run directory name")
-    if manifest.get("finish_reason") != EXPECTED_FINISH_REASON:
+    finish_reason = manifest.get("finish_reason")
+    if finish_reason not in ALLOWED_FINISH_REASONS:
         errors.append(
-            "manifest.finish_reason: expected graceful four-hour timeout "
-            f"{EXPECTED_FINISH_REASON!r}"
+            "manifest.finish_reason: expected strict timeout or proven natural exhaustion"
         )
     if manifest.get("max_runtime_seconds") != EXPECTED_RUNTIME_SECONDS:
         errors.append(
@@ -758,14 +765,22 @@ def validate_run(
     if started_at is not None and finished_at is not None and finished_at < started_at:
         errors.append("manifest.finished_at: precedes started_at")
     elapsed_time = manifest.get("elapsed_time_seconds")
-    if (
+    elapsed_invalid = (
         isinstance(elapsed_time, bool)
         or not isinstance(elapsed_time, (int, float))
         or not math.isfinite(elapsed_time)
-        or elapsed_time < EXPECTED_RUNTIME_SECONDS
+        or elapsed_time < 0
+    )
+    if elapsed_invalid:
+        errors.append(
+            "manifest.elapsed_time_seconds: expected a finite numeric duration >= 0"
+        )
+    elif (
+        finish_reason == EXPECTED_FINISH_REASON
+        and elapsed_time < EXPECTED_RUNTIME_SECONDS
     ):
         errors.append(
-            "manifest.elapsed_time_seconds: expected a finite numeric duration "
+            "manifest.elapsed_time_seconds: strict timeout requires duration "
             f">= {EXPECTED_RUNTIME_SECONDS}"
         )
 
@@ -1039,6 +1054,22 @@ def validate_run(
                 "manifest.completed_windows: represented failures exceed "
                 "unresolved_failure_count"
             )
+
+    if finish_reason == NATURAL_FINISH_REASON:
+        if lower_bound is None or lower_bound.isoformat() != TERMINAL_LOWER_BOUND:
+            errors.append(
+                "natural finish: lower_bound must be the frozen 1900-01-01 boundary"
+            )
+        if expected_global_frontier != TERMINAL_LOWER_BOUND:
+            errors.append(
+                "natural finish: derived global frontier has not reached 1900-01-01"
+            )
+        if any(cursor is not None for cursor in expected_cursors.values()):
+            errors.append(
+                "natural finish: every official chamber cursor must be exhausted"
+            )
+        if unresolved_count != 0:
+            errors.append("natural finish: unresolved_failure_count must be zero")
 
     if frontier is not None and lower_bound is not None:
         for record in items:

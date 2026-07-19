@@ -43,7 +43,8 @@ class FullCorpusBM25:
       - ``indices.npy`` int32[nnz]  — doc index of each nonzero (mmap at query time)
       - ``data.npy``    float32[nnz] — precomputed BM25 weight of (term, doc) (mmap)
       - ``terms.txt``   vocabulary, one token per line, line number == term id
-      - ``keys.jsonl``  line j == ``[source, document_id, chunk_index]`` of doc j
+      - ``keys.jsonl``  line j is a legacy ``[source, document_id, chunk_index]`` or
+        canonical ``[source, document_id, version_id, chunk_index]`` identity
       - ``meta.json``   {k1, b, avgdl, N, V, nnz, collection}
     """
 
@@ -52,7 +53,7 @@ class FullCorpusBM25:
         self._indices = indices  # may be an mmap
         self._data = data        # may be an mmap
         self._vocab = vocab      # token -> term id
-        self._keys = keys        # list[tuple[source, document_id, chunk_index]]
+        self._keys = keys        # legacy triples or canonical version-scoped quadruples
         self.meta = meta
         self._n_docs = int(meta["N"])
 
@@ -95,8 +96,21 @@ class FullCorpusBM25:
                         seen.add(i)
                         df[i] += 1
                 doc_len.append(len(toks))
-                keys.append((pl.get("source"), pl.get("document_id"),
-                             int(pl.get("chunk_index", -1))))
+                legacy_key = (
+                    pl.get("source"),
+                    pl.get("document_id"),
+                    int(pl.get("chunk_index", -1)),
+                )
+                keys.append(
+                    (
+                        pl.get("source"),
+                        pl.get("document_id"),
+                        pl.get("version_id"),
+                        int(pl.get("chunk_index", -1)),
+                    )
+                    if pl.get("version_id") is not None
+                    else legacy_key
+                )
             if len(keys) % 200_000 < batch:
                 log(f"[bm25_full] pass1 scanned {len(keys):,} chunks "
                     f"| vocab={len(vocab):,} | {time.perf_counter() - t0:.0f}s")
@@ -199,8 +213,17 @@ class FullCorpusBM25:
         keys: list[tuple] = []
         with (index_dir / "keys.jsonl").open(encoding="utf-8") as fh:
             for line in fh:
-                s, d, c = json.loads(line)
-                keys.append((s, d, int(c)))
+                raw_key = json.loads(line)
+                if len(raw_key) == 3:
+                    source, document_id, chunk_index = raw_key
+                    keys.append((source, document_id, int(chunk_index)))
+                elif len(raw_key) == 4:
+                    source, document_id, version_id, chunk_index = raw_key
+                    keys.append((source, document_id, version_id, int(chunk_index)))
+                else:
+                    raise RuntimeError(
+                        f"corrupt bm25 cache key at {index_dir}: {raw_key!r}"
+                    )
         if len(keys) != int(meta["N"]) or len(terms) != int(meta["V"]):
             raise RuntimeError(f"corrupt bm25 cache at {index_dir}")
         return cls(indptr, indices, data, vocab, keys, meta)
@@ -215,8 +238,8 @@ class FullCorpusBM25:
     def search(self, query: str, k: int) -> list[tuple[tuple, float]]:
         """Return up to ``k`` ``(key, score)`` with score > 0, best first.
 
-        ``key`` is ``(source, document_id, chunk_index)`` — the same shape
-        :class:`eval.bm25.BM25Index` yields, so the harness bm25 branch is unchanged.
+        ``key`` is a legacy triple or a canonical version-scoped quadruple, matching the
+        collection generation from which this cache was built.
         Repeated query terms are summed (matching the reference, which iterates the raw
         token list), and only positive scores are returned.
         """

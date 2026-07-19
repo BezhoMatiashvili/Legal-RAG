@@ -1,23 +1,45 @@
 import dataclasses
+import hashlib
+from types import SimpleNamespace
 
 import pytest
 
 from ingest.chunking import Chunk
-from ingest.config import ConfigurationError, load_config, retrieval_fingerprint_sha256
+from ingest.config import (
+    RETRIEVAL_FINGERPRINT_REVISION,
+    ConfigurationError,
+    load_config,
+    retrieval_fingerprint_sha256,
+)
 from ingest.dedup import content_hash
+from ingest.generation import GENERATION_SCHEMA_VERSION
 from ingest.qdrant_store import (
     KEYWORD_FIELDS,
     TEXT_FIELDS,
     _rfc3339,
     build_payload,
     chunking_fingerprint,
+    collection_configuration,
+    collection_configuration_sha256,
     delete_doc_chunks_from,
     ensure_collection,
+    prepare_embed_collection,
+    point_id,
+    refuse_aliased_write_target,
     upsert_points,
     validate_generation_write_target,
     vector_space_id,
 )
-from ingest.sources import CanonicalDoc
+from ingest.sources import CanonicalDoc, PageBoundary
+
+
+def test_schema_v2_point_identity_separates_versions_and_preserves_legacy_id():
+    legacy = point_id("matsne", "doc-1", 0)
+    current = point_id("matsne", "doc-1", 0, version_id="current")
+    repealed = point_id("matsne", "doc-1", 0, version_id="repealed")
+
+    assert len({legacy, current, repealed}) == 3
+    assert current == point_id("matsne", "doc-1", 0, version_id="current")
 
 
 def _doc(**over):
@@ -96,7 +118,7 @@ def test_new_index_fields_are_declared():
     assert "document_number" in KEYWORD_FIELDS
     assert "registration_code" in KEYWORD_FIELDS
     assert "status" in KEYWORD_FIELDS
-    assert set(TEXT_FIELDS) == {"text", "title", "parties", "article_summary"}
+    assert {"text", "title", "parties", "article_summary"} <= set(TEXT_FIELDS)
 
 
 def test_build_payload_carries_content_hash():
@@ -109,6 +131,93 @@ def test_build_payload_carries_content_hash():
     assert p0["content_hash"] == content_hash("the cleaned body text")
     assert p0["content_hash"] == p1["content_hash"]
     assert "content_hash" in KEYWORD_FIELDS
+
+
+def test_canonical_passage_payload_hashes_exact_document_slice():
+    body = "შესავალი.\n\nმუხლი 7. წესი.\n\n1. ზუსტი ციტატა."
+    from ingest.chunking import chunk_document
+
+    doc = _doc(source="matsne", document_id="law-7", body_markdown=body)
+    chunk = chunk_document(body, max_tokens=50, overlap=0, min_tokens=1)[1]
+    payload = build_payload(doc, chunk)
+    exact = body[chunk.char_start : chunk.char_end]
+    assert payload["text"] == exact
+    assert payload["canonical_text_exact"] is True
+    assert payload["passage_hash"] == hashlib.sha256(exact.encode("utf-8")).hexdigest()
+    assert payload["article_id"] == "7"
+    assert payload["clause_id"] == "1"
+    assert payload["heading_path"][-1].startswith("მუხლი 7")
+    assert ":article:7:" in payload["parent_id"]
+    assert payload["article_start_chunk_index"] == chunk.chunk_index
+    assert payload["version_id"].startswith("derived:")
+    assert payload["source_authority"] == "primary_official"
+
+
+def test_page_mapping_is_stored_once_and_hash_bound_on_every_chunk():
+    body = "abcdefghij"
+    boundaries = (
+        PageBoundary(page=1, char_start=0, char_end=5),
+        PageBoundary(page=2, char_start=5, char_end=10),
+    )
+    doc = _doc(
+        body_markdown=body,
+        page_boundaries=boundaries,
+        page_coordinate_reason="exact_pdf_text",
+    )
+    first = Chunk(
+        text=body[:6],
+        canonical_text=body[:6],
+        chunk_index=0,
+        heading_path=[],
+        token_count=1,
+        char_start=0,
+        char_end=6,
+        page_start=1,
+        page_end=2,
+        page_coordinate_reason="exact_pdf_text",
+    )
+    second = Chunk(
+        text=body[6:],
+        canonical_text=body[6:],
+        chunk_index=1,
+        heading_path=[],
+        token_count=1,
+        char_start=6,
+        char_end=10,
+        page_start=2,
+        page_end=2,
+        page_coordinate_reason="exact_pdf_text",
+    )
+
+    first_payload = build_payload(doc, first)
+    second_payload = build_payload(doc, second)
+    assert first_payload["page_boundaries"] == [
+        {"page": 1, "char_start": 0, "char_end": 5},
+        {"page": 2, "char_start": 5, "char_end": 10},
+    ]
+    assert second_payload["page_boundaries"] is None
+    assert first_payload["page_boundary_mapping_sha256"] == second_payload[
+        "page_boundary_mapping_sha256"
+    ]
+    assert (first_payload["page_start"], first_payload["page_end"]) == (1, 2)
+    assert first_payload["page_coordinate_reason"] == "exact_pdf_text"
+    assert first_payload["admissible"] is True
+
+
+def test_canonical_passage_payload_rejects_false_hash_or_offsets():
+    body = "ზუსტი ტექსტი"
+    bad = Chunk(
+        text=body,
+        canonical_text="სხვა",
+        passage_hash=hashlib.sha256("სხვა".encode("utf-8")).hexdigest(),
+        chunk_index=0,
+        heading_path=[],
+        token_count=2,
+        char_start=0,
+        char_end=len(body),
+    )
+    with pytest.raises(ValueError, match="does not equal"):
+        build_payload(_doc(body_markdown=body), bad)
 
 
 def test_build_payload_carries_content_completeness_lineage():
@@ -163,13 +272,22 @@ def _generation_cfg(**over):
 def test_generation_payload_carries_complete_cryptographic_identity():
     cfg = _generation_cfg(embed_header_v2=True)
     payload = build_payload(
-        _doc(),
-        Chunk(text="x", chunk_index=0, heading_path=[], token_count=1),
+        _doc(body_markdown="x", source_fingerprint="d" * 64, official_url="u"),
+        Chunk(
+            text="x",
+            canonical_text="x",
+            passage_hash=hashlib.sha256(b"x").hexdigest(),
+            chunk_index=0,
+            heading_path=[],
+            token_count=1,
+            char_start=0,
+            char_end=1,
+        ),
         document_chunk_count=1,
         document_state_hash="c" * 64,
         cfg=cfg,
     )
-    assert payload["schema_version"] == 1
+    assert payload["schema_version"] == GENERATION_SCHEMA_VERSION
     assert payload["generation_id"] == cfg.generation_id
     assert payload["embedding_model"] == cfg.embed_model
     assert payload["embedding_revision"] == "a" * 40
@@ -181,7 +299,20 @@ def test_generation_payload_carries_complete_cryptographic_identity():
     assert payload["chunking_fingerprint"] == chunking_fingerprint(cfg)
     assert payload["document_header"] is True
     assert payload["retrieval_fingerprint"] == retrieval_fingerprint_sha256(cfg)
+    assert payload["retrieval_fingerprint_revision"] == RETRIEVAL_FINGERPRINT_REVISION
     assert len(payload["retrieval_fingerprint"]) == 64
+    assert payload["canonical_text_exact"] is True
+
+
+def test_generation_payload_rejects_unproven_canonical_text():
+    with pytest.raises(ConfigurationError, match="proven equal"):
+        build_payload(
+            _doc(source_fingerprint="d" * 64),
+            Chunk(text="x", chunk_index=0, heading_path=[], token_count=1),
+            document_chunk_count=1,
+            document_state_hash="c" * 64,
+            cfg=_generation_cfg(),
+        )
 
 
 def test_generation_payload_rejects_partial_identity_and_document_markers():
@@ -276,12 +407,12 @@ def test_generation_writer_requires_exact_physical_name_not_suffix():
         )
 
 
-def test_recreate_requires_separate_destructive_approval_before_client_access():
+def test_generation_candidate_recreate_is_always_forbidden_before_client_access():
     class NoClientAccess:
         def collection_exists(self, _name):
             raise AssertionError("client must not be accessed")
 
-    with pytest.raises(ConfigurationError, match="QDRANT_RECREATE_APPROVED"):
+    with pytest.raises(ConfigurationError, match="create-only"):
         ensure_collection(
             NoClientAccess(),
             _generation_cfg(),
@@ -289,6 +420,176 @@ def test_recreate_requires_separate_destructive_approval_before_client_access():
             apply=True,
             environ={"QDRANT_WRITE_APPROVED": "1"},
         )
+
+
+def _candidate_info(points_count=3):
+    params = SimpleNamespace(
+        vectors={
+            "dense": SimpleNamespace(size=1024, distance="Cosine"),
+        },
+        sparse_vectors={"sparse": SimpleNamespace()},
+    )
+    return SimpleNamespace(
+        config=SimpleNamespace(params=params),
+        points_count=points_count,
+    )
+
+
+class _ExistingCandidate:
+    def __init__(self, *, points_count=3, matching_count=3, count_error=None):
+        self.info = _candidate_info(points_count)
+        self.matching_count = matching_count
+        self.count_error = count_error
+        self.count_filter = None
+
+    def collection_exists(self, _name):
+        return True
+
+    def get_collection(self, _name):
+        return self.info
+
+    def count(self, *, collection_name, count_filter, exact):
+        assert collection_name == "georgian_legal__gen_gen_20260713_verified"
+        assert exact is True
+        self.count_filter = count_filter
+        if self.count_error is not None:
+            raise self.count_error
+        return SimpleNamespace(count=self.matching_count)
+
+
+def test_resume_requires_every_existing_point_to_match_full_identity():
+    client = _ExistingCandidate()
+    assert prepare_embed_collection(
+        client,
+        _generation_cfg(),
+        resume=True,
+        recreate=False,
+        apply=True,
+        environ={"QDRANT_WRITE_APPROVED": "1"},
+    ) == 3
+    fields = {condition.key for condition in client.count_filter.must}
+    assert {
+        "generation_id",
+        "canonical_payload_revision",
+        "embedding_revision",
+        "tokenizer_revision",
+        "reranker_revision",
+        "vector_space_id",
+        "chunking_fingerprint",
+        "retrieval_fingerprint",
+        "retrieval_fingerprint_revision",
+    } <= fields
+
+
+def test_resume_rejects_mismatched_or_unavailable_identity_proof():
+    with pytest.raises(RuntimeError, match="2 of 3 points"):
+        prepare_embed_collection(
+            _ExistingCandidate(matching_count=2),
+            _generation_cfg(),
+            resume=True,
+            recreate=False,
+            apply=True,
+            environ={"QDRANT_WRITE_APPROVED": "1"},
+        )
+    with pytest.raises(RuntimeError, match="cannot verify existing point identity"):
+        prepare_embed_collection(
+            _ExistingCandidate(count_error=OSError("offline")),
+            _generation_cfg(),
+            resume=True,
+            recreate=False,
+            apply=True,
+            environ={"QDRANT_WRITE_APPROVED": "1"},
+        )
+
+
+def test_resume_rejects_collection_smaller_than_acknowledged_checkpoint():
+    with pytest.raises(RuntimeError, match="below the 4 chunks acknowledged"):
+        prepare_embed_collection(
+            _ExistingCandidate(points_count=3, matching_count=3),
+            _generation_cfg(),
+            resume=True,
+            recreate=False,
+            apply=True,
+            minimum_points=4,
+            environ={"QDRANT_WRITE_APPROVED": "1"},
+        )
+
+
+def test_fresh_embed_refuses_any_existing_candidate_without_count_filter():
+    client = _ExistingCandidate()
+    with pytest.raises(RuntimeError, match="any pre-existing physical collection"):
+        prepare_embed_collection(
+            client,
+            _generation_cfg(),
+            resume=False,
+            recreate=False,
+            apply=True,
+            environ={"QDRANT_WRITE_APPROVED": "1"},
+        )
+    assert client.count_filter is None
+
+
+def test_fresh_embed_also_refuses_an_existing_empty_candidate():
+    client = _ExistingCandidate(points_count=0, matching_count=0)
+    with pytest.raises(RuntimeError, match="including an empty one"):
+        prepare_embed_collection(
+            client,
+            _generation_cfg(),
+            resume=False,
+            recreate=False,
+            apply=True,
+            environ={"QDRANT_WRITE_APPROVED": "1"},
+        )
+
+
+def test_complete_collection_configuration_excludes_only_live_index_counts():
+    base = SimpleNamespace(
+        config={"params": {"vectors": {"dense": {"size": 1024}}}},
+        payload_schema={
+            "source": {"data_type": "keyword", "params": None, "points": 0}
+        },
+    )
+    populated = SimpleNamespace(
+        config=base.config,
+        payload_schema={
+            "source": {"data_type": "keyword", "params": None, "points": 999}
+        },
+    )
+    configured_differently = SimpleNamespace(
+        config=base.config,
+        payload_schema={
+            "source": {
+                "data_type": "keyword",
+                "params": {"on_disk": True},
+                "points": 999,
+            }
+        },
+    )
+    base_value = collection_configuration(base)
+    assert collection_configuration(populated) == base_value
+    assert collection_configuration_sha256(
+        collection_configuration(populated)
+    ) == collection_configuration_sha256(base_value)
+    assert collection_configuration(configured_differently) != base_value
+
+
+def test_candidate_write_target_rejects_alias_reference_and_alias_uncertainty():
+    with pytest.raises(RuntimeError, match="referenced by aliases"):
+        refuse_aliased_write_target(
+            SimpleNamespace(
+                get_aliases=lambda: SimpleNamespace(
+                    aliases=[
+                        SimpleNamespace(
+                            alias_name="candidate-live",
+                            collection_name=_generation_cfg().collection_name,
+                        )
+                    ]
+                )
+            ),
+            _generation_cfg().collection_name,
+        )
+    with pytest.raises(RuntimeError, match="cannot inspect Qdrant aliases"):
+        refuse_aliased_write_target(SimpleNamespace(), _generation_cfg().collection_name)
 
 
 @pytest.mark.parametrize("collection", ["georgian_legal", "georgian_legal_delta"])

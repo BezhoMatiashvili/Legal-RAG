@@ -105,14 +105,23 @@ def main() -> None:
     with open(out_path, "w", encoding="utf-8") as f:
         for q in sample:
             hits, _lat = backend.search(q.query, args.mode, args.k)
-            ids = [point_id(h.source, h.document_id, h.chunk_index) for h in hits]
+            ids = [
+                point_id(
+                    h.source,
+                    h.document_id,
+                    h.chunk_index,
+                    version_id=h.version_id,
+                )
+                for h in hits
+            ]
             text_by_id: dict[str, str] = {}
             if ids:
                 for r in client.retrieve(cfg.collection_name, ids=ids, with_payload=True):
                     text_by_id[str(r.id)] = (r.payload or {}).get("text", "")
             context = [
                 {"rank": i + 1, "source": h.source, "document_id": h.document_id,
-                 "chunk_index": h.chunk_index, "score": round(h.score, 4),
+                 "version_id": h.version_id, "chunk_index": h.chunk_index,
+                 "score": round(h.score, 4),
                  "text": text_by_id.get(pid, "")}
                 for i, (h, pid) in enumerate(zip(hits, ids))
             ]

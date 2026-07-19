@@ -24,6 +24,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from .generation import GENERATION_SCHEMA_VERSION
+
 PRIVATE_DIRECTORY_MODE = 0o700
 PRIVATE_FILE_MODE = 0o600
 DEFAULT_ROTATE_BYTES = 50 * 1024 * 1024
@@ -456,9 +458,11 @@ def _matching_verification_report(
         report = _read_json_object(path)
     except (ArtifactSafetyError, OSError, ValueError, json.JSONDecodeError):
         return False
-    if report.get("schema_version") != 1:
+    if report.get("schema_version") != GENERATION_SCHEMA_VERSION:
         return False
     if report.get("generation_id") != generation_id or report.get("ok") is not True:
+        return False
+    if report.get("physical_collection") != f"georgian_legal__gen_{generation_id}":
         return False
     try:
         parse_utc_datetime(report["verified_at"])  # type: ignore[arg-type]
@@ -502,7 +506,7 @@ def load_verified_generation_coverage(
             continue
         generation_id = _safe_component(manifest.get("generation_id"))
         if (
-            manifest.get("schema_version") != 1
+            manifest.get("schema_version") != GENERATION_SCHEMA_VERSION
             or generation_id is None
             or generation_id != manifest_path.parent.name
         ):

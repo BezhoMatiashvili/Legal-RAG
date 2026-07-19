@@ -10,11 +10,64 @@ every spider to inherit.
 import hashlib
 import json
 import os
+import re
 import sqlite3
+import stat
+import sys
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import scrapy
+
+from ..completion import (
+    atomic_create_private,
+    build_startup_record,
+    canonical_json_bytes,
+    hash_and_fsync_private_file,
+    publish_startup_metadata,
+    recover_authorized_terminal,
+    source_lock,
+    terminal_authorization_exists,
+    verify_authorized_terminal_record,
+    verify_terminal_record,
+)
+
+
+EVIDENCE_SNAPSHOT_ID = "v3_512_attested_20260715_01"
+EVIDENCE_START_DATE = date(1900, 1, 1)
+EVIDENCE_END_DATE = date(2026, 7, 15)
+EVIDENCE_ARTIFACTS_ROOT = (
+    Path(__file__).resolve().parents[3]
+    / "ingest/.state/v3/source-evidence"
+    / EVIDENCE_SNAPSHOT_ID
+)
+_EVIDENCE_REVISION_RE = re.compile(r"^[0-9a-f]{7,64}$")
+_EVIDENCE_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_DISCOVERY_LIMIT_NAMES = (
+    "MAX_PAGES",
+    "MAX_SAFE_PAGES",
+    "PAGE_SIZE",
+    "MAX_WINDOW_DAYS",
+    "TARGET_MIN",
+    "TARGET_MAX",
+)
+_EVIDENCE_IDENTITY_OUTCOMES = frozenset({"unique", "duplicate", "missing"})
+
+
+@dataclass(eq=False, slots=True)
+class ReversibleDedupCommit:
+    """Handle for one durable but inactive pending seen-store batch.
+
+    Pending rows never participate in :meth:`BaseLegalSpider.is_seen`.  The terminal
+    attester holds this handle until exact successful completion evidence exists,
+    then promotion makes the rows active in one SQLite transaction.
+    """
+
+    owner: object
+    run_id: str
+    committed_count: int
+    active: bool = True
 
 
 class BaseLegalSpider(scrapy.Spider):
@@ -29,6 +82,10 @@ class BaseLegalSpider(scrapy.Spider):
     DEDUP_KEY: tuple[str, ...] | None = None
     MAX_REFRESHES_PER_RUN = 2_000
     _SUCCESS_OUTCOMES = frozenset({"success", "legacy_success"})
+    _COMPLETION_SUCCESS = "success"
+    _COMPLETION_FAILURE = "failure"
+    _COMPLETION_ABSENT = "absent"
+    _COMPLETION_AMBIGUOUS = "ambiguous"
     _PENDING_MARKERS = (
         "pending",
         "draft",
@@ -36,11 +93,26 @@ class BaseLegalSpider(scrapy.Spider):
         "მოლოდინ",
         "პროექტ",
     )
+    _DEDUP_COLUMNS = (
+        "key",
+        "run_id",
+        "ts",
+        "last_success",
+        "content_hash",
+        "refresh_deadline",
+        "outcome",
+        "content_kind",
+        "content_complete",
+        "source_binary_url",
+        "is_consolidated",
+    )
+    _PENDING_RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,255}$")
 
     # Safe defaults so is_seen/dedup_key are inert until ``open_dedup_store`` runs
     # (e.g. in unit tests that call parse callbacks without ``from_crawler``).
     dedup_enabled = False
     _seen_keys: set = frozenset()
+    _pending_reversible_dedup_commit: ReversibleDedupCommit | None = None
 
     # base.py lives at <repo>/scraper/legal_scrapers/spiders/base.py, so parents[3] == <repo>.
     # Each spider writes under ARTIFACTS_ROOT / <name> / ... (see configure_run_outputs).
@@ -112,6 +184,21 @@ class BaseLegalSpider(scrapy.Spider):
             with (run_dir / "failures.jsonl").open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps(record, ensure_ascii=False) + "\n")
 
+    def record_quarantine(self, reason: str) -> None:
+        """Count an explicitly persisted, non-admissible source record.
+
+        Quarantine is not a crawl failure: the source row was discovered and durably
+        represented, but downstream snapshot construction must route it away from the
+        admitted corpus.  Transport/parser failures are recorded separately through
+        :meth:`record_quality_failure`.
+        """
+
+        crawler = getattr(self, "crawler", None)
+        stats = getattr(crawler, "stats", None)
+        if stats is not None:
+            stats.inc_value("quarantine/items")
+            stats.inc_value(f"quarantine/{reason}")
+
     @classmethod
     def parse_date_arg(cls, value, argument_name: str, default: date) -> date:
         if value is None or value == "":
@@ -128,29 +215,189 @@ class BaseLegalSpider(scrapy.Spider):
         # Artifacts can contain public-record personal data and local crawl diagnostics.
         # Owner-only creation is process-wide so Scrapy's feed/log/cache writers inherit it.
         os.umask(0o077)
-        self.started_at = datetime.now(UTC).replace(microsecond=0)
-        self.run_id = self.build_run_id()
-        self.run_dir = self.ARTIFACTS_ROOT / self.name / "runs" / self.run_id
-        self.latest_dir = self.ARTIFACTS_ROOT / self.name / "latest"
-        self.run_dir.mkdir(parents=True, exist_ok=False)
-        self.latest_dir.mkdir(parents=True, exist_ok=True)
+        self.evidence_crawl = settings.getbool("EVIDENCE_CRAWL_ENABLED", False)
+        if self.evidence_crawl:
+            if (
+                self.scraping_start_date != EVIDENCE_START_DATE
+                or self.scraping_end_date != EVIDENCE_END_DATE
+            ):
+                raise ValueError(
+                    "immutable evidence crawl requires the exact interval "
+                    f"{EVIDENCE_START_DATE.isoformat()} through "
+                    f"{EVIDENCE_END_DATE.isoformat()}"
+                )
+            revision = str(settings.get("EVIDENCE_CODE_REVISION") or "").strip()
+            if _EVIDENCE_REVISION_RE.fullmatch(revision) is None:
+                raise ValueError(
+                    "immutable evidence crawl requires EVIDENCE_CODE_REVISION as "
+                    "an immutable lowercase hexadecimal revision"
+                )
+            self.evidence_code_revision = revision
+            code_identity = str(
+                settings.get("EVIDENCE_CODE_IDENTITY_SHA256") or ""
+            ).strip()
+            if _EVIDENCE_SHA256_RE.fullmatch(code_identity) is None:
+                raise ValueError(
+                    "immutable evidence crawl requires "
+                    "EVIDENCE_CODE_IDENTITY_SHA256 as a lowercase SHA-256 digest"
+                )
+            self.evidence_code_identity_sha256 = code_identity
+            if self.name == "matsne":
+                doc_type = getattr(self, "_doc_type", None)
+                selected_doc_type = doc_type() if callable(doc_type) else "all"
+                seed_arguments = {
+                    name: getattr(self, name, None)
+                    for name in ("seed_ids_file", "seed_file", "seed_urls")
+                }
+                if selected_doc_type != "all" or any(seed_arguments.values()):
+                    raise ValueError(
+                        "immutable Matsne evidence crawl requires full/default "
+                        "doc_type=all mode without seed arguments"
+                    )
+            # These are hard safety properties, not caller-selectable preferences.
+            settings.set("HTTPCACHE_ENABLED", False, priority="spider")
+            settings.set("DEDUP_ENABLED", False, priority="spider")
+            source_root = Path(os.path.abspath(EVIDENCE_ARTIFACTS_ROOT / self.name))
+        else:
+            source_root = Path(os.path.abspath(self.ARTIFACTS_ROOT / self.name))
+        self.source_root = source_root
+        # A per-source lock makes run-id selection and the two-record startup
+        # publication one operation across concurrent crawler processes.  The startup
+        # publisher deliberately replaces latest/run.json *before* it creates the
+        # run-scoped record, so a crash can only leave nonqualifying ``started``
+        # metadata -- never an older success masquerading as the current attempt.
+        with source_lock(source_root):
+            if self.evidence_crawl and self.name != "supremecourt":
+                self._reject_existing_ordinary_evidence_runs(source_root)
+            self.started_at = datetime.now(UTC).replace(microsecond=0)
+            self.run_id = self.build_run_id(create_only=self.evidence_crawl)
+            self.run_dir = source_root / "runs" / self.run_id
+            self.latest_dir = None if self.evidence_crawl else source_root / "latest"
 
-        self.items_path = self.run_dir / "items.jsonl"
-        self.latest_items_path = self.latest_dir / "items.jsonl"
-        self.log_path = self.run_dir / "spider.log"
-        self.run_metadata_path = self.run_dir / "run.json"
-        self.latest_metadata_path = self.latest_dir / "run.json"
+            self.items_path = self.run_dir / "items.jsonl"
+            self.latest_items_path = (
+                None if self.latest_dir is None else self.latest_dir / "items.jsonl"
+            )
+            self.log_path = self.run_dir / "spider.log"
+            self.run_metadata_path = self.run_dir / "run.json"
+            self.latest_metadata_path = (
+                None if self.latest_dir is None else self.latest_dir / "run.json"
+            )
 
-        settings.set(
-            "FEEDS",
-            {
-                str(self.items_path): self.feed_options(),
-                str(self.latest_items_path): self.feed_options(),
-            },
-            priority="spider",
-        )
+            feed_options = self.feed_options()
+            if self.evidence_crawl:
+                feed_options["overwrite"] = False
+            feeds = {str(self.items_path): feed_options}
+            if self.latest_items_path is not None:
+                feeds[str(self.latest_items_path)] = self.feed_options()
+            settings.set("FEEDS", feeds, priority="spider")
+            self.write_run_metadata()
+            if self.evidence_crawl and self.name != "supremecourt":
+                self._open_evidence_identity_journal()
         self.open_dedup_store(settings)
-        self.write_run_metadata()
+        if self.evidence_crawl:
+            self.crawler.stats.set_value("evidence/enabled", 1)
+            self.crawler.stats.set_value("within_run/observed_identity_count", 0)
+            self.crawler.stats.set_value("within_run/unique_identity_count", 0)
+            self.crawler.stats.set_value("within_run/duplicate_identity_count", 0)
+            self.crawler.stats.set_value("within_run/missing_identity_count", 0)
+
+    @staticmethod
+    def _reject_existing_ordinary_evidence_runs(source_root: Path) -> None:
+        """Enforce the release contract's one-and-only-one ordinary crawl attempt."""
+
+        runs_dir = source_root / "runs"
+        try:
+            info = runs_dir.lstat()
+        except FileNotFoundError:
+            return
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise RuntimeError(f"ordinary evidence runs path is unsafe: {runs_dir}")
+        with os.scandir(runs_dir) as iterator:
+            entries = sorted(entry.name for entry in iterator)
+        if entries:
+            raise FileExistsError(
+                "immutable ordinary evidence source may be run exactly once; "
+                f"existing entries for {source_root.name}: {entries[:8]}"
+            )
+
+    def _open_evidence_identity_journal(self) -> None:
+        """Create the ordinary run's append-only identity decision journal."""
+
+        path = self.run_dir / "identity.journal.jsonl"
+        atomic_create_private(path, b"")
+        descriptor = os.open(
+            path,
+            os.O_WRONLY
+            | os.O_APPEND
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_uid != os.geteuid()
+        ):
+            os.close(descriptor)
+            raise RuntimeError(f"ordinary identity journal is not private: {path}")
+        self.evidence_identity_journal_path = path
+        self._evidence_identity_journal_descriptor = descriptor
+        self._evidence_identity_sequence = 0
+        self._evidence_identity_journal_proof = None
+
+    def record_evidence_identity_event(
+        self, outcome: str, identity: str | None
+    ) -> None:
+        """Append one exact ordinary within-run identity decision before export/drop."""
+
+        if not getattr(self, "evidence_crawl", False) or self.name == "supremecourt":
+            return
+        if outcome not in _EVIDENCE_IDENTITY_OUTCOMES:
+            raise ValueError(f"invalid evidence identity outcome: {outcome!r}")
+        if outcome == "missing":
+            if identity is not None:
+                raise ValueError("missing identity event cannot carry an identity")
+            identity_sha256 = None
+        else:
+            if not isinstance(identity, str) or not identity:
+                raise ValueError(f"{outcome} identity event requires an identity")
+            identity_sha256 = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+        descriptor = getattr(self, "_evidence_identity_journal_descriptor", None)
+        if descriptor is None:
+            raise RuntimeError("ordinary evidence identity journal is not open")
+        self._evidence_identity_sequence += 1
+        payload = canonical_json_bytes(
+            {
+                "identity_sha256": identity_sha256,
+                "outcome": outcome,
+                "sequence": self._evidence_identity_sequence,
+            }
+        )
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("short write to ordinary evidence identity journal")
+            view = view[written:]
+
+    def finalize_evidence_identity_journal(self):
+        """Flush, close, and hash the ordinary identity journal exactly once."""
+
+        path = getattr(self, "evidence_identity_journal_path", None)
+        if path is None:
+            return None
+        descriptor = getattr(self, "_evidence_identity_journal_descriptor", None)
+        if descriptor is not None:
+            os.fsync(descriptor)
+            os.close(descriptor)
+            self._evidence_identity_journal_descriptor = None
+        proof = hash_and_fsync_private_file(path)
+        previous = getattr(self, "_evidence_identity_journal_proof", None)
+        if previous is not None and previous != proof:
+            raise RuntimeError("ordinary evidence identity journal changed after finalization")
+        self._evidence_identity_journal_proof = proof
+        return proof
 
     # --- cross-run deduplication -------------------------------------------
 
@@ -170,8 +417,10 @@ class BaseLegalSpider(scrapy.Spider):
             "DEDUP_ENABLED", True
         )
         self._seen_keys: set[str] = set()
+        self._within_run_keys: set[str] = set()
         self._refresh_keys: set[str] = set()
         self._staged_dedup_records: dict[str, dict] = {}
+        self._pending_reversible_dedup_commit: ReversibleDedupCommit | None = None
         self._dedup_conn = None
         if not self.dedup_enabled:
             return
@@ -202,6 +451,9 @@ class BaseLegalSpider(scrapy.Spider):
             "source_binary_url TEXT, is_consolidated INTEGER)"
         )
         self._migrate_seen_schema()
+        self._ensure_pending_seen_schema()
+        self._recover_all_authorized_terminals()
+        self._reconcile_pending_seen()
         self._load_seen_state()
         self.logger.info(
             "dedup: loaded %d active key(s), selected %d refresh(es) from %s",
@@ -209,6 +461,27 @@ class BaseLegalSpider(scrapy.Spider):
             len(self._refresh_keys),
             self.dedup_db_path,
         )
+
+    def _ensure_pending_seen_schema(self) -> None:
+        """Create the durable inactive stage used by completion publication."""
+        self._dedup_conn.execute(
+            "CREATE TABLE IF NOT EXISTS pending_seen ("
+            "pending_run_id TEXT NOT NULL, key TEXT NOT NULL, run_id TEXT, ts TEXT, "
+            "last_success TEXT, content_hash TEXT, refresh_deadline TEXT, "
+            "outcome TEXT, content_kind TEXT, content_complete INTEGER, "
+            "source_binary_url TEXT, is_consolidated INTEGER, "
+            "PRIMARY KEY (pending_run_id, key))"
+        )
+        expected = {"pending_run_id", *self._DEDUP_COLUMNS}
+        actual = {
+            row[1]
+            for row in self._dedup_conn.execute("PRAGMA table_info(pending_seen)")
+        }
+        if actual != expected:
+            raise RuntimeError(
+                "pending_seen schema mismatch; refusing unsafe dedup activation"
+            )
+        self._dedup_conn.commit()
 
     def _dedup_now(self) -> datetime:
         return datetime.now(UTC)
@@ -256,6 +529,223 @@ class BaseLegalSpider(scrapy.Spider):
             (now, now),
         )
         self._dedup_conn.commit()
+
+    def _dedup_source_root(self) -> Path:
+        return Path(
+            os.path.abspath(
+                getattr(self, "source_root", self.ARTIFACTS_ROOT / self.name)
+            )
+        )
+
+    def _has_exact_success_evidence(self, run_id: str) -> bool:
+        """Return true only for a strictly verified run-scoped success record.
+
+        Callers hold the per-source publication lock through both this check and any
+        resulting SQLite promotion, so a cooperating publisher cannot change guard
+        state between proof and activation.
+        """
+        return self._pending_completion_state(run_id) == self._COMPLETION_SUCCESS
+
+    def _pending_completion_state(self, run_id: str) -> str:
+        """Classify evidence without collapsing ambiguity into terminal failure.
+
+        Only strict success may promote.  Only safely observed authorization absence
+        or an exact, structurally valid authorized failure may delete inactive rows.
+        Every inspection/fsync/source-validator error with possible authorization is
+        ambiguous and therefore preserves the shadow batch for a later startup.
+        """
+
+        if self._PENDING_RUN_ID_RE.fullmatch(run_id) is None:
+            return self._COMPLETION_ABSENT
+        source_root = self._dedup_source_root()
+        run_dir = source_root / "runs" / run_id
+        run_path = run_dir / "run.json"
+        try:
+            authorized = terminal_authorization_exists(
+                run_path,
+                expected_source=self.name,
+                expected_run_id=run_id,
+            )
+        except Exception as exc:  # noqa: BLE001 - ambiguity must retain pending
+            self.logger.warning(
+                "dedup: terminal authorization is ambiguous for %s: %s",
+                run_id,
+                exc,
+            )
+            return self._COMPLETION_AMBIGUOUS
+        if not authorized:
+            return self._COMPLETION_ABSENT
+        try:
+            terminal = verify_authorized_terminal_record(
+                run_path,
+                expected_source=self.name,
+                expected_run_id=run_id,
+            )
+        except Exception as exc:  # noqa: BLE001 - exact outcome is still unknown
+            self.logger.warning(
+                "dedup: authorized terminal binding is ambiguous for %s: %s",
+                run_id,
+                exc,
+            )
+            return self._COMPLETION_AMBIGUOUS
+        if terminal["outcome"] == "failure":
+            return self._COMPLETION_FAILURE
+        try:
+            verify_terminal_record(
+                run_path,
+                expected_source=self.name,
+                expected_run_id=run_id,
+                expected_items_path=run_dir / "items.jsonl",
+            )
+        except Exception as exc:  # noqa: BLE001 - success proof may be transient
+            self.logger.warning(
+                "dedup: authorized success proof is temporarily unverified for %s: %s",
+                run_id,
+                exc,
+            )
+            return self._COMPLETION_AMBIGUOUS
+        return self._COMPLETION_SUCCESS
+
+    def _pending_records(self, run_id: str) -> list[dict]:
+        columns = ", ".join(self._DEDUP_COLUMNS)
+        rows = self._dedup_conn.execute(
+            f"SELECT {columns} FROM pending_seen "  # noqa: S608
+            "WHERE pending_run_id = ? ORDER BY key",
+            (run_id,),
+        ).fetchall()
+        return [dict(zip(self._DEDUP_COLUMNS, row, strict=True)) for row in rows]
+
+    def _delete_pending_run(self, run_id: str) -> int:
+        cursor = self._dedup_conn.execute(
+            "DELETE FROM pending_seen WHERE pending_run_id = ?",
+            (run_id,),
+        )
+        return max(0, int(cursor.rowcount))
+
+    def _promote_pending_run(self, run_id: str) -> list[dict]:
+        """Atomically promote one exact-success batch into active seen rows."""
+        try:
+            self._dedup_conn.execute("BEGIN IMMEDIATE")
+            records = self._pending_records(run_id)
+            self._upsert_dedup_records(records)
+            self._delete_pending_run(run_id)
+            self._dedup_conn.commit()
+            return records
+        except Exception:
+            self._dedup_conn.rollback()
+            raise
+
+    def _discard_pending_run(self, run_id: str) -> int:
+        try:
+            self._dedup_conn.execute("BEGIN IMMEDIATE")
+            deleted = self._delete_pending_run(run_id)
+            self._dedup_conn.commit()
+            return deleted
+        except Exception:
+            self._dedup_conn.rollback()
+            raise
+
+    def _recover_all_authorized_terminals(self) -> None:
+        """Recover every permanent WAL decision before loading active dedup state.
+
+        Recovery is not limited to runs currently represented in ``pending_seen``:
+        a prior process may have promoted rows and then crashed before a directory
+        rename became durable.  Scanning exact private run directories ensures their
+        authoritative ``run.json`` is reconstructed before those active rows load.
+        """
+
+        source_root = self._dedup_source_root()
+        runs_root = source_root / "runs"
+        if not runs_root.is_dir():
+            return
+        with source_lock(source_root):
+            try:
+                entries = sorted(os.scandir(runs_root), key=lambda entry: entry.name)
+            except OSError as exc:
+                self.logger.error("dedup: could not scan terminal recovery WAL: %s", exc)
+                return
+            for entry in entries:
+                if (
+                    self._PENDING_RUN_ID_RE.fullmatch(entry.name) is None
+                    or not entry.is_dir(follow_symlinks=False)
+                ):
+                    continue
+                try:
+                    recovered = recover_authorized_terminal(
+                        Path(entry.path) / "run.json",
+                        expected_source=self.name,
+                        expected_run_id=entry.name,
+                    )
+                except Exception as exc:  # noqa: BLE001 - never invent evidence
+                    self.logger.error(
+                        "dedup: authorized terminal recovery failed for %s: %s",
+                        entry.name,
+                        exc,
+                    )
+                    continue
+                if recovered:
+                    self.logger.info(
+                        "dedup: materialized authorized terminal for run %s",
+                        entry.name,
+                    )
+
+    def _reconcile_pending_seen(self) -> None:
+        """Resolve crash-left pending batches without ever trusting them directly."""
+        run_ids = [
+            str(row[0])
+            for row in self._dedup_conn.execute(
+                "SELECT DISTINCT pending_run_id FROM pending_seen "
+                "ORDER BY pending_run_id"
+            )
+        ]
+        for run_id in run_ids:
+            try:
+                with source_lock(self._dedup_source_root()):
+                    # This call deliberately occurs while the existing lock is held;
+                    # recover_authorized_terminal must not recursively acquire it.
+                    recover_authorized_terminal(
+                        self._dedup_source_root() / "runs" / run_id / "run.json",
+                        expected_source=self.name,
+                        expected_run_id=run_id,
+                    )
+                    evidence_state = self._pending_completion_state(run_id)
+                    if evidence_state == self._COMPLETION_SUCCESS:
+                        promoted = self._promote_pending_run(run_id)
+            except Exception as exc:  # noqa: BLE001 - pending remains inactive
+                self.logger.error(
+                    "dedup: could not reconcile pending batch %s: %s",
+                    run_id,
+                    exc,
+                )
+                continue
+            if evidence_state == self._COMPLETION_SUCCESS:
+                self.logger.info(
+                    "dedup: recovered %d pending row(s) for successful run %s",
+                    len(promoted),
+                    run_id,
+                )
+                continue
+            if evidence_state == self._COMPLETION_AMBIGUOUS:
+                self.logger.warning(
+                    "dedup: preserving inactive pending row(s) for ambiguous run %s",
+                    run_id,
+                )
+                continue
+            try:
+                deleted = self._discard_pending_run(run_id)
+            except Exception as exc:  # noqa: BLE001 - pending remains ignored
+                self.logger.error(
+                    "dedup: could not discard unproven pending batch %s: %s",
+                    run_id,
+                    exc,
+                )
+            else:
+                self.logger.warning(
+                    "dedup: discarded %d pending row(s) for %s run %s",
+                    deleted,
+                    evidence_state,
+                    run_id,
+                )
 
     def _load_seen_state(self) -> None:
         if self.name == "supremecourt":
@@ -314,7 +804,7 @@ class BaseLegalSpider(scrapy.Spider):
         Returns ``None`` if dedup is off or any key field is missing/empty, so we
         fail open and never skip a document on incomplete data.
         """
-        if not self.dedup_enabled:
+        if not self.DEDUP_KEY:
             return None
         parts = []
         for field_name in self.DEDUP_KEY:
@@ -327,6 +817,12 @@ class BaseLegalSpider(scrapy.Spider):
     def is_seen(self, mapping) -> bool:
         key = self.dedup_key(mapping)
         if key is None:
+            return False
+        if (
+            self.dedup_enabled or getattr(self, "evidence_crawl", False)
+        ) and key in getattr(self, "_within_run_keys", ()):
+            return True
+        if not self.dedup_enabled:
             return False
         if key in self._seen_keys:
             return True
@@ -429,6 +925,16 @@ class BaseLegalSpider(scrapy.Spider):
         key = self.dedup_key(mapping)
         if key is None:
             return True
+        track_within_run = self.dedup_enabled or getattr(
+            self, "evidence_crawl", False
+        )
+        if not track_within_run:
+            return True
+        if key in self._within_run_keys:
+            return False
+        self._within_run_keys.add(key)
+        if not self.dedup_enabled:
+            return True
         record = self._dedup_record(mapping)
         previous = self._staged_dedup_records.get(key)
         if previous is not None:
@@ -442,9 +948,8 @@ class BaseLegalSpider(scrapy.Spider):
             self._seen_keys.add(key)
         return True
 
-    def _persist_dedup_records(self, records: list[dict]) -> None:
-        if self._dedup_conn is None or not records:
-            return
+    def _upsert_dedup_records(self, records: list[dict]) -> None:
+        """Upsert records inside the caller's active SQLite transaction."""
         sql = (
             "INSERT INTO seen (key, run_id, ts, last_success, content_hash, "
             "refresh_deadline, outcome, content_kind, content_complete, "
@@ -458,35 +963,107 @@ class BaseLegalSpider(scrapy.Spider):
             "source_binary_url=excluded.source_binary_url, "
             "is_consolidated=excluded.is_consolidated"
         )
+        for original in records:
+            record = dict(original)
+            if record["outcome"] != "success":
+                prior = self._dedup_conn.execute(
+                    "SELECT last_success, content_hash, is_consolidated "
+                    "FROM seen WHERE key = ?",
+                    (record["key"],),
+                ).fetchone()
+                if prior and prior[0]:
+                    record["last_success"] = prior[0]
+                    record["content_hash"] = prior[1]
+                    if record["is_consolidated"] is None:
+                        record["is_consolidated"] = prior[2]
+            self._dedup_conn.execute(
+                sql,
+                tuple(record[column] for column in self._DEDUP_COLUMNS),
+            )
+
+    def _persist_dedup_records(self, records: list[dict]) -> None:
+        if self._dedup_conn is None or not records:
+            return
         try:
             self._dedup_conn.execute("BEGIN IMMEDIATE")
-            for original in records:
-                record = dict(original)
-                if record["outcome"] != "success":
-                    prior = self._dedup_conn.execute(
-                        "SELECT last_success, content_hash, is_consolidated "
-                        "FROM seen WHERE key = ?",
-                        (record["key"],),
-                    ).fetchone()
-                    if prior and prior[0]:
-                        record["last_success"] = prior[0]
-                        record["content_hash"] = prior[1]
-                        if record["is_consolidated"] is None:
-                            record["is_consolidated"] = prior[2]
-                self._dedup_conn.execute(
-                    sql,
+            self._upsert_dedup_records(records)
+            self._dedup_conn.commit()
+        except Exception:
+            self._dedup_conn.rollback()
+            raise
+
+    def commit_staged_seen(self) -> int:
+        """Irreversibly commit staged records for direct, non-attester callers."""
+        if self._pending_reversible_dedup_commit is not None:
+            raise RuntimeError("a reversible staged dedup commit is still pending")
+        records = list(self._staged_dedup_records.values())
+        self._persist_dedup_records(records)
+        for record in records:
+            self._refresh_keys.discard(record["key"])
+            self._within_run_keys.discard(record["key"])
+        self._staged_dedup_records.clear()
+        return len(records)
+
+    def commit_staged_seen_reversible(self) -> ReversibleDedupCommit:
+        """Durably prepare staged records without making them visible to ``is_seen``.
+
+        The batch is written only to ``pending_seen``.  A process crash or an
+        ambiguous SQLite commit acknowledgement can therefore leave, at worst,
+        inactive shadow rows.  Promotion into ``seen`` is a separate operation and
+        requires a strictly verified successful completion record for this exact run.
+        """
+        if self._pending_reversible_dedup_commit is not None:
+            raise RuntimeError("a reversible staged dedup commit is already pending")
+
+        run_id = self._validated_pending_run_id(getattr(self, "run_id", ""))
+        records = [dict(record) for record in self._staged_dedup_records.values()]
+        if records and self._dedup_conn is None:
+            raise RuntimeError("cannot prepare dedup without an open dedup store")
+        for record in records:
+            if record.get("run_id") != run_id:
+                raise RuntimeError("staged dedup record has the wrong run identity")
+        if self._dedup_conn is not None:
+            self._write_pending_staged_records(run_id, records)
+
+        token = ReversibleDedupCommit(
+            owner=self,
+            run_id=run_id,
+            committed_count=len(records),
+        )
+        self._pending_reversible_dedup_commit = token
+        # ``stage_seen`` temporarily remembers successful keys so duplicates within
+        # one live crawl are suppressed.  Once the durable shadow batch exists, even
+        # that process-local membership is removed: pending means inactive.
+        for record in records:
+            if record["outcome"] == "success":
+                self._seen_keys.discard(record["key"])
+        self._staged_dedup_records.clear()
+        return token
+
+    def _validated_pending_run_id(self, value: object) -> str:
+        run_id = str(value)
+        if self._PENDING_RUN_ID_RE.fullmatch(run_id) is None:
+            raise RuntimeError("unsafe pending dedup run identity")
+        return run_id
+
+    def _write_pending_staged_records(
+        self, run_id: str, records: list[dict]
+    ) -> None:
+        """Replace one run's inactive shadow batch in a single transaction."""
+        if self._dedup_conn is None:
+            raise RuntimeError("dedup connection is closed")
+        columns = ", ".join(("pending_run_id", *self._DEDUP_COLUMNS))
+        placeholders = ", ".join("?" for _column in range(1 + len(self._DEDUP_COLUMNS)))
+        try:
+            self._dedup_conn.execute("BEGIN IMMEDIATE")
+            self._delete_pending_run(run_id)
+            if records:
+                self._dedup_conn.executemany(
+                    f"INSERT INTO pending_seen ({columns}) "  # noqa: S608
+                    f"VALUES ({placeholders})",
                     (
-                        record["key"],
-                        record["run_id"],
-                        record["ts"],
-                        record["last_success"],
-                        record["content_hash"],
-                        record["refresh_deadline"],
-                        record["outcome"],
-                        record["content_kind"],
-                        record["content_complete"],
-                        record["source_binary_url"],
-                        record["is_consolidated"],
+                        (run_id, *(record[column] for column in self._DEDUP_COLUMNS))
+                        for record in records
                     ),
                 )
             self._dedup_conn.commit()
@@ -494,18 +1071,96 @@ class BaseLegalSpider(scrapy.Spider):
             self._dedup_conn.rollback()
             raise
 
-    def commit_staged_seen(self) -> int:
-        records = list(self._staged_dedup_records.values())
-        self._persist_dedup_records(records)
+    def _require_reversible_dedup_token(
+        self, token: ReversibleDedupCommit
+    ) -> None:
+        if (
+            not isinstance(token, ReversibleDedupCommit)
+            or token.owner is not self
+            or self._pending_reversible_dedup_commit is not token
+            or not token.active
+        ):
+            raise RuntimeError("invalid or inactive reversible dedup commit token")
+
+    def accept_staged_seen_commit(self, token: ReversibleDedupCommit) -> int:
+        """Promote a shadow batch only after exact success evidence verifies."""
+        self._require_reversible_dedup_token(token)
+        if self._dedup_conn is None:
+            raise RuntimeError("dedup connection closed before pending promotion")
+        with source_lock(self._dedup_source_root()):
+            if not self._has_exact_success_evidence(token.run_id):
+                raise RuntimeError(
+                    "cannot promote pending dedup without exact successful completion"
+                )
+            records = self._promote_pending_run(token.run_id)
         for record in records:
             self._refresh_keys.discard(record["key"])
-        self._staged_dedup_records.clear()
-        return len(records)
+            if record["outcome"] == "success":
+                self._seen_keys.add(record["key"])
+            else:
+                self._seen_keys.discard(record["key"])
+        token.active = False
+        self._pending_reversible_dedup_commit = None
+        return token.committed_count
+
+    def rollback_staged_seen_commit(self, token: ReversibleDedupCommit) -> int:
+        """Delete an inactive shadow batch; active ``seen`` rows are untouched."""
+        self._require_reversible_dedup_token(token)
+        if self._dedup_conn is None:
+            raise RuntimeError("dedup connection closed before pending discard")
+        pending_keys = {
+            record["key"] for record in self._pending_records(token.run_id)
+        }
+        self._discard_pending_run(token.run_id)
+        self._within_run_keys.difference_update(pending_keys)
+        token.active = False
+        self._pending_reversible_dedup_commit = None
+        return token.committed_count
+
+    def discard_pending_staged_seen(self, run_id: str | None = None) -> int:
+        """Best-effort recovery API for a prepare whose commit acknowledgement failed.
+
+        This method deliberately works without a token.  If SQLite committed the
+        shadow batch and then raised before the caller received its handle, the run
+        identity is enough to remove it.  Failure still leaves only ignored rows.
+        """
+        if self._dedup_conn is None:
+            raise RuntimeError("dedup connection closed before pending discard")
+        selected = self._validated_pending_run_id(
+            getattr(self, "run_id", "") if run_id is None else run_id
+        )
+        pending_keys = {
+            record["key"] for record in self._pending_records(selected)
+        }
+        deleted = self._discard_pending_run(selected)
+        self._within_run_keys.difference_update(pending_keys)
+        token = self._pending_reversible_dedup_commit
+        if token is not None and token.run_id == selected:
+            token.active = False
+            self._pending_reversible_dedup_commit = None
+        return deleted
+
+    def pending_staged_seen_count(self, run_id: str | None = None) -> int:
+        """Return the inactive shadow-row count for diagnostics and tests."""
+        if self._dedup_conn is None:
+            return 0
+        selected = self._validated_pending_run_id(
+            getattr(self, "run_id", "") if run_id is None else run_id
+        )
+        row = self._dedup_conn.execute(
+            "SELECT COUNT(*) FROM pending_seen WHERE pending_run_id = ?",
+            (selected,),
+        ).fetchone()
+        return int(row[0]) if row else 0
 
     def discard_staged_seen(self) -> None:
+        # A durable pending batch, if any, is independent and remains invisible.
+        # Clearing the process-local stage is therefore always safe, including when
+        # deletion of pending rows failed and a later startup must reconcile them.
         for record in self._staged_dedup_records.values():
             if record["outcome"] == "success":
                 self._seen_keys.discard(record["key"])
+            self._within_run_keys.discard(record["key"])
         self._staged_dedup_records.clear()
 
     def mark_seen(self, mapping) -> bool:
@@ -517,13 +1172,18 @@ class BaseLegalSpider(scrapy.Spider):
         key = self.dedup_key(mapping)
         if key is None or self.is_seen(mapping):
             return False
+        if not self.dedup_enabled:
+            if not getattr(self, "evidence_crawl", False):
+                return False
+            self._within_run_keys.add(key)
+            return True
         record = self._dedup_record(mapping, force_success=True)
         self._persist_dedup_records([record])
         self._seen_keys.add(key)
         self._refresh_keys.discard(key)
         return True
 
-    def build_run_id(self) -> str:
+    def build_run_id(self, *, create_only: bool = False) -> str:
         timestamp = self.started_at.strftime("%Y%m%dT%H%M%SZ")
         base_run_id = (
             f"{timestamp}_start-{self.scraping_start_date.isoformat()}"
@@ -531,7 +1191,15 @@ class BaseLegalSpider(scrapy.Spider):
         )
         run_id = base_run_id
         suffix = 2
-        while (self.ARTIFACTS_ROOT / self.name / "runs" / run_id).exists():
+        source_root = Path(
+            os.path.abspath(getattr(self, "source_root", self.ARTIFACTS_ROOT / self.name))
+        )
+        if create_only and (source_root / "runs" / run_id).exists():
+            raise FileExistsError(
+                f"immutable evidence run destination already exists: "
+                f"{source_root / 'runs' / run_id}"
+            )
+        while (source_root / "runs" / run_id).exists():
             run_id = f"{base_run_id}-{suffix}"
             suffix += 1
         return run_id
@@ -548,16 +1216,45 @@ class BaseLegalSpider(scrapy.Spider):
         }
 
     def write_run_metadata(self):
-        metadata = {
-            "run_id": self.run_id,
-            "spider": self.name,
-            "start_date": self.scraping_start_date.isoformat(),
-            "end_date": self.scraping_end_date.isoformat(),
-            "started_at": self.started_at.isoformat(),
-            "items_path": str(self.items_path),
-            "latest_items_path": str(self.latest_items_path),
-            "log_path": str(self.log_path),
-        }
-        metadata_json = json.dumps(metadata, indent=2) + "\n"
-        self.run_metadata_path.write_text(metadata_json, encoding="utf-8")
-        self.latest_metadata_path.write_text(metadata_json, encoding="utf-8")
+        """Invalidate latest and create this run's nonqualifying startup record."""
+        metadata = build_startup_record(self)
+        publish_startup_metadata(
+            self.run_metadata_path,
+            self.latest_metadata_path,
+            metadata,
+        )
+
+    def evidence_source_arguments(self) -> dict[str, object]:
+        """Return bounded, reportable spider arguments for the crawl contract."""
+        arguments: dict[str, object] = {}
+        if self.name == "matsne":
+            doc_type = getattr(self, "_doc_type", None)
+            arguments["doc_type"] = doc_type() if callable(doc_type) else "all"
+            for name in ("seed_ids_file", "seed_file", "seed_urls"):
+                value = getattr(self, name, None)
+                arguments[name] = None if value in (None, "") else value
+        if self.name == "supremecourt":
+            arguments["initial_window_days"] = int(
+                getattr(self, "initial_window_days", 7)
+            )
+            arguments["parent_run_id"] = getattr(self, "parent_run_id", None)
+            crawler = getattr(self, "crawler", None)
+            settings = getattr(crawler, "settings", None)
+            arguments["max_runtime_seconds"] = (
+                settings.getint("CLOSESPIDER_TIMEOUT", 0)
+                if settings is not None
+                else 0
+            )
+        return arguments
+
+    def evidence_discovery_limits(self) -> dict[str, int]:
+        """Return deterministic numeric discovery ceilings for attestation."""
+        module = sys.modules.get(type(self).__module__)
+        limits: dict[str, int] = {}
+        for name in _DISCOVERY_LIMIT_NAMES:
+            value = getattr(self, name, None)
+            if value is None and module is not None:
+                value = getattr(module, name, None)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                limits[name.lower()] = value
+        return limits

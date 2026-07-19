@@ -18,6 +18,7 @@ from ingest.promotion import (  # noqa: E402
     PROMOTION_APPROVAL_ENV,
     create_promotion_plan,
     execute_promotion,
+    load_promotion_plan,
     write_promotion_plan,
 )
 
@@ -85,6 +86,9 @@ def main(argv: list[str] | None = None, *, environ=None) -> int:
         )
     if args.forward_after_rollback and environment.get(FORWARD_APPROVAL_ENV) != "1":
         parser.error(f"final forward switch also requires {FORWARD_APPROVAL_ENV}=1")
+    # Parse and reject a reserved frozen-candidate plan before importing/calling a backend
+    # factory, which may construct clients or models as a side effect.
+    load_promotion_plan(args.plan)
     backend = _backend_factory(args.backend_factory)
     state = execute_promotion(
         args.plan,

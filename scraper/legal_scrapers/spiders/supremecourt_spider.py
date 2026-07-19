@@ -26,6 +26,7 @@ import json
 import math
 import os
 import re
+import secrets
 import stat
 import sys
 import time
@@ -38,10 +39,12 @@ from urllib.parse import urlencode
 from scrapy import Request
 from scrapy.loader import ItemLoader
 
+from ..completion import verify_terminal_record
 from ..items import SupremecourtItem
 from ..utils.dates import iso_to_year_slashed
 from ..utils.markdown import safe_html_to_markdown
 from .base import BaseLegalSpider
+from .base import EVIDENCE_ARTIFACTS_ROOT
 
 BASE = "https://www.supremecourt.ge"
 GETCASES_URL = f"{BASE}/ka/getCases"
@@ -216,23 +219,226 @@ def parse_authoritative_total(response) -> int | None:
     return int(re.sub(r"[^0-9]", "", match.group(1)))
 
 
-def _atomic_write(path: Path, payload: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    with tmp.open("wb") as fh:
-        os.chmod(tmp, 0o600)
-        fh.write(payload)
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.replace(tmp, path)
+_DIRECTORY_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_CLOEXEC", 0)
+    | getattr(os, "O_DIRECTORY", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+)
+
+
+def _absolute_lexical(path: str | os.PathLike[str]) -> Path:
+    return Path(os.path.abspath(os.fspath(path)))
+
+
+def _open_directory_nofollow(
+    path: str | os.PathLike[str], *, create: bool = False
+) -> int:
+    """Open a directory by walking every component beneath a trusted root fd.
+
+    A final-component ``O_NOFOLLOW`` is insufficient: an attacker can otherwise
+    replace any ancestor with a symlink between a lexical check and ``os.open``.
+    This walker resolves each component relative to the already-open parent and
+    keeps ``O_NOFOLLOW`` in force for the whole traversal.
+    """
+
+    absolute = _absolute_lexical(path)
+    descriptor = os.open(absolute.anchor, _DIRECTORY_FLAGS)
     try:
-        fd = os.open(path.parent, os.O_DIRECTORY)
+        for component in absolute.parts[1:]:
+            try:
+                info = os.stat(component, dir_fd=descriptor, follow_symlinks=False)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                try:
+                    os.mkdir(component, mode=0o700, dir_fd=descriptor)
+                    os.fsync(descriptor)
+                except FileExistsError:
+                    # A concurrent creator is accepted only after the same
+                    # no-follow type check and descriptor-relative open below.
+                    pass
+                info = os.stat(component, dir_fd=descriptor, follow_symlinks=False)
+            if stat.S_ISLNK(info.st_mode):
+                raise PermissionError(
+                    f"refusing symlinked Supreme Court directory component: "
+                    f"{absolute}"
+                )
+            if not stat.S_ISDIR(info.st_mode):
+                raise PermissionError(
+                    f"Supreme Court directory component is not a directory: "
+                    f"{absolute}"
+                )
+            try:
+                child = os.open(component, _DIRECTORY_FLAGS, dir_fd=descriptor)
+            except OSError as exc:
+                raise PermissionError(
+                    f"cannot safely open Supreme Court directory component "
+                    f"{component!r} in {absolute}: {exc}"
+                ) from exc
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _private_regular_stat(info: os.stat_result, path: Path) -> None:
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or stat.S_IMODE(info.st_mode) != 0o600
+        or info.st_uid != os.geteuid()
+    ):
+        raise PermissionError(
+            f"Supreme Court artifact must be an owner-private regular file: {path}"
+        )
+
+
+def _fsync_private_regular_file(path: Path) -> None:
+    """Fsync one private file and its parent through no-follow descriptors."""
+
+    absolute = _absolute_lexical(path)
+    directory_fd = _open_directory_nofollow(absolute.parent)
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            absolute.name,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory_fd,
+        )
+        _private_regular_stat(os.fstat(descriptor), absolute)
+        os.fsync(descriptor)
+        os.fsync(directory_fd)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(directory_fd)
+
+
+def _read_private_regular_bytes(path: Path, *, max_bytes: int) -> bytes:
+    """Read stable owner-private bytes without following any path component."""
+
+    absolute = _absolute_lexical(path)
+    directory_fd = _open_directory_nofollow(absolute.parent)
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            absolute.name,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory_fd,
+        )
+        before = os.fstat(descriptor)
+        _private_regular_stat(before, absolute)
+        if before.st_size > max_bytes:
+            raise ValueError(f"Supreme Court artifact exceeds {max_bytes} bytes: {absolute}")
+        payload = bytearray()
+        while True:
+            block = os.read(descriptor, min(1024 * 1024, max_bytes + 1 - len(payload)))
+            if not block:
+                break
+            payload.extend(block)
+            if len(payload) > max_bytes:
+                raise ValueError(
+                    f"Supreme Court artifact grew beyond {max_bytes} bytes: {absolute}"
+                )
+        after = os.fstat(descriptor)
+        leaf = os.stat(absolute.name, dir_fd=directory_fd, follow_symlinks=False)
+        if (
+            len(payload) != before.st_size
+            or after.st_size != before.st_size
+            or after.st_dev != before.st_dev
+            or after.st_ino != before.st_ino
+            or after.st_mtime_ns != before.st_mtime_ns
+            or leaf.st_dev != before.st_dev
+            or leaf.st_ino != before.st_ino
+        ):
+            raise RuntimeError(f"Supreme Court artifact changed while reading: {absolute}")
+        os.fsync(descriptor)
+        os.fsync(directory_fd)
+        return bytes(payload)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(directory_fd)
+
+
+def _atomic_write(path: Path, payload: bytes) -> None:
+    """Durably replace one private file without following any symlink.
+
+    Supreme Court artifacts are acceptance evidence, so a directory fsync is part of
+    the write rather than best-effort cleanup.  The random same-directory temporary
+    name avoids collisions between interrupted or concurrent attempts.
+    """
+
+    path = _absolute_lexical(path)
+    directory_fd = _open_directory_nofollow(path.parent, create=True)
+    temporary_name = f".{path.name}.{secrets.token_hex(16)}.tmp"
+    descriptor = None
+    try:
         try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-    except OSError:
-        pass
+            current = os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            current = None
+        if current is not None:
+            if stat.S_ISLNK(current.st_mode) or not stat.S_ISREG(current.st_mode):
+                raise PermissionError(
+                    f"refusing to replace non-regular Supreme Court artifact: {path}"
+                )
+            if (
+                stat.S_IMODE(current.st_mode) != 0o600
+                or current.st_uid != os.geteuid()
+            ):
+                raise PermissionError(
+                    f"refusing to replace non-private Supreme Court artifact: {path}"
+                )
+        descriptor = os.open(
+            temporary_name,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=directory_fd,
+        )
+        os.fchmod(descriptor, 0o600)
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("short write while materializing Supreme Court artifact")
+            view = view[written:]
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        os.replace(
+            temporary_name,
+            path.name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        os.fsync(directory_fd)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary_name, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+        os.close(directory_fd)
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = _open_directory_nofollow(path)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 class SupremecourtSpider(BaseLegalSpider):
@@ -257,9 +463,14 @@ class SupremecourtSpider(BaseLegalSpider):
         },
     }
 
-    def __init__(self, *args, initial_window_days=7, **kwargs):
+    def __init__(
+        self, *args, initial_window_days=7, parent_run_id=None, **kwargs
+    ):
         super().__init__(*args, **kwargs)
         self.initial_window_days = max(1, int(initial_window_days))
+        self.parent_run_id = (
+            str(parent_run_id).strip() if parent_run_id is not None else None
+        )
         self._planner = NewestFirstPlanner(
             self.scraping_start_date, self.initial_window_days
         )
@@ -278,6 +489,7 @@ class SupremecourtSpider(BaseLegalSpider):
         self._unresolved_count = 0
         self._finish_reason: str | None = None
         self._artifacts_finalized = False
+        self._completion_preparing = False
         self._run_ready = False
         self._reconcile_counts = (0, 0, 0)
         self._chamber_start_cursors: dict[int, date | None] = {
@@ -290,14 +502,33 @@ class SupremecourtSpider(BaseLegalSpider):
         self._started_monotonic = time.monotonic()
 
     def configure_run_outputs(self, settings):
-        start_cursors, resume_parent = self._discover_resume_state()
+        evidence = settings.getbool("EVIDENCE_CRAWL_ENABLED", False)
+        if evidence and self.parent_run_id is None:
+            raise ValueError(
+                "Supreme Court evidence crawl requires an explicit parent_run_id "
+                "('none' only for the first run)"
+            )
+        if evidence and self.initial_window_days != 7:
+            raise ValueError(
+                "Supreme Court evidence crawl requires initial_window_days=7"
+            )
+        if evidence and settings.getint("CLOSESPIDER_TIMEOUT", 0) != 14_400:
+            raise ValueError(
+                "Supreme Court evidence crawl requires CLOSESPIDER_TIMEOUT=14400"
+            )
+        self.evidence_crawl = evidence
+        start_cursors, resume_parent = self._discover_resume_state(evidence=evidence)
         super().configure_run_outputs(settings)
         # This spider's fsync journal and atomic materializer replace FeedExporter.  Keeping
         # FEEDS enabled would duplicate items and recreate the seen-before-feed race.
         settings.set("FEEDS", {}, priority="spider")
         self.journal_path = self.run_dir / "items.journal.jsonl"
         self.partial_manifest_path = self.run_dir / "partial_manifest.json"
-        self.latest_manifest_path = self.latest_dir / "partial_manifest.json"
+        self.latest_manifest_path = (
+            None
+            if self.latest_dir is None
+            else self.latest_dir / "partial_manifest.json"
+        )
 
         self._existing_items = self._collect_existing_items()
         self._cumulative_items = dict(self._existing_items)
@@ -344,7 +575,9 @@ class SupremecourtSpider(BaseLegalSpider):
             raise
         return module
 
-    def _discover_resume_state(self) -> tuple[dict[int, date | None], dict | None]:
+    def _discover_resume_state(
+        self, *, evidence: bool = False
+    ) -> tuple[dict[int, date | None], dict | None]:
         """Return independently verified prior cursors, or a deliberate fresh seed.
 
         Only run-scoped final manifests participate; ``latest`` and live partial manifests
@@ -354,26 +587,69 @@ class SupremecourtSpider(BaseLegalSpider):
         """
 
         fresh = {chamber: self.scraping_end_date for chamber in CHAMBERS}
-        runs_root = self.ARTIFACTS_ROOT / self.name / "runs"
+        artifacts_root = EVIDENCE_ARTIFACTS_ROOT if evidence else self.ARTIFACTS_ROOT
+        runs_root = artifacts_root / self.name / "runs"
+        if evidence:
+            if self.parent_run_id == "none":
+                existing = any(runs_root.iterdir()) if runs_root.is_dir() else False
+                if existing:
+                    raise RuntimeError(
+                        "explicit parent 'none' is valid only before the first "
+                        "Supreme Court evidence run"
+                    )
+                return fresh, None
+            if (
+                not self.parent_run_id
+                or self._PENDING_RUN_ID_RE.fullmatch(self.parent_run_id) is None
+                or self.parent_run_id.lower() == "latest"
+            ):
+                raise RuntimeError("unsafe explicit Supreme Court parent run ID")
+            manifest_path = runs_root / self.parent_run_id / "partial_manifest.json"
+            if not manifest_path.is_file() or manifest_path.is_symlink():
+                raise RuntimeError(
+                    f"explicit Supreme Court parent manifest is missing: {manifest_path}"
+                )
+            try:
+                verify_terminal_record(
+                    manifest_path.parent / "run.json",
+                    expected_source=self.name,
+                    expected_run_id=self.parent_run_id,
+                    expected_items_path=manifest_path.parent / "items.jsonl",
+                )
+                payload = _read_private_regular_bytes(
+                    manifest_path, max_bytes=1024 * 1024
+                )
+                raw_manifest = json.loads(payload)
+            except (
+                OSError,
+                ValueError,
+                RuntimeError,
+                json.JSONDecodeError,
+            ) as exc:
+                raise RuntimeError(
+                    f"cannot inspect explicit Supreme Court parent {manifest_path}: {exc}"
+                ) from exc
+            finalized = [(self.parent_run_id, manifest_path, payload, raw_manifest)]
+        else:
+            finalized = []
         if not runs_root.is_dir():
             return fresh, None
-
-        finalized: list[tuple[str, Path, bytes, dict]] = []
-        for path in sorted(runs_root.glob("*/partial_manifest.json")):
-            try:
-                payload = path.read_bytes()
-                value = json.loads(payload)
-            except (OSError, json.JSONDecodeError) as exc:
-                raise RuntimeError(
-                    f"cannot inspect prior Supreme Court manifest {path}: {exc}"
-                ) from exc
-            if not isinstance(value, dict):
-                raise RuntimeError(f"prior Supreme Court manifest is not an object: {path}")
-            # Atomic live manifests have both fields null. Either non-null field is final
-            # evidence (or a corrupt attempted finalization that must fail closed below).
-            if value.get("finished_at") is None and value.get("items_sha256") is None:
-                continue
-            finalized.append((path.parent.name, path, payload, value))
+        if not evidence:
+            for path in sorted(runs_root.glob("*/partial_manifest.json")):
+                try:
+                    payload = path.read_bytes()
+                    value = json.loads(payload)
+                except (OSError, json.JSONDecodeError) as exc:
+                    raise RuntimeError(
+                        f"cannot inspect prior Supreme Court manifest {path}: {exc}"
+                    ) from exc
+                if not isinstance(value, dict):
+                    raise RuntimeError(f"prior Supreme Court manifest is not an object: {path}")
+                # Atomic live manifests have both fields null. Either non-null field is final
+                # evidence (or a corrupt attempted finalization that must fail closed below).
+                if value.get("finished_at") is None and value.get("items_sha256") is None:
+                    continue
+                finalized.append((path.parent.name, path, payload, value))
         if not finalized:
             return fresh, None
 
@@ -397,6 +673,10 @@ class SupremecourtSpider(BaseLegalSpider):
             or raw_manifest.get("frontier_start_date")
             != self.scraping_end_date.isoformat()
         ):
+            if evidence:
+                raise RuntimeError(
+                    "explicit Supreme Court evidence parent has a different date scope"
+                )
             self.logger.info(
                 "supremecourt: newest final run %s has a different date scope; "
                 "starting fresh",
@@ -817,21 +1097,29 @@ class SupremecourtSpider(BaseLegalSpider):
         line = (
             json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n"
         ).encode()
-        self.journal_path.parent.mkdir(parents=True, exist_ok=True)
         flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
         flags |= getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(self.journal_path, flags, 0o600)
-        current = os.fstat(descriptor)
-        if not stat.S_ISREG(current.st_mode) or stat.S_IMODE(current.st_mode) & 0o077:
-            os.close(descriptor)
-            raise PermissionError(
-                "Supreme Court journal is not an owner-only regular file; "
-                "refusing to chmod existing evidence"
+        journal_path = _absolute_lexical(self.journal_path)
+        directory_fd = _open_directory_nofollow(journal_path.parent)
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(
+                journal_path.name,
+                flags,
+                0o600,
+                dir_fd=directory_fd,
             )
-        with os.fdopen(descriptor, "ab") as fh:
-            fh.write(line)
-            fh.flush()
-            os.fsync(fh.fileno())
+            _private_regular_stat(os.fstat(descriptor), journal_path)
+            with os.fdopen(descriptor, "ab") as fh:
+                descriptor = None
+                fh.write(line)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.fsync(directory_fd)
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            os.close(directory_fd)
         self._cumulative_items[identity] = item
         self._new_identities.add(identity)
         self.crawler.stats.inc_value("supremecourt/new_items")
@@ -959,12 +1247,24 @@ class SupremecourtSpider(BaseLegalSpider):
         return f"{case_id}:{chamber}"
 
     def _collect_existing_items(self) -> dict[str, dict]:
-        root = self.ARTIFACTS_ROOT / self.name
-        paths = sorted(root.glob("runs/*/items.jsonl"))
-        paths += sorted(root.glob("runs/*/items.journal.jsonl"))
-        latest = root / "latest" / "items.jsonl"
-        if latest.exists():
-            paths.append(latest)
+        if getattr(self, "evidence_crawl", False):
+            if self._resume_parent is None:
+                return {}
+            parent_path = (
+                Path(str(self._resume_parent["manifest_file"])).parent
+                / "items.jsonl"
+            )
+            return self._load_exact_parent_items(
+                parent_path,
+                expected_sha256=str(self._resume_parent["items_sha256"]),
+            )
+        else:
+            root = self.ARTIFACTS_ROOT / self.name
+            paths = sorted(root.glob("runs/*/items.jsonl"))
+            paths += sorted(root.glob("runs/*/items.journal.jsonl"))
+            latest = root / "latest" / "items.jsonl"
+            if latest.exists():
+                paths.append(latest)
         items: dict[str, dict] = {}
         for path in paths:
             try:
@@ -981,6 +1281,86 @@ class SupremecourtSpider(BaseLegalSpider):
                     if identity and str(item.get("body_markdown") or "").strip():
                         items[identity] = item
         return items
+
+    def _load_exact_parent_items(
+        self, path: Path, *, expected_sha256: str
+    ) -> dict[str, dict]:
+        """Load only the validated parent's exact cumulative feed, fail closed."""
+
+        absolute = _absolute_lexical(path)
+        directory_fd = _open_directory_nofollow(absolute.parent)
+        descriptor: int | None = None
+        items: dict[str, dict] = {}
+        digest = hashlib.sha256()
+        try:
+            descriptor = os.open(
+                absolute.name,
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=directory_fd,
+            )
+            before = os.fstat(descriptor)
+            _private_regular_stat(before, absolute)
+            with os.fdopen(os.dup(descriptor), "rb") as stream:
+                for line_number, raw_line in enumerate(stream, start=1):
+                    digest.update(raw_line)
+                    if not raw_line.strip():
+                        raise RuntimeError(
+                            f"parent feed contains a blank row at line {line_number}"
+                        )
+                    try:
+                        item = json.loads(raw_line)
+                    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                        raise RuntimeError(
+                            f"parent feed has invalid JSON at line {line_number}: {exc}"
+                        ) from exc
+                    if not isinstance(item, dict):
+                        raise RuntimeError(
+                            f"parent feed row {line_number} is not an object"
+                        )
+                    identity = self._identity(item)
+                    if identity is None or not str(
+                        item.get("body_markdown") or ""
+                    ).strip():
+                        raise RuntimeError(
+                            f"parent feed row {line_number} is not an admitted decision"
+                        )
+                    if identity in items:
+                        raise RuntimeError(
+                            f"parent feed repeats identity {identity!r}"
+                        )
+                    items[identity] = item
+            after = os.fstat(descriptor)
+            leaf = os.stat(
+                absolute.name, dir_fd=directory_fd, follow_symlinks=False
+            )
+            if (
+                after.st_size != before.st_size
+                or after.st_dev != before.st_dev
+                or after.st_ino != before.st_ino
+                or after.st_mtime_ns != before.st_mtime_ns
+                or leaf.st_dev != before.st_dev
+                or leaf.st_ino != before.st_ino
+            ):
+                raise RuntimeError("validated Supreme Court parent feed changed while loading")
+            if digest.hexdigest() != expected_sha256:
+                raise RuntimeError(
+                    "validated Supreme Court parent feed hash does not match its manifest"
+                )
+            os.fsync(descriptor)
+            os.fsync(directory_fd)
+            return items
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            os.close(directory_fd)
+
+    def is_seen(self, mapping) -> bool:
+        key = self.dedup_key(mapping)
+        if key is not None and key in getattr(self, "_existing_items", {}):
+            return True
+        return super().is_seen(mapping)
 
     def _reconcile_seen_store(self) -> None:
         if not self.dedup_enabled or self._dedup_conn is None:
@@ -1048,7 +1428,8 @@ class SupremecourtSpider(BaseLegalSpider):
             for item in self._sorted_cumulative()
         )
         _atomic_write(self.items_path, payload)
-        _atomic_write(self.latest_items_path, payload)
+        if self.latest_items_path is not None:
+            _atomic_write(self.latest_items_path, payload)
         return len(self._cumulative_items), hashlib.sha256(payload).hexdigest()
 
     def _manifest(self, *, final: bool, items_sha256: str | None = None) -> dict:
@@ -1172,14 +1553,28 @@ class SupremecourtSpider(BaseLegalSpider):
         manifest = self._manifest(final=final, items_sha256=items_sha256)
         payload = (json.dumps(manifest, ensure_ascii=False, indent=2) + "\n").encode()
         _atomic_write(self.partial_manifest_path, payload)
-        _atomic_write(self.latest_manifest_path, payload)
+        if self.latest_manifest_path is not None:
+            _atomic_write(self.latest_manifest_path, payload)
 
-    def closed(self, reason):
+    def prepare_completion(self, reason):
+        """Idempotently materialize the strict partial artifact for the attester."""
+
         if self._artifacts_finalized or not self._run_ready:
             return
-        self._artifacts_finalized = True
-        self._finish_reason = reason
-        _, digest = self._materialize_items()
-        self._write_manifest(final=True, items_sha256=digest)
-        if getattr(self, "_dedup_conn", None) is not None:
-            self._dedup_conn.close()
+        if self._completion_preparing:
+            return
+        self._completion_preparing = True
+        try:
+            self._finish_reason = reason
+            try:
+                _fsync_private_regular_file(self.journal_path)
+            except FileNotFoundError:
+                # An empty journal is positive evidence that this run emitted no new items.
+                _atomic_write(self.journal_path, b"")
+            _, digest = self._materialize_items()
+            self._write_manifest(final=True, items_sha256=digest)
+            if getattr(self, "_dedup_conn", None) is not None:
+                self._dedup_conn.close()
+            self._artifacts_finalized = True
+        finally:
+            self._completion_preparing = False

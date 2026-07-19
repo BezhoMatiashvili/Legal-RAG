@@ -48,6 +48,31 @@ class ExtractionLimits:
 
 
 @dataclass(frozen=True)
+class PageBoundary:
+    """One PDF page's exact half-open range in emitted ``body_markdown``.
+
+    Page numbers are one-based physical PDF page numbers.  Character offsets use
+    Python/JSON Unicode code-point coordinates.  The two newlines inserted between
+    pages are deliberately outside either page's range; substantive page text is
+    therefore never attributed to an adjacent page.
+    """
+
+    page_number: int
+    char_start: int
+    char_end: int
+
+    def as_dict(self) -> dict[str, int]:
+        return {
+            "page_number": self.page_number,
+            "char_start": self.char_start,
+            "char_end": self.char_end,
+        }
+
+
+PAGE_COORDINATE_REASON_EXACT_PDF_TEXT = "exact_pdf_text"
+
+
+@dataclass(frozen=True)
 class ExtractionResult:
     text: str
     status: ExtractionStatus
@@ -55,6 +80,8 @@ class ExtractionResult:
     content_complete: bool = False
     detected_mime: str | None = None
     detail: str = ""
+    page_boundaries: tuple[PageBoundary, ...] = ()
+    page_coordinate_reason: str | None = None
 
 
 DEFAULT_EXTRACTION_LIMITS = ExtractionLimits()
@@ -169,8 +196,70 @@ def _extract_pdf_payload(
             if characters > limits.max_output_chars:
                 truncated = True
                 break
-    return _text_result(
-        "\n\n".join(parts), limits=limits, truncated=truncated, mime=mime
+    return _pdf_text_result(
+        parts, limits=limits, truncated=truncated, mime=mime
+    )
+
+
+def _pdf_text_result(
+    pages: list[str],
+    *,
+    limits: ExtractionLimits,
+    truncated: bool,
+    mime: str | None,
+) -> ExtractionResult:
+    """Normalize pages independently and retain exact offsets in the final text."""
+
+    output_parts: list[str] = []
+    boundaries: list[PageBoundary] = []
+    output_length = 0
+
+    for page_number, raw_text in enumerate(pages, start=1):
+        page_text = plain_text_to_markdown(raw_text)
+        separator = "" if page_number == 1 else "\n\n"
+        remaining = limits.max_output_chars - output_length
+        if remaining < len(separator):
+            output_parts.append(separator[: max(remaining, 0)])
+            output_length += max(remaining, 0)
+            truncated = True
+            break
+
+        output_parts.append(separator)
+        output_length += len(separator)
+        char_start = output_length
+        remaining = limits.max_output_chars - output_length
+        emitted_page_text = page_text[:remaining]
+        output_parts.append(emitted_page_text)
+        output_length += len(emitted_page_text)
+        boundaries.append(
+            PageBoundary(
+                page_number=page_number,
+                char_start=char_start,
+                char_end=output_length,
+            )
+        )
+        if len(emitted_page_text) != len(page_text):
+            truncated = True
+            break
+
+    markdown = "".join(output_parts)
+    if not markdown.strip():
+        return ExtractionResult(
+            text="",
+            status=ExtractionStatus.SCANNED_NO_TEXT,
+            detected_mime=mime,
+            detail="document contains no extractable text",
+        )
+
+    status = ExtractionStatus.TRUNCATED if truncated else ExtractionStatus.FULL_TEXT
+    return ExtractionResult(
+        text=markdown,
+        status=status,
+        content_complete=status is ExtractionStatus.FULL_TEXT,
+        detected_mime=mime,
+        detail="configured page/output ceiling reached" if truncated else "",
+        page_boundaries=tuple(boundaries),
+        page_coordinate_reason=PAGE_COORDINATE_REASON_EXACT_PDF_TEXT,
     )
 
 

@@ -28,11 +28,26 @@ def test_legal_search_warns_about_missing_base_laws():
     assert "consolidated base-law texts" in doc
 
 
-def test_legal_search_has_calibrated_abstention_contract():
+def test_legal_search_has_paraphrase_caution():
     doc = _doc(mcp_server.legal_search)
-    assert "Abstention contract" in doc
-    assert "below ~0.92" in doc  # calibrated 2026-07-10, .state/min_score_calibration.json
-    assert "report that the document was not found" in doc
+    assert "Paraphrase caution" in doc
+    assert "statute's defined terms and article-style phrasing" in doc
+
+
+def test_legal_search_does_not_treat_reranker_score_as_answer_confidence():
+    doc = _doc(mcp_server.legal_search)
+    assert "Search-score caution" in doc
+    assert "not an answer probability" in doc
+    assert "legal_ask" in doc
+    assert "0.92" not in doc
+
+
+def test_legal_ask_pins_the_strict_validation_contract():
+    doc = _doc(mcp_server.legal_ask)
+    assert "atomic claims" in doc
+    assert "one repair" in doc
+    assert "selective-risk calibrator" in doc
+    assert "reranker sigmoid score" in doc
 
 
 def test_citation_existence_check_in_search_and_get_document():
@@ -41,17 +56,17 @@ def test_citation_existence_check_in_search_and_get_document():
         assert "never cite an identifier that does not resolve" in doc, fn
 
 
-def test_i4_changes_nothing_in_serving_fingerprint():
-    # Docstrings are not retrieval config: the fingerprint of each known serving config
-    # must still equal its historical value (env-independent via explicit replace).
+def test_i4_changes_nothing_inside_revision_two_serving_fingerprint():
+    # Docstrings are not retrieval config. Revision 2 intentionally invalidated the old
+    # digests once to remove storage names; these values now pin the revised material.
     import dataclasses
 
     base = dataclasses.replace(load_config(), rerank_enabled=True, rerank_backend="torch",
                                rerank_min_score=0.3)
     known = {
-        ("torch", 80): "06a64f548fcb4d59",   # Phase C shipped config
-        ("torch", 50): "81c807b279399098",   # Phase C recommended config
-        ("onnx", 50): "471ee93fc0199b03",    # I7 serving flip (2026-07-10)
+        ("torch", 80): "57431d11b802560e",
+        ("torch", 50): "2fad68ff22b025d7",
+        ("onnx", 50): "39358f4ea0787f38",
     }
     for (backend, rc), expect in known.items():
         cfg = dataclasses.replace(base, rerank_backend=backend, rerank_candidates=rc)

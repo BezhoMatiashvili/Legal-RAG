@@ -194,7 +194,10 @@ def test_tas_complete_dwr_scope_finalizes_cleanly():
     async def consume():
         return [item async for item in spider.parse_docs(response)]
 
-    assert asyncio.run(consume()) == []
+    items = asyncio.run(consume())
+    assert len(items) == 1
+    assert items[0]["admissible"] is False
+    assert items[0]["source_authority"] == "non_authoritative_summary"
     outcome = spider._pagination_reconcilers[spider.pagination_scope()].finalize()
     assert outcome.ok
     assert outcome.unique_identifier_count == 1
@@ -215,7 +218,10 @@ def test_tas_due_refresh_runs_by_id_outside_listing_discovery():
     async def consume():
         return [item async for item in spider.parse_docs(response)]
 
-    assert asyncio.run(consume()) == [{"refreshed": "42"}]
+    assert asyncio.run(consume()) == [
+        {"refreshed": "42"},
+        {"refreshed": "42"},
+    ]
     assert spider._fetch_detail.await_args_list[0].args[1] == "42"
     spider.build_item.assert_any_call(
         {

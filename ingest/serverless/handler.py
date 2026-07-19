@@ -11,7 +11,8 @@ same formatted string the local MCP server would produce — the local server in
 Request shape (queue API ``input``):   {"op": "search", "params": {...}}
 Response shape (job ``output``):       {"result": "<tool output string>"}   or {"error": ...}
 
-Ops: search | get_document | lookup | browse | versions | collection_info | health | refresh.
+Ops: ask | get_context | search | get_document | lookup | browse | stats | versions |
+collection_info | health | refresh.
 ``ingest_status`` is intentionally absent — watcher state lives on the local box only.
 
 Boot is FAIL-SOFT: an exception during qdrant boot/restore must not exit the process —
@@ -171,14 +172,43 @@ def _worker_readiness() -> dict:
     return qdrant_boot.runtime_readiness(_RESTORE, _RUNTIME_MANIFEST)
 
 
+def _retrieval_license_attestations():
+    """Load deployment-reviewed attestations before either retrieval model can load."""
+
+    from ingest.model_policy import LicenseAttestation
+
+    paths = {
+        "retriever": os.getenv("RETRIEVER_LICENSE_ATTESTATION_PATH", "").strip(),
+        "reranker": os.getenv("RERANKER_LICENSE_ATTESTATION_PATH", "").strip(),
+    }
+    missing = sorted(name for name, path in paths.items() if not path)
+    if missing:
+        raise RuntimeError(
+            "production worker is missing retrieval license attestation paths: "
+            + ", ".join(missing)
+        )
+    return (
+        LicenseAttestation.from_path(paths["retriever"]),
+        LicenseAttestation.from_path(paths["reranker"]),
+    )
+
+
 if _RUNTIME_CFG is not None:
     try:
-        srv._install_verified_worker_runtime(_RUNTIME_CFG, _worker_readiness)
+        retriever_attestation, reranker_attestation = _retrieval_license_attestations()
+        srv._install_verified_worker_runtime(
+            _RUNTIME_CFG,
+            _worker_readiness,
+            retriever_attestation=retriever_attestation,
+            reranker_attestation=reranker_attestation,
+        )
     except Exception as e:  # noqa: BLE001 - keep fail-soft boot, but never serve unbound
         _BOOT_ERROR = f"{type(e).__name__}: {e}"
         logger.error("worker runtime binding install failed: %s", _BOOT_ERROR)
 
 OPS: dict[str, tuple] = {
+    "ask": (srv.legal_ask, srv.LegalAskInput),
+    "get_context": (srv.legal_get_context, srv.LegalGetContextInput),
     "search": (srv.legal_search, srv.SearchInput),
     "get_document": (srv.legal_get_document, srv.GetDocumentInput),
     "lookup": (srv.legal_lookup, srv.LookupInput),
@@ -187,6 +217,11 @@ OPS: dict[str, tuple] = {
     "collection_info": (srv.legal_collection_info, None),
     "health": (srv.legal_health, None),
 }
+# Some hermetic boot tests install a deliberately minimal fake mcp_server. The real
+# server always exposes both symbols, while this conditional keeps that existing boot
+# seam compatible without weakening runtime registration.
+if hasattr(srv, "legal_stats") and hasattr(srv, "StatsInput"):
+    OPS["stats"] = (srv.legal_stats, srv.StatsInput)
 
 
 def _sysinfo() -> dict:
@@ -273,7 +308,11 @@ async def handler(job: dict) -> dict:
         # A publish that landed after module import is caught by a cheap two-file check.
         # maybe_restore refuses destructive warm replacement, so this records a visible
         # stale-data warning until an empty cold worker (or blue/green promotion) is used.
-        if await asyncio.to_thread(qdrant_boot.restore_pending):
+        # ``restore_pending`` is only two small local JSON reads. Running it directly
+        # avoids creating a per-request default executor (and makes pre-publication health
+        # probes terminate cleanly); the potentially multi-minute restore below remains
+        # offloaded.
+        if qdrant_boot.restore_pending():
             logger.info("new publish detected on a warm worker; checking safe restore policy")
             candidate = await asyncio.to_thread(qdrant_boot.maybe_restore)
             try:

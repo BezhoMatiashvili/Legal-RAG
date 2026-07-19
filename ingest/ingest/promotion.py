@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Protocol
 
 from .artifacts import atomic_write_json, load_verified_generation_coverage
+from .config import RETRIEVAL_FINGERPRINT_REVISION
 from .generation import (
     MANIFEST_FILENAME,
     GenerationFormatError,
@@ -71,6 +72,22 @@ class PromotionLockedError(PromotionError):
 
 class PromotionPlanExists(PromotionError):
     """An immutable promotion plan already exists at the requested path."""
+
+
+def refuse_frozen_candidate_promotion(
+    generation_id: str, physical_collection: str
+) -> None:
+    """Keep the exact 512-token candidate outside every alias-capable workflow."""
+
+    # Import lazily so the generic promotion module remains independent of release-input
+    # validation at import time.
+    from .release_inputs import GENERATION_ID, PHYSICAL_COLLECTION
+
+    if generation_id == GENERATION_ID and physical_collection == PHYSICAL_COLLECTION:
+        raise PromotionPreconditionError(
+            "the frozen 512-token candidate cannot enter a promotion plan or restore; "
+            "this release explicitly forbids promotion and alias operations"
+        )
 
 
 def _require_string(value: object, field: str, *, maximum: int = 4096) -> str:
@@ -179,6 +196,7 @@ class ExpectedCollectionIdentity:
     vector_space_id: str
     chunking_fingerprint: str
     document_header: bool
+    retrieval_fingerprint_revision: int
     retrieval_fingerprint: str
 
     @classmethod
@@ -201,10 +219,11 @@ class ExpectedCollectionIdentity:
             "vector_space_id",
             "chunking_fingerprint",
             "document_header",
+            "retrieval_fingerprint_revision",
             "retrieval_fingerprint",
         }
         _exact_keys(value, expected, "expected_collection")
-        return cls(
+        identity = cls(
             payload_schema_version=_require_int(
                 value["payload_schema_version"], "payload_schema_version"
             ),
@@ -238,10 +257,20 @@ class ExpectedCollectionIdentity:
                 value["chunking_fingerprint"], "chunking_fingerprint"
             ),
             document_header=_require_bool(value["document_header"], "document_header"),
+            retrieval_fingerprint_revision=_require_int(
+                value["retrieval_fingerprint_revision"],
+                "retrieval_fingerprint_revision",
+            ),
             retrieval_fingerprint=_require_sha256(
                 value["retrieval_fingerprint"], "retrieval_fingerprint"
             ),
         )
+        if identity.retrieval_fingerprint_revision != RETRIEVAL_FINGERPRINT_REVISION:
+            raise PromotionError(
+                "retrieval_fingerprint_revision must equal "
+                f"{RETRIEVAL_FINGERPRINT_REVISION}"
+            )
+        return identity
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -294,6 +323,7 @@ class PromotionPlan:
             raise PromotionError(
                 "physical_collection is not derived from generation_id"
             )
+        refuse_frozen_candidate_promotion(generation_id, physical)
         if value["serving_alias"] != SERVING_ALIAS:
             raise PromotionError(f"serving_alias must be {SERVING_ALIAS!r}")
         return cls(
@@ -361,6 +391,7 @@ class CollectionInspection:
     vector_space_id: str
     chunking_fingerprint: str
     document_header: bool
+    retrieval_fingerprint_revision: int
     retrieval_fingerprint: str
     optimizer_status: str
     integrity_ok: bool
@@ -408,6 +439,9 @@ def create_promotion_plan(
     _require_private_generation_tree(root)
     artifacts = load_generation(root)
     manifest = artifacts.manifest
+    physical_collection = physical_collection_name(manifest.generation_id)
+    # Refuse before building any alias-capable plan or consulting its promotion sidecar.
+    refuse_frozen_candidate_promotion(manifest.generation_id, physical_collection)
     sidecar = root.with_name(f"{root.name}.verification.json")
     _require_private_regular_file(sidecar, "verification sidecar")
     verification_report_sha256 = _file_sha256(sidecar)
@@ -447,7 +481,7 @@ def create_promotion_plan(
         snapshot_ref=snapshot_ref,
         snapshot_sha256=snapshot_sha256,
         serving_alias=SERVING_ALIAS,
-        physical_collection=physical_collection_name(manifest.generation_id),
+        physical_collection=physical_collection,
         expected_collection=ExpectedCollectionIdentity(
             payload_schema_version=manifest.schema_version,
             points_count=manifest.chunk_count,
@@ -464,6 +498,7 @@ def create_promotion_plan(
             vector_space_id=vector.id,
             chunking_fingerprint=chunking.fingerprint,
             document_header=chunking.document_header,
+            retrieval_fingerprint_revision=manifest.retrieval_fingerprint_revision,
             retrieval_fingerprint=manifest.retrieval_fingerprint,
         ),
         created_at=_format_utc(created_at or datetime.now(UTC)),
@@ -871,6 +906,10 @@ def _candidate_mismatches(
         "document_header": (
             inspection.document_header,
             expected.document_header,
+        ),
+        "retrieval_fingerprint_revision": (
+            inspection.retrieval_fingerprint_revision,
+            expected.retrieval_fingerprint_revision,
         ),
         "retrieval_fingerprint": (
             inspection.retrieval_fingerprint,

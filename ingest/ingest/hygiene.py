@@ -2,15 +2,18 @@
 
 The corpus arrives with source-specific damage: napr PDF→text bodies embed NUL and other
 control characters (~72% of docs), matsne HTML→Markdown carries `U+FFFD` mojibake in a few
-hundred docs, and a handful of bodies are non-NFC. This module strips structural junk
-(NUL / disallowed control chars), NFC-normalises Mkhedruli (idempotent), and classifies
-damage so a document can be *quarantined with a reason* instead of silently dropped.
+hundred docs, a handful of bodies are non-NFC, and some constcourt decisions embed inline
+base64 data-URI images (~18% of that source). This module strips structural junk
+(NUL / disallowed control chars, data-URI payloads), NFC-normalises Mkhedruli (idempotent),
+and classifies damage so a document can be *quarantined with a reason* instead of silently
+dropped.
 
-Personal data is never removed — only control characters and encoding artefacts. The
-cleaning is applied to the text we embed/index; callers keep the raw body separately.
-Pure stdlib: safe to import without the ML stack.
+Personal data is never removed — only control characters, non-text binary payloads, and
+encoding artefacts. The cleaning is applied to the text we embed/index; callers keep the
+raw body separately. Pure stdlib: safe to import without the ML stack.
 """
 
+import re
 import unicodedata
 from dataclasses import dataclass
 
@@ -19,6 +22,15 @@ from dataclasses import dataclass
 _KEEP = {0x09, 0x0A, 0x0D}
 _CONTROL = set(range(0x00, 0x20)) | set(range(0x80, 0xA0))
 _STRIP_TABLE = {c: None for c in (_CONTROL - _KEEP)}
+
+# Inline data-URI payloads (embedded images/fonts in scraped HTML→text, e.g. constcourt
+# decisions with attached figures) — a long whitespace-free base64 run that pollutes
+# embeddings/rerank input with non-text tokens and once crashed the chunker before
+# chunking.py hard-split it (see _split_oversized_run). Stripped to a bounded marker,
+# never left in indexed text.
+_DATA_URI_RE = re.compile(
+    r"data:(?P<mime>[a-zA-Z0-9.+-]+/[a-zA-Z0-9.+-]+);base64,(?P<payload>[A-Za-z0-9+/]+={0,2})"
+)
 
 REPLACEMENT_CHAR = "�"  # U+FFFD — the mojibake / lost-character marker
 
@@ -30,6 +42,21 @@ MOJIBAKE_RATIO = 0.01    # ≥ 1% of chars are U+FFFD ⇒ text too corrupt to tr
 Q_EMPTY = "empty_body"
 Q_NEAR_EMPTY = "near_empty"
 Q_MOJIBAKE = "mojibake"
+
+
+def strip_data_uris(text: str) -> tuple[str, int]:
+    """Replace embedded base64 data-URI payloads with a bounded marker; return (cleaned, count)."""
+    if not text:
+        return text or "", 0
+    count = 0
+
+    def _sub(m: re.Match) -> str:
+        nonlocal count
+        count += 1
+        return "[image]" if m.group("mime").startswith("image/") else "[file]"
+
+    cleaned = _DATA_URI_RE.sub(_sub, text)
+    return cleaned, count
 
 
 def strip_control(text: str) -> tuple[str, int]:
@@ -46,11 +73,14 @@ def to_nfc(text: str) -> str:
 
 
 def clean_text(text: str) -> str:
-    """Hygiene applied to indexed/embedded text: strip control chars, then NFC.
+    """Hygiene applied to indexed/embedded text: strip data-URI payloads and control
+    chars, then NFC.
 
-    Idempotent, and preserves all human-meaningful content (including personal data).
+    Idempotent, and preserves all human-meaningful content (including personal data) —
+    only non-text binary payloads and structural junk are removed.
     """
-    cleaned, _ = strip_control(text or "")
+    no_uris, _ = strip_data_uris(text or "")
+    cleaned, _ = strip_control(no_uris)
     return to_nfc(cleaned)
 
 
@@ -86,7 +116,8 @@ def assess(raw_body: str) -> DamageReport:
     """
     raw = raw_body or ""
     length = len(raw)
-    stripped, control = strip_control(raw)      # what clean_text keeps (pre-NFC)
+    no_uris, _ = strip_data_uris(raw)
+    stripped, control = strip_control(no_uris)  # what clean_text keeps (pre-NFC)
     meaningful = sum(1 for ch in stripped if not ch.isspace())
     nul = raw.count("\x00")
     repl = stripped.count(REPLACEMENT_CHAR)      # U+FFFD is not a control char, survives

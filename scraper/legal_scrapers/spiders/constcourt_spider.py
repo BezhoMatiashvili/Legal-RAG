@@ -23,6 +23,11 @@ from ..items import ConstcourtItem
 from ..utils.dates import iso_to_dotted
 from ..utils.documents import ExtractionStatus, docx_to_markdown
 from ..utils.markdown import safe_html_to_markdown
+from ..utils.pagination import (
+    finalize_pagination_scope,
+    get_pagination_reconciler,
+    handle_pagination_request_failure,
+)
 from .base import BaseLegalSpider
 
 BASE = "https://constcourt.ge"
@@ -53,7 +58,16 @@ class ConstcourtSpider(BaseLegalSpider):
     async def start(self):
         yield self.request_page(1)
 
+    @staticmethod
+    def pagination_scope():
+        return "judicial-acts"
+
+    def pagination_request_failed(self, failure):
+        return handle_pagination_request_failure(self, failure)
+
     def request_page(self, page, empty_retry=False):
+        scope = self.pagination_scope()
+        get_pagination_reconciler(self, scope, max_pages=MAX_PAGES)
         query = {
             "quantity": self.PAGE_SIZE,
             "page": page,
@@ -63,7 +77,7 @@ class ConstcourtSpider(BaseLegalSpider):
         return Request(
             f"{LIST_URL}?{urlencode(query)}",
             callback=self.parse_list,
-            errback=self.request_failed,
+            errback=self.pagination_request_failed,
             # The one-shot empty-page recheck must reach the network: otherwise Scrapy's
             # duplicate filter drops the identical URL and HTTP cache may replay the same
             # cached 200 WAF/empty response.
@@ -72,13 +86,37 @@ class ConstcourtSpider(BaseLegalSpider):
                 "page": page,
                 "empty_retry": empty_retry,
                 "dont_cache": empty_retry,
+                "pagination_scope": scope,
+                "pagination_cursor": page,
             },
+        )
+
+    @staticmethod
+    def _looks_waf_blocked(response):
+        sample = " ".join(response.xpath("//title//text() | //body//text()").getall())
+        folded = sample.casefold()[:64_000]
+        return any(
+            marker in folded
+            for marker in (
+                "access denied",
+                "request rejected",
+                "forbidden",
+                "captcha",
+                "cloudflare",
+                "web application firewall",
+            )
         )
 
     def parse_list(self, response):
         page = response.meta["page"]
+        scope = response.meta.get("pagination_scope") or self.pagination_scope()
+        tracker = get_pagination_reconciler(self, scope, max_pages=MAX_PAGES)
         if response.status != 200:
             self.logger.warning("constcourt: page %s returned HTTP %s; stopping", page, response.status)
+            tracker.mark_failure(
+                "callback_failure", cursor=page, detail=f"HTTP {response.status}"
+            )
+            finalize_pagination_scope(self, tracker, url=response.url)
             return
         items = response.css("div.legal-act-info")
 
@@ -88,12 +126,40 @@ class ConstcourtSpider(BaseLegalSpider):
             # before concluding, so a blip doesn't silently truncate coverage; a genuinely empty
             # end page just costs one extra fetch.
             if response.meta.get("empty_retry"):
-                self.logger.info("constcourt: page %s still empty on retry — end of results", page)
+                if self._looks_waf_blocked(response):
+                    tracker.mark_failure(
+                        "empty_waf_response",
+                        cursor=page,
+                        detail="uncached terminal retry matched a WAF/block page",
+                    )
+                else:
+                    tracker.observe_page(
+                        page,
+                        [],
+                        page_number=page,
+                        terminal=True,
+                    )
+                finalize_pagination_scope(self, tracker, url=response.url)
             else:
                 self.logger.info("constcourt: page %s empty — re-checking once (guards a transient "
                                  "200 block) before stopping", page)
                 yield self.request_page(page, empty_retry=True)
             return
+
+        identities = []
+        for block in items:
+            href = block.css("h5.legal-act-title a::attr(href)").get()
+            identities.append(
+                parse_qs(urlparse(href).query).get("legal", [None])[0]
+                if href
+                else None
+            )
+        tracker.observe_page(
+            page,
+            identities,
+            page_number=page,
+            terminal=False,
+        )
 
         for block in items:
             href = block.css("h5.legal-act-title a::attr(href)").get()
@@ -117,6 +183,8 @@ class ConstcourtSpider(BaseLegalSpider):
             yield self.request_page(page + 1)
         else:
             self.logger.warning("constcourt: hit MAX_PAGES=%s cap; stopping pagination", MAX_PAGES)
+            tracker.mark_cap(cursor=page, configured_cap=MAX_PAGES)
+            finalize_pagination_scope(self, tracker, url=response.url)
 
     def parse_detail(self, response):
         data = {

@@ -1,0 +1,22 @@
+{
+  "covered_sources": [
+    "ecd",
+    "supremecourt"
+  ],
+  "eval_set_hash": "48ad50a0101f52d1366cf0c24afffe70de6f3980e82273192d02351cbe3c68fd",
+  "extractor_revision": "court-extract-v1",
+  "extractor_source_sha256": "96bd90cdc665788d47b167bfc3de3c94eeebb2ea103208d6a24be663994d6891",
+  "metrics": {
+    "disposition_accuracy_confident": 1.0,
+    "disposition_coverage": 0.8125,
+    "judge_f1": 1.0
+  },
+  "passed": true,
+  "result_hash": "5e28875dc496afded3aee9ab7c441b8a372d00b902407a2dc51ac201049fefb3",
+  "schema_version": "court-extraction-trust/v1",
+  "thresholds": {
+    "disposition_accuracy_confident": 0.95,
+    "disposition_coverage": 0.8,
+    "judge_f1": 0.97
+  }
+}

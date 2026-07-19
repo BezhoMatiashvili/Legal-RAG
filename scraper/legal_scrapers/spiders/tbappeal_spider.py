@@ -136,7 +136,22 @@ class TbappealSpider(BaseLegalSpider):
                     continue
 
                 date_str = (post.css("span.date::text").get() or "").strip()
-                if not self._in_window(date_str):
+                parsed_date = parse_dotted(date_str)
+                if parsed_date is None:
+                    seen_slugs.add(slug)
+                    self.record_quarantine("unparseable_date")
+                    yield self._unparseable_date_quarantine(
+                        slug=slug,
+                        date_str=date_str,
+                        title=(post.css("h4 a::text").get() or "").strip(),
+                        source_url=response.urljoin(href),
+                    )
+                    continue
+                if not (
+                    self.scraping_start_date
+                    <= parsed_date
+                    <= self.scraping_end_date
+                ):
                     continue
 
                 seen_slugs.add(slug)
@@ -178,8 +193,28 @@ class TbappealSpider(BaseLegalSpider):
     def _in_window(self, date_str):
         parsed = parse_dotted(date_str)
         if parsed is None:
-            return True  # keep undated/unparseable posts rather than silently dropping
+            return False
         return self.scraping_start_date <= parsed <= self.scraping_end_date
+
+    @classmethod
+    def _unparseable_date_quarantine(
+        cls, *, slug, date_str, title, source_url
+    ):
+        return cls.load_item(
+            {
+                "source_url": source_url,
+                "slug": slug,
+                "title": title,
+                "date": date_str,
+                "body_markdown": title,
+                "content_kind": "non_authoritative_summary",
+                "content_complete": False,
+                "extraction_status": ExtractionStatus.MALFORMED.value,
+                "source_authority": "non_authoritative_summary",
+                "admissible": False,
+                "quarantine_reason": "unparseable_date",
+            }
+        )
 
     def parse_detail(self, response):
         body_html = response.css("div.blog-details").get()
@@ -212,13 +247,12 @@ class TbappealSpider(BaseLegalSpider):
             )
             return
 
-        self.record_quality_failure(
-            "missing_ruling_pdf",
-            response.url,
-            detail="article has no ruling PDF link",
-            context={"slug": data["slug"]},
+        self.record_quarantine("missing_ruling_pdf")
+        yield self._summary_fallback(
+            data,
+            ExtractionStatus.MALFORMED,
+            reason="missing_ruling_pdf",
         )
-        yield self._summary_fallback(data, ExtractionStatus.MALFORMED)
 
     def parse_pdf(self, response):
         data = response.meta["fields"]
@@ -234,17 +268,18 @@ class TbappealSpider(BaseLegalSpider):
                 detail=str(exc),
                 context={"slug": data.get("slug")},
             )
-            yield self._summary_fallback(data, ExtractionStatus.MALFORMED)
+            self.record_quarantine("ruling_pdf_parse_failed")
+            yield self._summary_fallback(
+                data,
+                ExtractionStatus.MALFORMED,
+                reason="ruling_pdf_parse_failed",
+            )
             return
 
         if result.status is not ExtractionStatus.FULL_TEXT:
-            self.record_quality_failure(
-                f"document_{result.status.value}",
-                response.url,
-                detail=result.detail,
-                context={"slug": data.get("slug")},
-            )
-            yield self._summary_fallback(data, result.status)
+            reason = f"ruling_pdf_{result.status.value}"
+            self.record_quarantine(reason)
+            yield self._summary_fallback(data, result.status, reason=reason)
             return
 
         data.update(
@@ -253,18 +288,27 @@ class TbappealSpider(BaseLegalSpider):
                 "content_kind": "ruling_full_text",
                 "content_complete": True,
                 "extraction_status": result.status.value,
+                "page_boundaries": [
+                    boundary.as_dict() for boundary in result.page_boundaries
+                ],
+                "page_coordinate_reason": result.page_coordinate_reason,
+                "source_authority": "primary_official",
+                "admissible": True,
             }
         )
         yield self.load_item(data)
 
     @classmethod
-    def _summary_fallback(cls, data, status):
+    def _summary_fallback(cls, data, status, *, reason="incomplete_ruling_pdf"):
         data.update(
             {
                 "body_markdown": data.get("article_summary") or "",
-                "content_kind": "article_summary",
+                "content_kind": "non_authoritative_summary",
                 "content_complete": False,
                 "extraction_status": status.value,
+                "source_authority": "non_authoritative_summary",
+                "admissible": False,
+                "quarantine_reason": reason,
             }
         )
         return cls.load_item(data)

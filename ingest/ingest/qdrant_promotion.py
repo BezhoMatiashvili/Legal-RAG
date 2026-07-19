@@ -23,12 +23,14 @@ from qdrant_client import models
 from .artifacts import atomic_write_json
 from .generation import MANIFEST_FILENAME, GenerationArtifacts, load_generation
 from .integrity import verify_generation_artifacts, write_verification_report
+from .qdrant_store import collection_configuration, collection_configuration_sha256
 from .promotion import (
     CollectionInspection,
     PromotionPlan,
     PromotionPreconditionError,
     _candidate_mismatches,
     promotion_plan_sha256,
+    refuse_frozen_candidate_promotion,
 )
 
 Check = Callable[[str, Any], bool]
@@ -149,6 +151,11 @@ def _generation_integrity_check(artifacts: GenerationArtifacts) -> IntegrityChec
         report = verify_generation_artifacts(
             artifacts,
             _stream_points(client, plan.physical_collection),
+            physical_collection=plan.physical_collection,
+            observed_collection_configuration_sha256=collection_configuration_sha256(
+                collection_configuration(client.get_collection(plan.physical_collection))
+            ),
+            verification_id=plan.promotion_id,
         )
         report_path = artifacts.root.parent / (
             f"{plan.generation_id}.{plan.promotion_id}.candidate-verification.json"
@@ -158,6 +165,7 @@ def _generation_integrity_check(artifacts: GenerationArtifacts) -> IntegrityChec
         report_matches = (
             report.generation_id == plan.generation_id
             and report.manifest_sha256 == plan.manifest_sha256
+            and report.physical_collection == plan.physical_collection
         )
         provenance_path = report_path.with_name(f"{report_path.stem}.provenance.json")
         atomic_write_json(
@@ -219,6 +227,11 @@ class QdrantPromotionBackend:
     def restore_candidate(self, plan: PromotionPlan) -> None:
         if not isinstance(plan, PromotionPlan):
             raise TypeError("plan must be a PromotionPlan")
+        # Dataclass construction can bypass PromotionPlan.from_dict; repeat the guard at
+        # the final restore boundary before the client is inspected or mutated.
+        refuse_frozen_candidate_promotion(
+            plan.generation_id, plan.physical_collection
+        )
         collection = plan.physical_collection
         self._plans[collection] = plan
         if self.client.collection_exists(collection):
@@ -266,6 +279,7 @@ class QdrantPromotionBackend:
             "vector_space_id": expected.vector_space_id,
             "chunking_fingerprint": expected.chunking_fingerprint,
             "document_header": expected.document_header,
+            "retrieval_fingerprint_revision": expected.retrieval_fingerprint_revision,
             "retrieval_fingerprint": expected.retrieval_fingerprint,
         }
 
@@ -336,6 +350,9 @@ class QdrantPromotionBackend:
                 expected.chunking_fingerprint if identity_ok else mismatch
             ),
             document_header=(expected.document_header if identity_ok else not expected.document_header),
+            retrieval_fingerprint_revision=(
+                expected.retrieval_fingerprint_revision if identity_ok else -1
+            ),
             retrieval_fingerprint=(
                 expected.retrieval_fingerprint if identity_ok else mismatch
             ),
@@ -438,6 +455,16 @@ class QdrantPromotionBackend:
         return targets[0] if targets else None
 
     def switch_alias(self, alias: str, collection: str) -> None:
+        # ``PromotionPlan`` validation protects the state-machine path, but callers can
+        # invoke this public adapter method directly.  The frozen candidate is explicitly
+        # retrieval-only and must never become reachable through any alias, so refuse its
+        # unique physical name before even reading alias state from Qdrant.
+        from .release_inputs import PHYSICAL_COLLECTION as FROZEN_PHYSICAL_COLLECTION
+
+        if collection == FROZEN_PHYSICAL_COLLECTION:
+            raise PromotionPreconditionError(
+                "the frozen 512-token candidate cannot be targeted by an alias operation"
+            )
         current = self.alias_target(alias)
         if current is None:
             raise PromotionPreconditionError(

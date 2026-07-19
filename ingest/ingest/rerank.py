@@ -14,12 +14,23 @@ device, fp16, batching and the sigmoid normalisation. The heavy imports are lazy
 offline unit tests don't need the ML stack.
 """
 
+import logging
 import os
 
 from .config import Config
 
-_MAX_LENGTH = 512   # query+chunk truncation (chunks are already ~512 tokens)
+logger = logging.getLogger(__name__)
+
 _BATCH_SIZE = 16
+
+
+class RerankerParityError(RuntimeError):
+    """The remote reranker's reported model/max_length differs from local config.
+
+    Raised before any scoring request so a drifted pod can never silently return
+    valid-looking floats on a different calibration scale (memory-bank
+    reranker-score-parity).
+    """
 
 
 def _revision_kwargs(revision: str | None) -> dict[str, str]:
@@ -65,6 +76,7 @@ class BGEReranker:
         if (cfg.rerank_device or _auto_device(torch)) == "cpu":
             _configure_cpu_threads(torch)  # before the first forward
         self.device = cfg.rerank_device or _auto_device(torch)
+        self.max_length = cfg.rerank_max_length
         revision = _revision_kwargs(cfg.reranker_revision)
         self.tokenizer = AutoTokenizer.from_pretrained(cfg.rerank_model, **revision)
         model = AutoModelForSequenceClassification.from_pretrained(
@@ -92,7 +104,7 @@ class BGEReranker:
             idx = order[start : start + _BATCH_SIZE]
             pairs = [[query, texts[i]] for i in idx]
             inputs = self.tokenizer(
-                pairs, padding=True, truncation=True, max_length=_MAX_LENGTH,
+                pairs, padding=True, truncation=True, max_length=self.max_length,
                 return_tensors="pt",
             ).to(self.device)
             with torch.no_grad():
@@ -125,6 +137,7 @@ class ONNXBGEReranker:
         from transformers import AutoTokenizer
 
         self._np = np
+        self.max_length = cfg.rerank_max_length
         self.tokenizer = AutoTokenizer.from_pretrained(
             cfg.rerank_model, **_revision_kwargs(cfg.reranker_revision)
         )
@@ -145,7 +158,7 @@ class ONNXBGEReranker:
             idx = order[start : start + _BATCH_SIZE]
             pairs = [[query, texts[i]] for i in idx]
             enc = self.tokenizer(pairs, padding=True, truncation=True,
-                                 max_length=_MAX_LENGTH, return_tensors="np")
+                                 max_length=self.max_length, return_tensors="np")
             logits = self.session.run(
                 ["logits"],
                 {"input_ids": enc["input_ids"].astype(np.int64),
@@ -174,14 +187,72 @@ class RemoteBGEReranker:
     no ML deps locally. Interface is identical: ``score(query, texts) -> list[float]``.
     """
 
-    def __init__(self, url: str, timeout: int = 300):
+    def __init__(
+        self,
+        url: str,
+        timeout: int = 300,
+        expected_model: str | None = None,
+        expected_max_length: int | None = None,
+    ):
         self.url = url.rstrip("/")
         self.timeout = timeout
         self.device = "remote"  # parity with BGEReranker (callers may log .device)
+        # Local half of the score-parity contract. Both sides read RERANK_MODEL /
+        # RERANK_MAX_LENGTH from their *own* process env (memory-bank
+        # reranker-score-parity: a real silent-drift vector), so defaults here must
+        # mirror Config's defaults for callers that don't pass explicit expectations.
+        self.expected_model = expected_model or os.environ.get(
+            "RERANK_MODEL", "BAAI/bge-reranker-v2-m3"
+        )
+        self.expected_max_length = expected_max_length or int(
+            os.environ.get("RERANK_MAX_LENGTH", "512")
+        )
+        self._parity_checked = False
+
+    def _check_parity(self) -> None:
+        """One-shot server-config check before the first scoring request.
+
+        A *reported mismatch* raises (scores would be silently on a different scale —
+        the exception surfaces through the caller's existing remote-failure handling).
+        An unreachable server or an older server that doesn't report ``max_length``
+        only warns: reachability problems already fail loudly in :meth:`score`, and
+        parity can't be disproven without the report.
+        """
+        import json
+        import urllib.request
+
+        self._parity_checked = True
+        try:
+            with urllib.request.urlopen(f"{self.url}/", timeout=30) as resp:
+                info = json.loads(resp.read().decode())
+        except Exception as exc:  # noqa: BLE001 - reachability is score()'s job
+            logger.warning("remote reranker parity check skipped (unreachable): %s", exc)
+            return
+        remote_model = info.get("model")
+        remote_max_length = info.get("max_length")
+        if remote_model is not None and remote_model != self.expected_model:
+            raise RerankerParityError(
+                f"remote reranker model mismatch: local expects {self.expected_model!r},"
+                f" server runs {remote_model!r} — scores are not comparable"
+            )
+        if remote_max_length is None:
+            logger.warning(
+                "remote reranker does not report max_length (older server); "
+                "RERANK_MAX_LENGTH parity is UNVERIFIED — local expects %d",
+                self.expected_max_length,
+            )
+        elif int(remote_max_length) != self.expected_max_length:
+            raise RerankerParityError(
+                f"remote reranker max_length mismatch: local expects "
+                f"{self.expected_max_length}, server runs {remote_max_length} — "
+                "truncation differs, scores are not comparable"
+            )
 
     def score(self, query: str, texts: list[str]) -> list[float]:
         if not texts:
             return []
+        if not self._parity_checked:
+            self._check_parity()
         import json
         import urllib.request
 

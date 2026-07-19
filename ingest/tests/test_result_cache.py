@@ -14,8 +14,15 @@ from ingest.config import load_config
 
 
 @pytest.fixture(autouse=True)
-def _isolate_cache():
-    """Keep the module-global cache from leaking across tests."""
+def _isolate_cache(monkeypatch):
+    """Keep cache tests in-process and independent of the OS thread executor."""
+    async def immediate_to_thread(function, /, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    # These tests exercise cache identity/eligibility, not asyncio's thread-pool shutdown.
+    # Keeping the fake worker inline also makes each asyncio.run() hermetic on Python builds
+    # where an otherwise-idle default-executor worker can take minutes to join under pytest.
+    monkeypatch.setattr(srv.asyncio, "to_thread", immediate_to_thread)
     srv._result_cache.clear()
     yield
     srv._result_cache.clear()
@@ -120,4 +127,19 @@ def test_fingerprint_change_invalidates(worker, monkeypatch):
     asyncio.run(srv.legal_search(srv.SearchInput(query="q", top_k=5)))
     monkeypatch.setattr(srv, "_cfg", _remote_cfg(rerank_candidates=999))  # moves the fingerprint
     asyncio.run(srv.legal_search(srv.SearchInput(query="q", top_k=5)))
+    assert len(worker.calls) == 2
+
+
+def test_generation_and_collection_target_are_independent_cache_identity(worker, monkeypatch):
+    request = srv.SearchInput(query="q", top_k=5)
+    asyncio.run(srv.legal_search(request))
+    monkeypatch.setattr(
+        srv,
+        "_cfg",
+        _remote_cfg(
+            collection_name="georgian_legal__gen_gen_20260715_candidate",
+            generation_id="gen_20260715_candidate",
+        ),
+    )
+    asyncio.run(srv.legal_search(request))
     assert len(worker.calls) == 2

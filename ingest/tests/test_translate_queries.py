@@ -31,7 +31,7 @@ def test_loader_returns_mapping_and_content_hash(tmp_path):
     p = _write(tmp_path, {"q1": {"query": EN_Q, "ka": KA_Q}})
     mapping, h1 = load_query_translations(p, _gold(("q1", EN_Q)))
     assert mapping == {EN_Q: KA_Q}
-    assert len(h1) == 16
+    assert len(h1) == 64
     p.write_text(p.read_text().replace("შვებულების", "შვებულებisა"), encoding="utf-8")
     _, h2 = load_query_translations(p, _gold(("q1", EN_Q)))
     assert h1 != h2  # content-addressed: any edit is a new eval config

@@ -18,12 +18,81 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-GENERATION_SCHEMA_VERSION = 1
+from .config import RETRIEVAL_FINGERPRINT_REVISION
+
+GENERATION_SCHEMA_VERSION = 2
+# Schema v2 is the first generation format whose Qdrant points are valid canonical legal
+# evidence rather than retrieval-only chunks.  The revision marker is repeated on every
+# point and included in startup compatibility counts.
+CANONICAL_PAYLOAD_REVISION = "canonical-evidence-v2"
+CANONICAL_PAYLOAD_REQUIRED_FIELDS = frozenset(
+    {
+        "canonical_payload_revision",
+        "canonical_content_hash",
+        "canonical_text_exact",
+        "passage_id",
+        "passage_hash",
+        "source_fingerprint",
+        "normalizer_revision",
+        "chunker_revision",
+        "model_revision",
+        "article_id",
+        "clause_id",
+        "subarticle",
+        "chapter",
+        "heading_path",
+        "parent_id",
+        "article_start_chunk_index",
+        "parent_chunk_index",
+        "char_start",
+        "char_end",
+        "page_start",
+        "page_end",
+        "page_coordinate_reason",
+        "page_boundaries",
+        "page_boundary_mapping_sha256",
+        "admissible",
+        "version_id",
+        "supersedes",
+        "effective_from",
+        "effective_to",
+        "repeal_date",
+        "consolidation_status",
+        "version_lineage_status",
+        "version_lineage_complete",
+        "official_url",
+        "official_binary_url",
+        "source_authority",
+        "freshness_sla_met",
+    }
+)
+# These fields are never legitimately null/empty on an indexed canonical passage.  Startup
+# compatibility uses Qdrant ``is_empty`` exclusions so deleting any one makes the exact
+# identity count fall below the manifest chunk count before the collection can serve.
+CANONICAL_PAYLOAD_REQUIRED_NONEMPTY_FIELDS = frozenset(
+    {
+        "canonical_payload_revision",
+        "canonical_content_hash",
+        "passage_id",
+        "passage_hash",
+        "source_fingerprint",
+        "normalizer_revision",
+        "chunker_revision",
+        "model_revision",
+        "char_start",
+        "char_end",
+        "version_id",
+        "official_url",
+        "source_authority",
+        "page_coordinate_reason",
+    }
+)
 CHECKSUM_ALGORITHM = "sha256"
 CHECKSUM_FILENAME = "checksums.json"
 MANIFEST_FILENAME = "manifest.json"
 DOCUMENTS_FILENAME = "documents.jsonl"
 SAMPLE_CHECKS_FILENAME = "sample_checks.jsonl"
+COLLECTION_DIGEST_FILENAME = "collection_digest.json"
 MAX_METADATA_LINE_BYTES = 1_000_000
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -435,6 +504,7 @@ class GenerationManifest:
     vector_space: VectorSpaceIdentity
     chunking: ChunkingIdentity
     covered_runs: tuple[CoveredRun, ...]
+    retrieval_fingerprint_revision: int
     retrieval_fingerprint: str
     code: CodeIdentity
     dependency: DependencyIdentity
@@ -457,6 +527,7 @@ class GenerationManifest:
             "vector_space",
             "chunking",
             "covered_runs",
+            "retrieval_fingerprint_revision",
             "retrieval_fingerprint",
             "code",
             "dependency",
@@ -514,6 +585,16 @@ class GenerationManifest:
             raise GenerationFormatError(
                 "non-empty generations require at least one covered raw run"
             )
+        fingerprint_revision = _integer(
+            data["retrieval_fingerprint_revision"],
+            field="retrieval_fingerprint_revision",
+            minimum=1,
+        )
+        if fingerprint_revision != RETRIEVAL_FINGERPRINT_REVISION:
+            raise GenerationFormatError(
+                "unsupported retrieval_fingerprint_revision "
+                f"{fingerprint_revision}; expected {RETRIEVAL_FINGERPRINT_REVISION}"
+            )
         return cls(
             schema_version=schema_version,
             generation_id=validate_generation_id(data["generation_id"]),
@@ -528,6 +609,7 @@ class GenerationManifest:
             vector_space=VectorSpaceIdentity.from_dict(data["vector_space"]),
             chunking=ChunkingIdentity.from_dict(data["chunking"]),
             covered_runs=covered_runs,
+            retrieval_fingerprint_revision=fingerprint_revision,
             retrieval_fingerprint=_sha256(
                 data["retrieval_fingerprint"], field="retrieval_fingerprint"
             ),
@@ -546,6 +628,7 @@ class DocumentRecord:
     generation_id: str
     source: str
     document_id: str
+    version_id: str
     source_identity: str
     content_hash: str
     document_state_hash: str
@@ -568,6 +651,7 @@ class DocumentRecord:
             "generation_id",
             "source",
             "document_id",
+            "version_id",
             "source_identity",
             "content_hash",
             "document_state_hash",
@@ -644,6 +728,9 @@ class DocumentRecord:
             document_id=_string(
                 data["document_id"], field="document.document_id", max_length=2048
             ),
+            version_id=_string(
+                data["version_id"], field="document.version_id", max_length=2048
+            ),
             source_identity=_sha256(
                 data["source_identity"], field="document.source_identity"
             ),
@@ -683,6 +770,7 @@ class SampleCheck:
     generation_id: str
     source: str
     document_id: str
+    version_id: str
     chunk_index: int
     point_id: str
     text_sha256: str
@@ -697,6 +785,7 @@ class SampleCheck:
             "generation_id",
             "source",
             "document_id",
+            "version_id",
             "chunk_index",
             "point_id",
             "text_sha256",
@@ -734,6 +823,11 @@ class SampleCheck:
             document_id=_string(
                 data["document_id"],
                 field="sample_check.document_id",
+                max_length=2048,
+            ),
+            version_id=_string(
+                data["version_id"],
+                field="sample_check.version_id",
                 max_length=2048,
             ),
             chunk_index=_integer(data["chunk_index"], field="sample_check.chunk_index"),
@@ -792,6 +886,114 @@ class ChecksumInventory:
             "schema_version": self.schema_version,
             "algorithm": self.algorithm,
             "files": dict(self.files),
+        }
+
+
+@dataclass(frozen=True)
+class CollectionDigest:
+    schema_version: int
+    digest_revision: int
+    algorithm: str
+    point_count: int
+    collection_sha256: str
+    physical_collection: str
+    payload_projection: str
+    dense_encoding: str
+    sparse_encoding: str
+    collection_configuration_sha256: str
+    collection_configuration: Mapping[str, Any]
+    vector_checksum_artifact_sha256: str
+    vector_probe_sha256: str
+    embed_binding_sha256: str
+
+    @classmethod
+    def from_dict(cls, value: Any) -> CollectionDigest:
+        data = _object(value, field="collection_digest")
+        expected = {
+            "schema_version",
+            "digest_revision",
+            "algorithm",
+            "point_count",
+            "collection_sha256",
+            "physical_collection",
+            "payload_projection",
+            "dense_encoding",
+            "sparse_encoding",
+            "collection_configuration_sha256",
+            "collection_configuration",
+            "vector_checksum_artifact_sha256",
+            "vector_probe_sha256",
+            "embed_binding_sha256",
+        }
+        _exact_keys(data, expected, field="collection_digest")
+        if data["schema_version"] != GENERATION_SCHEMA_VERSION:
+            raise GenerationFormatError("collection_digest schema_version mismatch")
+        if data["digest_revision"] != 1 or data["algorithm"] != "sha256":
+            raise GenerationFormatError("collection_digest algorithm/revision mismatch")
+        configuration = _object(
+            data["collection_configuration"],
+            field="collection_digest.collection_configuration",
+        )
+        canonical_configuration = json.dumps(
+            configuration,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        configuration_sha = hashlib.sha256(canonical_configuration).hexdigest()
+        expected_configuration_sha = _sha256(
+            data["collection_configuration_sha256"],
+            field="collection_digest.collection_configuration_sha256",
+        )
+        if configuration_sha != expected_configuration_sha:
+            raise GenerationFormatError(
+                "collection_digest collection configuration hash mismatch"
+            )
+        return cls(
+            schema_version=GENERATION_SCHEMA_VERSION,
+            digest_revision=1,
+            algorithm="sha256",
+            point_count=_integer(
+                data["point_count"], field="collection_digest.point_count"
+            ),
+            collection_sha256=_sha256(
+                data["collection_sha256"], field="collection_digest.collection_sha256"
+            ),
+            physical_collection=_string(
+                data["physical_collection"],
+                field="collection_digest.physical_collection",
+                max_length=512,
+            ),
+            payload_projection=_string(
+                data["payload_projection"], field="collection_digest.payload_projection"
+            ),
+            dense_encoding=_string(
+                data["dense_encoding"], field="collection_digest.dense_encoding"
+            ),
+            sparse_encoding=_string(
+                data["sparse_encoding"], field="collection_digest.sparse_encoding"
+            ),
+            collection_configuration_sha256=expected_configuration_sha,
+            collection_configuration=configuration,
+            vector_checksum_artifact_sha256=_sha256(
+                data["vector_checksum_artifact_sha256"],
+                field="collection_digest.vector_checksum_artifact_sha256",
+            ),
+            vector_probe_sha256=_sha256(
+                data["vector_probe_sha256"],
+                field="collection_digest.vector_probe_sha256",
+            ),
+            embed_binding_sha256=_sha256(
+                data["embed_binding_sha256"],
+                field="collection_digest.embed_binding_sha256",
+            ),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            **asdict(self),
+            "collection_configuration": dict(self.collection_configuration),
         }
 
 
@@ -931,6 +1133,7 @@ class GenerationArtifacts:
     root: Path
     manifest: GenerationManifest
     checksums: ChecksumInventory
+    collection_digest: CollectionDigest | None = None
 
     def iter_documents(self) -> Iterator[DocumentRecord]:
         return iter_document_records(
@@ -951,8 +1154,23 @@ def load_generation(root: str | Path) -> GenerationArtifacts:
     checksums = load_checksums(directory / CHECKSUM_FILENAME)
     verify_artifact_checksums(directory, checksums)
     manifest = load_manifest(directory / MANIFEST_FILENAME)
+    collection_digest = None
+    if COLLECTION_DIGEST_FILENAME in checksums.files:
+        collection_digest = CollectionDigest.from_dict(
+            _load_json(directory / COLLECTION_DIGEST_FILENAME)
+        )
+        if collection_digest.point_count != manifest.chunk_count:
+            raise GenerationFormatError(
+                "collection digest point_count differs from manifest.chunk_count"
+            )
+        expected_physical = f"georgian_legal__gen_{manifest.generation_id}"
+        if collection_digest.physical_collection != expected_physical:
+            raise GenerationFormatError(
+                "collection digest physical collection differs from generation"
+            )
     return GenerationArtifacts(
         root=directory,
         manifest=manifest,
         checksums=checksums,
+        collection_digest=collection_digest,
     )

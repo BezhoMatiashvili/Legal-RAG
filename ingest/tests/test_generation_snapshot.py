@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import stat
-import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -14,9 +13,12 @@ import pytest
 from ingest import generation_snapshot
 from ingest.generation import (
     CHECKSUM_FILENAME,
+    COLLECTION_DIGEST_FILENAME,
     DOCUMENTS_FILENAME,
     MANIFEST_FILENAME,
     SAMPLE_CHECKS_FILENAME,
+    GENERATION_SCHEMA_VERSION,
+    CollectionDigest,
     GenerationFormatError,
     GenerationManifest,
     load_generation,
@@ -31,6 +33,9 @@ from ingest.generation_snapshot import (
     source_state_sha256,
 )
 from ingest.integrity import (
+    COLLECTION_DENSE_ENCODING,
+    COLLECTION_PAYLOAD_PROJECTION,
+    COLLECTION_SPARSE_ENCODING,
     VerificationOutcome,
     VerificationReport,
     write_verification_report,
@@ -40,8 +45,11 @@ from ingest.promotion import (
     create_promotion_plan,
     physical_collection_name,
 )
+from ingest.qdrant_store import point_id
 
 GENERATION_ID = "gen-20260713"
+VERSION_ONE = "derived:" + "1" * 64
+VERSION_TWO = "derived:" + "2" * 64
 SHA_A = "a" * 64
 SHA_B = "b" * 64
 SHA_C = "c" * 64
@@ -59,7 +67,7 @@ def _mode(path: Path) -> int:
 
 def _manifest(**overrides) -> GenerationManifest:
     data = {
-        "schema_version": 1,
+        "schema_version": GENERATION_SCHEMA_VERSION,
         "generation_id": GENERATION_ID,
         "document_count": 2,
         "indexed_document_count": 1,
@@ -93,6 +101,7 @@ def _manifest(**overrides) -> GenerationManifest:
             "document_header": True,
         },
         "covered_runs": [{"source": "matsne", "run_id": "20260713t100000z"}],
+        "retrieval_fingerprint_revision": 2,
         "retrieval_fingerprint": SHA_D,
         "code": {"git_sha": "c" * 40, "dirty_patch_sha256": None},
         "dependency": {"lock_sha256": SHA_E, "image_digest": None},
@@ -109,10 +118,11 @@ def _manifest(**overrides) -> GenerationManifest:
 def _documents():
     return [
         {
-            "schema_version": 1,
+            "schema_version": GENERATION_SCHEMA_VERSION,
             "generation_id": GENERATION_ID,
             "source": "matsne",
             "document_id": "doc-1",
+            "version_id": VERSION_ONE,
             "source_identity": SHA_A,
             "content_hash": SHA_B,
             "document_state_hash": SHA_C,
@@ -126,10 +136,11 @@ def _documents():
             "source_binary_url": None,
         },
         {
-            "schema_version": 1,
+            "schema_version": GENERATION_SCHEMA_VERSION,
             "generation_id": GENERATION_ID,
             "source": "matsne",
             "document_id": "doc-2",
+            "version_id": VERSION_TWO,
             "source_identity": SHA_D,
             "content_hash": SHA_E,
             "document_state_hash": "f" * 64,
@@ -148,15 +159,50 @@ def _documents():
 def _samples():
     return [
         {
-            "schema_version": 1,
+            "schema_version": GENERATION_SCHEMA_VERSION,
             "generation_id": GENERATION_ID,
             "source": "matsne",
             "document_id": "doc-1",
+            "version_id": VERSION_ONE,
             "chunk_index": 0,
-            "point_id": str(uuid.uuid5(uuid.NAMESPACE_URL, "matsne:doc-1:0")),
+            "point_id": point_id(
+                "matsne", "doc-1", 0, version_id=VERSION_ONE
+            ),
             "text_sha256": SHA_A,
         }
     ]
+
+
+def _collection_digest(manifest: GenerationManifest | None = None) -> CollectionDigest:
+    manifest = manifest or _manifest()
+    configuration = {"revision": 1, "config": {}, "payload_schema": {}}
+    configuration_sha = hashlib.sha256(
+        json.dumps(
+            configuration,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return CollectionDigest.from_dict(
+        {
+            "schema_version": GENERATION_SCHEMA_VERSION,
+            "digest_revision": 1,
+            "algorithm": "sha256",
+            "point_count": manifest.chunk_count,
+            "collection_sha256": "6" * 64,
+            "physical_collection": physical_collection_name(manifest.generation_id),
+            "payload_projection": COLLECTION_PAYLOAD_PROJECTION,
+            "dense_encoding": COLLECTION_DENSE_ENCODING,
+            "sparse_encoding": COLLECTION_SPARSE_ENCODING,
+            "collection_configuration_sha256": configuration_sha,
+            "collection_configuration": configuration,
+            "vector_checksum_artifact_sha256": "7" * 64,
+            "vector_probe_sha256": "8" * 64,
+            "embed_binding_sha256": "9" * 64,
+        }
+    )
 
 
 def _publish(root: Path, *, manifest=None, documents=None, samples=None):
@@ -167,6 +213,7 @@ def _publish(root: Path, *, manifest=None, documents=None, samples=None):
         documents if documents is not None else _documents(),
         samples if samples is not None else _samples(),
         SOURCE_STATE,
+        collection_digest=_collection_digest(manifest or _manifest()),
     )
 
 
@@ -190,6 +237,7 @@ def test_generation_is_private_complete_checksummed_and_v1_untouched(tmp_path):
         QUARANTINE_FILENAME,
         SAMPLE_CHECKS_FILENAME,
         SOURCE_STATE_FILENAME,
+        COLLECTION_DIGEST_FILENAME,
     }
     assert all(_mode(path) == 0o600 for path in destination.iterdir())
     assert not list(root.glob(f".{GENERATION_ID}.staging-*"))
@@ -205,6 +253,7 @@ def test_generation_is_private_complete_checksummed_and_v1_untouched(tmp_path):
         QUARANTINE_FILENAME,
         SAMPLE_CHECKS_FILENAME,
         SOURCE_STATE_FILENAME,
+        COLLECTION_DIGEST_FILENAME,
     }
 
     provenance = json.loads((destination / PROVENANCE_FILENAME).read_text())
@@ -220,10 +269,11 @@ def test_generation_is_private_complete_checksummed_and_v1_untouched(tmp_path):
     ]
     assert quarantine == [
         {
-            "schema_version": 1,
+            "schema_version": GENERATION_SCHEMA_VERSION,
             "generation_id": GENERATION_ID,
             "source": "matsne",
             "document_id": "doc-2",
+            "version_id": VERSION_TWO,
             "source_identity": SHA_D,
             "content_hash": SHA_E,
             "document_state_hash": "f" * 64,
@@ -278,8 +328,22 @@ def test_existing_destination_is_never_overwritten_or_consumes_input(tmp_path):
             must_not_iterate(),
             _samples(),
             SOURCE_STATE,
+            collection_digest=_collection_digest(),
         )
     assert sentinel.read_text(encoding="utf-8") == "keep"
+
+
+def test_publish_rejects_existing_output_root_beneath_symlink_ancestor(tmp_path):
+    real_parent = tmp_path / "real-parent"
+    existing_root = real_parent / "snapshots"
+    existing_root.mkdir(parents=True)
+    linked_parent = tmp_path / "linked-parent"
+    linked_parent.symlink_to(real_parent, target_is_directory=True)
+
+    with pytest.raises(GenerationPublishError, match="not a real directory"):
+        _publish(linked_parent / "snapshots")
+
+    assert not (existing_root / GENERATION_ID).exists()
 
 
 def test_destination_race_is_atomically_rejected_without_overwrite(
@@ -349,7 +413,11 @@ def test_failed_build_retains_private_staging_without_manifest(tmp_path):
 
 def test_sample_for_excluded_document_fails_closed(tmp_path):
     samples = _samples()
-    samples[0] = {**samples[0], "document_id": "doc-2"}
+    samples[0] = {
+        **samples[0],
+        "document_id": "doc-2",
+        "version_id": VERSION_TWO,
+    }
     with pytest.raises(GenerationPublishError, match="non-indexed chunk") as raised:
         _publish(tmp_path / "snapshots", samples=samples)
     assert raised.value.staging_path is not None
@@ -388,6 +456,7 @@ def test_promotion_plan_requires_and_binds_four_gate_verification(tmp_path):
     report = VerificationReport(
         generation_id=GENERATION_ID,
         manifest_sha256=loaded.checksums.files[MANIFEST_FILENAME],
+        physical_collection=physical_collection_name(GENERATION_ID),
         verified_at="2026-07-13T12:05:00Z",
         covered_runs=({"source": "matsne", "run_id": "20260713t100000z"},),
         stats={"observed_points": 2},
@@ -408,7 +477,7 @@ def test_promotion_plan_requires_and_binds_four_gate_verification(tmp_path):
         promotion_id="promotion-20260713",
     )
     assert plan.physical_collection == physical_collection_name(GENERATION_ID)
-    assert plan.expected_collection.payload_schema_version == 1
+    assert plan.expected_collection.payload_schema_version == GENERATION_SCHEMA_VERSION
     assert plan.expected_collection.points_count == 2
     assert plan.expected_collection.document_header is True
     assert plan.manifest_sha256 == loaded.checksums.files[MANIFEST_FILENAME]

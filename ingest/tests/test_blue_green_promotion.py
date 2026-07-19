@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+import ingest.promotion as promotion_module
 from ingest.promotion import (
     CollectionInspection,
     PromotionError,
@@ -23,6 +24,10 @@ from ingest.promotion import (
     physical_collection_name,
     promotion_lock,
     write_promotion_plan,
+)
+from ingest.release_inputs import (
+    GENERATION_ID as FROZEN_CANDIDATE_GENERATION_ID,
+    PHYSICAL_COLLECTION as FROZEN_CANDIDATE_PHYSICAL_COLLECTION,
 )
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
@@ -70,6 +75,7 @@ def _plan() -> PromotionPlan:
                 "vector_space_id": SHA_C,
                 "chunking_fingerprint": SHA_D,
                 "document_header": True,
+                "retrieval_fingerprint_revision": 2,
                 "retrieval_fingerprint": SHA_E,
             },
             "created_at": "2026-07-13T12:00:00Z",
@@ -99,6 +105,7 @@ def _inspection(plan: PromotionPlan) -> CollectionInspection:
         vector_space_id=expected.vector_space_id,
         chunking_fingerprint=expected.chunking_fingerprint,
         document_header=expected.document_header,
+        retrieval_fingerprint_revision=expected.retrieval_fingerprint_revision,
         retrieval_fingerprint=expected.retrieval_fingerprint,
         optimizer_status="green",
         integrity_ok=True,
@@ -368,6 +375,14 @@ def test_plan_rejects_blank_model_identity():
         PromotionPlan.from_dict(payload)
 
 
+def test_plan_rejects_legacy_retrieval_fingerprint_revision():
+    payload = _plan().to_dict()
+    payload["expected_collection"]["retrieval_fingerprint_revision"] = 1
+
+    with pytest.raises(PromotionError, match="retrieval_fingerprint_revision"):
+        PromotionPlan.from_dict(payload)
+
+
 def test_non_private_plan_is_rejected_before_backend_use(operation):
     plan, plan_path, _ = operation
     backend = FakeBackend(plan)
@@ -411,3 +426,60 @@ def test_cli_apply_requires_flag_and_environment_before_loading_backend(
             environ={"PROMOTION_APPROVED": "1"},
         )
     assert not state_path.exists()
+
+
+def test_frozen_candidate_plan_creation_refuses_before_sidecar_or_plan(monkeypatch, tmp_path):
+    root = tmp_path / FROZEN_CANDIDATE_GENERATION_ID
+    root.mkdir(mode=0o700)
+    monkeypatch.setattr(promotion_module, "_require_private_generation_tree", lambda _root: None)
+    monkeypatch.setattr(
+        promotion_module,
+        "load_generation",
+        lambda _root: type(
+            "Artifacts",
+            (),
+            {"manifest": type("Manifest", (), {"generation_id": FROZEN_CANDIDATE_GENERATION_ID})()},
+        )(),
+    )
+    monkeypatch.setattr(
+        promotion_module,
+        "load_verified_generation_coverage",
+        lambda _root: pytest.fail("refusal must precede promotion sidecar/coverage access"),
+    )
+
+    with pytest.raises(PromotionPreconditionError, match="cannot enter a promotion plan"):
+        promotion_module.create_promotion_plan(
+            root,
+            snapshot_ref="immutable://candidate.snapshot",
+            snapshot_sha256=SHA_A,
+            created_by="operator",
+        )
+
+
+def test_frozen_candidate_apply_refuses_before_backend_factory(monkeypatch, tmp_path):
+    value = _plan().to_dict()
+    value["generation_id"] = FROZEN_CANDIDATE_GENERATION_ID
+    value["physical_collection"] = FROZEN_CANDIDATE_PHYSICAL_COLLECTION
+    plan_path = tmp_path / "frozen-promotion.json"
+    plan_path.write_text(json.dumps(value), encoding="utf-8")
+    plan_path.chmod(0o600)
+    monkeypatch.setattr(
+        promote_generation,
+        "_backend_factory",
+        lambda _spec: pytest.fail("frozen-candidate refusal must precede backend creation"),
+    )
+
+    with pytest.raises(PromotionPreconditionError, match="cannot enter a promotion plan"):
+        promote_generation.main(
+            [
+                "apply",
+                "--plan",
+                str(plan_path),
+                "--state",
+                str(tmp_path / "state.json"),
+                "--backend-factory",
+                "unused:factory",
+                "--apply",
+            ],
+            environ={"PROMOTION_APPROVED": "1"},
+        )

@@ -8,6 +8,7 @@ import pytest
 
 from ingest.config import (
     ConfigurationError,
+    RETRIEVAL_FINGERPRINT_REVISION,
     load_config,
     retrieval_fingerprint,
     retrieval_fingerprint_sha256,
@@ -55,6 +56,17 @@ def test_unset_identity_preserves_development_fingerprint(
     assert retrieval_fingerprint(cfg) == retrieval_fingerprint(explicit_legacy_identity)
     assert len(retrieval_fingerprint_sha256(cfg)) == 64
     assert retrieval_fingerprint_sha256(cfg).startswith(retrieval_fingerprint(cfg))
+    assert RETRIEVAL_FINGERPRINT_REVISION == 2
+
+
+def test_storage_and_generation_names_do_not_change_revision_two_fingerprint() -> None:
+    cfg = load_config()
+    renamed = dataclasses.replace(
+        cfg,
+        collection_name="georgian_legal__gen_gen_20260715_candidate",
+        generation_id="gen_20260715_candidate",
+    )
+    assert retrieval_fingerprint_sha256(renamed) == retrieval_fingerprint_sha256(cfg)
 
 
 @pytest.mark.parametrize(

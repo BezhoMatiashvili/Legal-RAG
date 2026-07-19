@@ -36,11 +36,11 @@ offline with synthetic data — no Qdrant, no torch:
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from .goldset import GoldQuery
-from .metrics import Hit, Key, reduce_ranking
+from .metrics import Hit, Key, hit_key, reduce_ranking
 
 # Query types whose answer cites one specific document — where identity@1 is the meaningful
 # answer-correctness signal. Mirrors the golden_set_v2 query_type vocabulary.
@@ -49,20 +49,60 @@ KNOWN_ITEM_TYPES: tuple[str, ...] = ("legal_citation", "keyword")
 DEFAULT_ABSTENTION_THRESHOLD = 0.92  # from scripts/calibrate_min_score.py (top-1, v1, rc=50)
 
 
-def gold_doc_key(q: GoldQuery) -> tuple[str, str]:
-    """The ``(source, document_id)`` the query's answer should cite."""
+def gold_doc_key(q: GoldQuery) -> Key:
+    """The legacy document or exact canonical version the answer should cite."""
+
+    if q.gold_version_id is not None:
+        return (q.gold_source, q.gold_document_id, q.gold_version_id)
     return (q.gold_source, q.gold_document_id)
 
 
-def top1_doc(hits: Sequence[Hit]) -> tuple[str, str] | None:
-    """The ``(source, document_id)`` of the highest-ranked retrieved document, or None."""
+def top1_doc(hits: Sequence[Hit]) -> Key | None:
+    """The highest-ranked legacy document or canonical version identity, or ``None``."""
     order = reduce_ranking(hits, "doc")
-    return order[0] if order else None  # reduce_ranking yields 2-tuples at doc level
+    return order[0] if order else None
 
 
 def top1_score(hits: Sequence[Hit]) -> float:
     """Reranker score (calibrated 0..1 in rerank mode) of the rank-1 hit; 0.0 if none."""
     return float(hits[0].score) if hits else 0.0
+
+
+def _doc_ranked_with_scores(hits: Sequence[Hit]) -> list[tuple[Key, float]]:
+    """Doc-reduced ranking WITH each doc's (best/first-seen-chunk) score, in rank order.
+
+    ``metrics.reduce_ranking`` drops scores; rebuilt here so a margin can be computed
+    between distinct DOCUMENTS, not between two chunks of the same top document (which
+    would read as a false "tight margin" — hits are pre-sorted, so a doc's first
+    occurrence is already its highest-scored chunk).
+    """
+    seen: set[Key] = set()
+    out: list[tuple[Key, float]] = []
+    for h in hits:
+        key = hit_key(h, "doc")
+        if key not in seen:
+            seen.add(key)
+            out.append((key, float(h.score)))
+    return out
+
+
+def top2_score(hits: Sequence[Hit]) -> float:
+    """Reranker score of the SECOND distinct document in the ranking; 0.0 if none exists."""
+    ranked = _doc_ranked_with_scores(hits)
+    return ranked[1][1] if len(ranked) > 1 else 0.0
+
+
+def top1_top2_margin(hits: Sequence[Hit]) -> float:
+    """``top1_doc_score - top2_doc_score`` (doc-reduced, not raw chunk hits).
+
+    When fewer than 2 distinct documents are retrieved there is no competing wrong
+    document at all — returns ``top1_score`` itself as the margin (an unambiguous top-1
+    reads as a maximal, not zero, margin under this convention).
+    """
+    ranked = _doc_ranked_with_scores(hits)
+    if len(ranked) < 2:
+        return ranked[0][1] if ranked else 0.0
+    return ranked[0][1] - ranked[1][1]
 
 
 def confident_wrong(hits: Sequence[Hit], q: GoldQuery, threshold: float = DEFAULT_ABSTENTION_THRESHOLD) -> bool:
@@ -85,28 +125,37 @@ def identity_at_1(hits: Sequence[Hit], q: GoldQuery) -> bool:
 
 
 def identity_at_k(hits: Sequence[Hit], q: GoldQuery, k: int = 10) -> bool:
-    """Is the gold document anywhere in the top-k? (== doc-level Recall@k; for context)."""
+    """Is the gold document anywhere in the top-k? (document Success@k; for context)."""
     order = reduce_ranking(hits, "doc")[:k]
     return gold_doc_key(q) in order
 
 
-def span_coverage_at_k(hits: Sequence[Hit], gold_chunks: set[Key], k: int = 10) -> float:
-    """Fraction of the gold chunk set present in the retrieved top-k (mean coverage).
+def _evidence_groups(gold_evidence) -> list[set[Key]]:
+    """Normalise new evidence-group mappings and the legacy flattened chunk-set API."""
+    if isinstance(gold_evidence, Mapping):
+        return [set(alternatives) for alternatives in gold_evidence.values()]
+    # A legacy set had no way to distinguish separate spans from overlapping alternatives;
+    # retain its historical each-key-required semantics for API compatibility.  The harness
+    # always passes the new mapping and therefore gets correct evidence-unit semantics.
+    if isinstance(gold_evidence, (set, frozenset)):
+        return [{key} for key in gold_evidence]
+    return [set(alternatives) for alternatives in gold_evidence]
 
-    ``gold_chunks`` is the set of ``(source, document_id, chunk_index)`` the gold spans map
-    to under the current chunk config (the same relevance keys the retrieval harness builds).
-    Empty gold set → 0.0 (nothing to ground).
-    """
-    if not gold_chunks:
+
+def span_coverage_at_k(hits: Sequence[Hit], gold_evidence, k: int = 10) -> float:
+    """Fraction of required evidence groups satisfied by any alternative chunk at k."""
+    groups = _evidence_groups(gold_evidence)
+    if not groups:
         return 0.0
     retrieved = set(reduce_ranking(hits, "chunk")[:k])
-    covered = sum(1 for gk in gold_chunks if gk in retrieved)
-    return covered / len(gold_chunks)
+    covered = sum(1 for alternatives in groups if alternatives & retrieved)
+    return covered / len(groups)
 
 
-def fully_grounded_at_k(hits: Sequence[Hit], gold_chunks: set[Key], k: int = 10) -> bool:
+def fully_grounded_at_k(hits: Sequence[Hit], gold_evidence, k: int = 10) -> bool:
     """Are ALL gold spans present in the top-k context (answer can be fully grounded)?"""
-    return bool(gold_chunks) and span_coverage_at_k(hits, gold_chunks, k) >= 1.0
+    groups = _evidence_groups(gold_evidence)
+    return bool(groups) and span_coverage_at_k(hits, groups, k) >= 1.0
 
 
 @dataclass(frozen=True)
@@ -121,14 +170,17 @@ class AnswerScore:
     identity_at_10: bool
     span_coverage_at_10: float
     fully_grounded_at_10: bool
-    top1_doc: tuple[str, str] | None
-    gold_doc: tuple[str, str]
+    top1_doc: Key | None
+    gold_doc: Key
     top1_score: float
+    top2_score: float
+    margin: float
     confident_wrong: bool
+    confidence_threshold: float
 
 
 def score_answer(
-    q: GoldQuery, hits: Sequence[Hit], gold_chunks: set[Key], *,
+    q: GoldQuery, hits: Sequence[Hit], gold_evidence, *,
     k: int = 10, threshold: float = DEFAULT_ABSTENTION_THRESHOLD,
 ) -> AnswerScore:
     """Compute all per-query deterministic answer signals for one query."""
@@ -139,12 +191,15 @@ def score_answer(
         is_known_item=q.query_type in KNOWN_ITEM_TYPES,
         identity_at_1=identity_at_1(hits, q),
         identity_at_10=identity_at_k(hits, q, k),
-        span_coverage_at_10=span_coverage_at_k(hits, gold_chunks, k),
-        fully_grounded_at_10=fully_grounded_at_k(hits, gold_chunks, k),
+        span_coverage_at_10=span_coverage_at_k(hits, gold_evidence, k),
+        fully_grounded_at_10=fully_grounded_at_k(hits, gold_evidence, k),
         top1_doc=top1_doc(hits),
         gold_doc=gold_doc_key(q),
         top1_score=top1_score(hits),
+        top2_score=top2_score(hits),
+        margin=top1_top2_margin(hits),
         confident_wrong=confident_wrong(hits, q, threshold),
+        confidence_threshold=threshold,
     )
 
 
@@ -155,6 +210,13 @@ def _mean(xs: Sequence[float]) -> float:
 def aggregate_answer_scores(scores: Sequence[AnswerScore]) -> dict[str, float | int]:
     """Overall means plus a known-item-only slice (where identity@1 is meaningful)."""
     known = [s for s in scores if s.is_known_item]
+    # Margin-separation diagnostic: does a thin top1-top2 margin distinguish confident-wrong
+    # hits from confident-CORRECT ones? Only meaningful over the same known-item, "confident"
+    # (score >= threshold) population on both sides — comparing wrong-but-confident vs
+    # right-but-confident, not vs the whole set (which would mix in low-score misses).
+    confident_known = [s for s in known if s.top1_score >= s.confidence_threshold]
+    confident_wrong_group = [s for s in confident_known if not s.identity_at_1]
+    confident_correct_group = [s for s in confident_known if s.identity_at_1]
     return {
         "n": len(scores),
         "identity_at_1": _mean([1.0 if s.identity_at_1 else 0.0 for s in scores]),
@@ -169,6 +231,10 @@ def aggregate_answer_scores(scores: Sequence[AnswerScore]) -> dict[str, float | 
         # Only set True for known-item queries → rate is over the known-item denominator.
         "known_item_confident_wrong": _mean([1.0 if s.confident_wrong else 0.0 for s in known]),
         "mean_top1_score": _mean([s.top1_score for s in scores]),
+        "n_confident_wrong": len(confident_wrong_group),
+        "n_confident_correct": len(confident_correct_group),
+        "mean_margin_confident_wrong": _mean([s.margin for s in confident_wrong_group]),
+        "mean_margin_confident_correct": _mean([s.margin for s in confident_correct_group]),
     }
 
 

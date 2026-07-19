@@ -18,6 +18,10 @@ from ingest.qdrant_promotion import (
     QdrantPromotionBackend,
     make_qdrant_promotion_backend,
 )
+from ingest.release_inputs import (
+    GENERATION_ID as FROZEN_CANDIDATE_GENERATION_ID,
+    PHYSICAL_COLLECTION as FROZEN_CANDIDATE_PHYSICAL_COLLECTION,
+)
 
 
 def _proof(tmp_path, *, ok=True):
@@ -66,6 +70,7 @@ def _plan(snapshot) -> PromotionPlan:
                 "vector_space_id": "b" * 64,
                 "chunking_fingerprint": "c" * 64,
                 "document_header": True,
+                "retrieval_fingerprint_revision": 2,
                 "retrieval_fingerprint": "d" * 64,
             },
             "created_at": "2026-07-13T12:00:00Z",
@@ -131,6 +136,7 @@ class _FakeClient:
             "vector_space_id",
             "chunking_fingerprint",
             "document_header",
+            "retrieval_fingerprint_revision",
             "retrieval_fingerprint",
         } == keys
         return SimpleNamespace(count=self.plan.expected_collection.points_count)
@@ -180,6 +186,23 @@ def test_restores_absent_candidate_with_bound_checksum_and_exact_inspection(tmp_
     assert inspection.optimizer_status == "green"
     assert backend.smoke(plan.physical_collection) is True
     assert backend.readiness(plan.physical_collection) is True
+
+
+def test_frozen_candidate_restore_refuses_before_client_access(tmp_path):
+    snapshot = tmp_path / "candidate.snapshot"
+    snapshot.write_bytes(b"immutable qdrant snapshot")
+    plan = replace(
+        _plan(snapshot),
+        generation_id=FROZEN_CANDIDATE_GENERATION_ID,
+        physical_collection=FROZEN_CANDIDATE_PHYSICAL_COLLECTION,
+    )
+
+    class NoClientAccess:
+        def __getattr__(self, name):
+            pytest.fail(f"frozen-candidate refusal must precede client access: {name}")
+
+    with pytest.raises(PromotionPreconditionError, match="cannot enter a promotion plan"):
+        QdrantPromotionBackend(NoClientAccess()).restore_candidate(plan)
 
 
 def test_snapshot_checksum_mismatch_fails_before_recovery(tmp_path):
@@ -242,6 +265,20 @@ def test_alias_switch_is_one_atomic_batch_and_never_creates_missing_alias(tmp_pa
     client.aliases.clear()
     with pytest.raises(PromotionPreconditionError, match="maintenance migration"):
         backend.switch_alias("georgian_legal", plan.physical_collection)
+
+
+def test_direct_alias_switch_refuses_frozen_candidate_before_client_access():
+    class ExplodingClient:
+        def get_aliases(self):
+            pytest.fail("frozen alias refusal must happen before client access")
+
+    backend = QdrantPromotionBackend(ExplodingClient())
+
+    with pytest.raises(PromotionPreconditionError, match="cannot be targeted by an alias"):
+        backend.switch_alias(
+            "georgian_legal",
+            FROZEN_CANDIDATE_PHYSICAL_COLLECTION,
+        )
 
 
 def test_semantic_checks_are_mandatory_even_for_exact_storage(tmp_path):
@@ -340,18 +377,35 @@ def test_generation_integrity_check_streams_and_persists_post_restore_report(
         checksums=SimpleNamespace(files={"manifest.json": plan.manifest_sha256}),
     )
     client = SimpleNamespace(
-        scroll=lambda **_kwargs: ([{"id": "point-1"}, {"id": "point-2"}], None)
+        scroll=lambda **_kwargs: ([{"id": "point-1"}, {"id": "point-2"}], None),
+        get_collection=lambda _name: SimpleNamespace(
+            config={"params": {}},
+            payload_schema={},
+        ),
     )
     observed = {}
     report = SimpleNamespace(
         ok=True,
         generation_id=plan.generation_id,
         manifest_sha256=plan.manifest_sha256,
+        physical_collection=plan.physical_collection,
     )
 
-    def verify(checked_artifacts, points):
+    def verify(
+        checked_artifacts,
+        points,
+        *,
+        physical_collection,
+        observed_collection_configuration_sha256,
+        verification_id,
+    ):
         observed["artifacts"] = checked_artifacts
         observed["points"] = list(points)
+        observed["physical_collection"] = physical_collection
+        observed["collection_configuration_sha256"] = (
+            observed_collection_configuration_sha256
+        )
+        observed["verification_id"] = verification_id
         return report
 
     def persist(path, checked_report):
@@ -367,6 +421,9 @@ def test_generation_integrity_check_streams_and_persists_post_restore_report(
     assert proof.ok is True
     assert observed["artifacts"] is artifacts
     assert observed["points"] == [{"id": "point-1"}, {"id": "point-2"}]
+    assert observed["physical_collection"] == plan.physical_collection
+    assert len(observed["collection_configuration_sha256"]) == 64
+    assert observed["verification_id"] == plan.promotion_id
     assert observed["report"] is report
     assert observed["report_path"] == tmp_path / (
         f"{plan.generation_id}.{plan.promotion_id}.candidate-verification.json"

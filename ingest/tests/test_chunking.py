@@ -1,3 +1,5 @@
+import hashlib
+
 from ingest.chunking import _pack, _split_oversized_run, build_embed_text, chunk_document
 
 
@@ -156,3 +158,56 @@ def test_injected_token_counter_is_used():
     chunk_document("# H\n\none two three four five.", max_tokens=4, overlap=1,
                    min_tokens=1, count_tokens=counter)
     assert calls["n"] > 0
+
+
+def test_article_identity_and_exact_text_propagate_to_continuation_chunks():
+    body = (
+        "**თავი I**\n\n**მუხლი 12¹. სპეციალური წესი**\n\n1. "
+        + " ".join(f"დებულება{i}." for i in range(45))
+    )
+    chunks = chunk_document(body, max_tokens=10, overlap=3, min_tokens=1)
+    article_chunks = [chunk for chunk in chunks if chunk.article_id == "12¹"]
+    assert len(article_chunks) > 2
+    assert all(chunk.article_label in chunk.heading_path for chunk in article_chunks)
+    assert all(chunk.article_start_chunk_index == article_chunks[0].chunk_index for chunk in article_chunks)
+    assert all(chunk.parent_chunk_index == article_chunks[0].chunk_index for chunk in article_chunks)
+    for chunk in chunks:
+        assert chunk.text == body[chunk.char_start : chunk.char_end]
+        assert chunk.canonical_text == chunk.text
+        assert chunk.passage_hash == hashlib.sha256(chunk.text.encode("utf-8")).hexdigest()
+
+
+def test_token_bounded_overlap_keeps_tail_of_large_sentence_exactly():
+    body = " ".join(f"სიტყვა{i}" for i in range(35)) + "."
+    chunks = chunk_document(body, max_tokens=10, overlap=3, min_tokens=1)
+    assert len(chunks) > 2
+    assert any(chunks[i + 1].char_start < chunks[i].char_end for i in range(len(chunks) - 1))
+    assert all(chunk.text == body[chunk.char_start : chunk.char_end] for chunk in chunks)
+
+
+def test_chunks_derive_exact_physical_page_intersections():
+    body = "one two three four\n\nfive six seven eight"
+    page_two = body.index("five")
+    chunks = chunk_document(
+        body,
+        max_tokens=6,
+        overlap=2,
+        min_tokens=1,
+        page_boundaries=(
+            {"page_number": 1, "char_start": 0, "char_end": page_two - 2},
+            {"page_number": 2, "char_start": page_two, "char_end": len(body)},
+        ),
+        page_coordinate_reason="exact_pdf_text",
+    )
+
+    assert chunks
+    assert all(chunk.page_start is not None and chunk.page_end is not None for chunk in chunks)
+    assert chunks[0].page_start == 1
+    assert chunks[-1].page_end == 2
+    assert {chunk.page_coordinate_reason for chunk in chunks} == {"exact_pdf_text"}
+
+
+def test_non_paginated_chunks_keep_null_pages_with_explicit_reason():
+    chunks = chunk_document("one two three", max_tokens=5, overlap=0, min_tokens=1)
+    assert [(chunk.page_start, chunk.page_end) for chunk in chunks] == [(None, None)]
+    assert chunks[0].page_coordinate_reason == "source_not_paginated"

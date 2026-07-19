@@ -26,6 +26,7 @@ from ingest.qdrant_store import point_id  # noqa: E402
 def _reset_orchestrator_globals():
     orch._created_pod_ids.clear()  # noqa: SLF001
     orch._created_pod_name = None  # noqa: SLF001
+    orch._provisioned_gpu = None  # noqa: SLF001
     orch.O._pod_id = None
     orch.O._ip = None
     orch.O._port = None
@@ -34,6 +35,7 @@ def _reset_orchestrator_globals():
     yield
     orch._created_pod_ids.clear()  # noqa: SLF001
     orch._created_pod_name = None  # noqa: SLF001
+    orch._provisioned_gpu = None  # noqa: SLF001
 
 
 def _supreme_item(case_id: str, chamber: str | None = None) -> dict:
@@ -104,6 +106,9 @@ def test_run_scoped_staging_guard_is_narrow_and_preserves_generation_guards():
         base,
         generation_id="gen_20260713_verified",
         collection_name="georgian_legal__gen_gen_20260713_verified",
+        embedding_revision="a" * 40,
+        tokenizer_revision="b" * 40,
+        reranker_revision="c" * 40,
     )
     qdrant_store_module.validate_generation_write_target(
         generation,
@@ -465,7 +470,28 @@ def test_reserve_budget_is_checked_from_provision_attempt(monkeypatch):
         )
 
 
-def test_provision_requests_exactly_one_secure_4090_without_fallback(
+def test_reserve_budget_refuses_the_exact_wall_clock_ceiling(monkeypatch):
+    monkeypatch.setattr(orch.time, "time", lambda: 3_599.0)
+    monkeypatch.setattr(orch.time, "monotonic", lambda: 8.0)
+
+    assert orch.enforce_reserve_budget(
+        price=1.0,
+        provisioned_at=0.0,
+        max_compute_cost=1.0,
+        phase="just inside",
+    ) == pytest.approx(3_599 / 3_600)
+
+    monkeypatch.setattr(orch.time, "time", lambda: 3_600.0)
+    with pytest.raises(orch.ReserveBudgetError, match=r"during exact ceiling"):
+        orch.enforce_reserve_budget(
+            price=1.0,
+            provisioned_at=0.0,
+            max_compute_cost=1.0,
+            phase="exact ceiling",
+        )
+
+
+def test_provision_succeeds_immediately_on_primary_gpu_when_available(
     monkeypatch, tmp_path
 ):
     calls = []
@@ -486,6 +512,102 @@ def test_provision_requests_exactly_one_secure_4090_without_fallback(
     assert request["gpuCount"] == 1
     assert request["gpuTypeId"] == "NVIDIA GeForce RTX 4090"
     assert len(calls) == 1
+    assert orch._provisioned_gpu == "NVIDIA GeForce RTX 4090"  # noqa: SLF001
+
+
+def test_provision_falls_back_to_next_gpu_when_primary_has_no_capacity(
+    monkeypatch, tmp_path
+):
+    """2026-07-14: user-authorized fallback after repeated zero-cost RTX 4090 capacity
+    failures. Primary is retried 3x (matching its own no-fallback retry budget) before the
+    first fallback candidate is tried; a candidate priced above the gated ceiling is
+    skipped without an API call."""
+    calls = []
+
+    def fake_gql(query, variables=None):
+        calls.append(variables["input"]["gpuTypeId"])
+        if variables["input"]["gpuTypeId"] == orch.GPU_PRIMARY:
+            return {"podFindAndDeployOnDemand": None}  # no capacity
+        return {"podFindAndDeployOnDemand": {"id": "pod-fallback"}}
+
+    monkeypatch.setattr(orch.O, "gql", fake_gql)
+    monkeypatch.setattr(orch.O, "WORKDIR", tmp_path)
+    monkeypatch.setattr(orch.O, "gpu_price", lambda gpu_id: (0.5, "high"))
+    monkeypatch.setattr(orch.time, "sleep", lambda _s: None)
+    orch._created_pod_ids.clear()  # noqa: SLF001
+    ctx = orch.make_run("supremecourt", "run-1", workdir=tmp_path)
+
+    pod_id = orch.step_provision_4090("ssh-ed25519 test", ctx, 0.69)
+
+    assert pod_id == "pod-fallback"
+    assert orch._provisioned_gpu == orch.GPU_FALLBACKS[0]  # noqa: SLF001
+    assert calls.count(orch.GPU_PRIMARY) == 3
+    assert calls[-1] == orch.GPU_FALLBACKS[0]
+
+
+def test_provision_falls_back_when_primary_returns_a_graphql_capacity_error(
+    monkeypatch, tmp_path
+):
+    """The real RunPod failure mode is a GraphQL error ('does not have the resources to
+    deploy'), not a null response — gql() raises RuntimeError for it. That must be treated
+    as a clean, definitive no (safe to retry/fall back) rather than an ambiguous lost
+    response requiring reconciliation-then-raise, or fallback never triggers in practice."""
+    calls = []
+
+    def fake_gql(query, variables=None):
+        gpu_id = variables["input"]["gpuTypeId"]
+        calls.append(gpu_id)
+        if gpu_id == orch.GPU_PRIMARY:
+            raise RuntimeError(
+                'GraphQL error: [{"message": "This machine does not have the resources '
+                'to deploy your pod. Please try a different machine"}]'
+            )
+        return {"podFindAndDeployOnDemand": {"id": "pod-fallback"}}
+
+    monkeypatch.setattr(orch.O, "gql", fake_gql)
+    monkeypatch.setattr(orch.O, "WORKDIR", tmp_path)
+    monkeypatch.setattr(orch.O, "gpu_price", lambda gpu_id: (0.5, "high"))
+    monkeypatch.setattr(orch.time, "sleep", lambda _s: None)
+    orch._created_pod_ids.clear()  # noqa: SLF001
+    ctx = orch.make_run("supremecourt", "run-1", workdir=tmp_path)
+
+    pod_id = orch.step_provision_4090("ssh-ed25519 test", ctx, 0.69)
+
+    assert pod_id == "pod-fallback"
+    assert orch._provisioned_gpu == orch.GPU_FALLBACKS[0]  # noqa: SLF001
+    assert calls.count(orch.GPU_PRIMARY) == 3
+    assert calls[-1] == orch.GPU_FALLBACKS[0]
+
+
+def test_provision_skips_fallback_candidates_priced_above_the_gated_ceiling(
+    monkeypatch, tmp_path
+):
+    def fake_gql(query, variables=None):
+        return {"podFindAndDeployOnDemand": None}
+
+    prices = {orch.GPU_FALLBACKS[0]: (5.0, "high")}  # over the 0.69 ceiling
+
+    monkeypatch.setattr(orch.O, "gql", fake_gql)
+    monkeypatch.setattr(orch.O, "WORKDIR", tmp_path)
+    monkeypatch.setattr(orch.O, "gpu_price", lambda gpu_id: prices.get(gpu_id, (None, None)))
+    monkeypatch.setattr(orch.time, "sleep", lambda _s: None)
+    orch._created_pod_ids.clear()  # noqa: SLF001
+    ctx = orch.make_run("supremecourt", "run-1", workdir=tmp_path)
+
+    with pytest.raises(RuntimeError, match="could not provision any GPU"):
+        orch.step_provision_4090("ssh-ed25519 test", ctx, 0.69)
+
+
+def test_hardware_attestation_uses_the_gpu_that_was_actually_provisioned(monkeypatch):
+    orch._provisioned_gpu = "NVIDIA RTX A5000"  # noqa: SLF001
+    monkeypatch.setattr(orch.O, "ssh_capture", lambda *_a, **_k: "NVIDIA RTX A5000\n")
+    orch.attest_single_4090("127.0.0.1", 22)  # does not raise
+
+    monkeypatch.setattr(
+        orch.O, "ssh_capture", lambda *_a, **_k: "NVIDIA GeForce RTX 4090\n"
+    )
+    with pytest.raises(RuntimeError, match="expected exactly"):
+        orch.attest_single_4090("127.0.0.1", 22)
 
 
 def test_checksum_is_a_separate_gate_before_corpus_embedding():
@@ -614,6 +736,24 @@ def test_run_manifest_requires_exact_snapshot_hash_documents_chunks_and_points(
     bad = dict(run, document_ids_sha256="0" * 64)
     with pytest.raises(RuntimeError, match="document_ids_sha256 is not canonical"):
         orch.validate_run_manifest(ctx, expected, bad, ctx.snapshot)
+
+    # gpu: without a live attestation (_provisioned_gpu unset, e.g. --skip-pod), any
+    # known candidate GPU is accepted — not just the primary.
+    fallback_run = dict(run, gpu=orch.GPU_FALLBACKS[0])
+    orch.validate_run_manifest(ctx, expected, fallback_run, ctx.snapshot)
+
+    bad = dict(run, gpu="some unknown GPU")
+    with pytest.raises(RuntimeError, match="not one of the allowed GPU types"):
+        orch.validate_run_manifest(ctx, expected, bad, ctx.snapshot)
+
+    # gpu: WITH a live attestation, the manifest must match exactly what was attested.
+    orch._provisioned_gpu = orch.GPU_FALLBACKS[0]  # noqa: SLF001
+    try:
+        orch.validate_run_manifest(ctx, expected, fallback_run, ctx.snapshot)
+        with pytest.raises(RuntimeError, match="gpu: expected"):
+            orch.validate_run_manifest(ctx, expected, run, ctx.snapshot)
+    finally:
+        orch._provisioned_gpu = None  # noqa: SLF001
 
 
 def test_restored_points_require_uuid5_exact_ids_and_contiguous_chunks(tmp_path):

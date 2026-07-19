@@ -26,11 +26,13 @@ from typing import BinaryIO
 from .generation import (
     CHECKSUM_ALGORITHM,
     CHECKSUM_FILENAME,
+    COLLECTION_DIGEST_FILENAME,
     DOCUMENTS_FILENAME,
     GENERATION_SCHEMA_VERSION,
     MANIFEST_FILENAME,
     SAMPLE_CHECKS_FILENAME,
     ChecksumInventory,
+    CollectionDigest,
     DocumentRecord,
     GenerationFormatError,
     GenerationManifest,
@@ -104,22 +106,47 @@ def _rename_noreplace(source: Path, destination: Path) -> None:
 
 
 def _create_private_directory(path: Path) -> None:
-    missing: list[Path] = []
-    cursor = path
-    while not cursor.exists():
-        missing.append(cursor)
-        if cursor.parent == cursor:
-            break
-        cursor = cursor.parent
-    if cursor.exists() and (cursor.is_symlink() or not cursor.is_dir()):
-        raise GenerationPublishError(f"not a real directory: {cursor}")
-    for directory in reversed(missing):
+    absolute = path.expanduser().absolute()
+    cursor = Path(absolute.anchor)
+    components = [cursor]
+    for part in absolute.parts[1:]:
+        cursor /= part
+        components.append(cursor)
+
+    def require_real_directory(directory: Path) -> bool:
+        try:
+            mode = directory.lstat().st_mode
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            raise GenerationPublishError(
+                f"cannot inspect generation output path {directory}: {exc}"
+            ) from exc
+        if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+            raise GenerationPublishError(f"not a real directory: {directory}")
+        return True
+
+    # Path.exists()/Path.is_dir() follow symlinks and only inspect the nearest existing
+    # ancestor.  Walk every absolute component so an already-existing output root cannot
+    # smuggle a symlinked parent into the immutable publisher.
+    for directory in components:
+        if require_real_directory(directory):
+            continue
         try:
             directory.mkdir(mode=PRIVATE_DIRECTORY_MODE)
         except FileExistsError:
             pass
-        if directory.is_symlink() or not directory.is_dir():
-            raise GenerationPublishError(f"not a real directory: {directory}")
+        except OSError as exc:
+            raise GenerationPublishError(
+                f"cannot create generation output directory {directory}: {exc}"
+            ) from exc
+        if not require_real_directory(directory):  # pragma: no cover - mkdir succeeded
+            raise GenerationPublishError(f"generation output directory vanished: {directory}")
+
+    # Recheck after creation to catch a component swapped while the path was built.
+    for directory in components:
+        if not require_real_directory(directory):
+            raise GenerationPublishError(f"generation output directory vanished: {directory}")
 
 
 def _fsync_directory(path: Path) -> None:
@@ -261,9 +288,12 @@ def _as_sample(
     return SampleCheck.from_dict(data, expected_generation_id=generation_id)
 
 
-def _provenance(manifest: GenerationManifest) -> dict[str, object]:
+def _provenance(
+    manifest: GenerationManifest,
+    preparation_provenance: Mapping[str, object] | None = None,
+) -> dict[str, object]:
     data = manifest.to_dict()
-    return {
+    provenance: dict[str, object] = {
         "schema_version": GENERATION_SCHEMA_VERSION,
         "generation_id": manifest.generation_id,
         "corpus": data["corpus"],
@@ -272,11 +302,15 @@ def _provenance(manifest: GenerationManifest) -> dict[str, object]:
         "vector_space": data["vector_space"],
         "chunking": data["chunking"],
         "covered_runs": data["covered_runs"],
+        "retrieval_fingerprint_revision": manifest.retrieval_fingerprint_revision,
         "retrieval_fingerprint": manifest.retrieval_fingerprint,
         "code": data["code"],
         "dependency": data["dependency"],
         "creation": data["creation"],
     }
+    if preparation_provenance is not None:
+        provenance["preparation"] = dict(preparation_provenance)
+    return provenance
 
 
 def _source_state_artifact(
@@ -297,6 +331,7 @@ def _quarantine_record(document: DocumentRecord) -> dict[str, object]:
         "generation_id": document.generation_id,
         "source": document.source,
         "document_id": document.document_id,
+        "version_id": document.version_id,
         "source_identity": document.source_identity,
         "content_hash": document.content_hash,
         "document_state_hash": document.document_state_hash,
@@ -318,9 +353,9 @@ def _open_validation_index(path: Path) -> sqlite3.Connection:
     connection.execute("PRAGMA synchronous=FULL")
     connection.execute(
         "CREATE TABLE documents ("
-        "source TEXT NOT NULL, document_id TEXT NOT NULL, "
+        "source TEXT NOT NULL, document_id TEXT NOT NULL, version_id TEXT NOT NULL, "
         "expected_chunks INTEGER NOT NULL, indexed INTEGER NOT NULL, "
-        "PRIMARY KEY (source, document_id))"
+        "PRIMARY KEY (source, document_id, version_id))"
     )
     return connection
 
@@ -332,7 +367,7 @@ def _stream_documents(
     index: sqlite3.Connection,
 ) -> tuple[int, int, int, int]:
     document_count = indexed_count = excluded_count = chunk_count = 0
-    previous_key: tuple[str, str] | None = None
+    previous_key: tuple[str, str, str] | None = None
     document_path = staging / DOCUMENTS_FILENAME
     quarantine_path = staging / QUARANTINE_FILENAME
     with (
@@ -341,10 +376,10 @@ def _stream_documents(
     ):
         for raw_record in records:
             record = _as_document(raw_record, manifest.generation_id)
-            key = (record.source, record.document_id)
+            key = (record.source, record.document_id, record.version_id)
             if previous_key is not None and key <= previous_key:
                 raise GenerationFormatError(
-                    "documents must be strictly sorted by source and document_id"
+                    "documents must be strictly sorted by source, document_id, and version_id"
                 )
             previous_key = key
             if record.indexed and not record.content_complete:
@@ -353,10 +388,11 @@ def _stream_documents(
                 )
             try:
                 index.execute(
-                    "INSERT INTO documents VALUES (?, ?, ?, ?)",
+                    "INSERT INTO documents VALUES (?, ?, ?, ?, ?)",
                     (
                         record.source,
                         record.document_id,
+                        record.version_id,
                         record.expected_chunk_count,
                         int(record.indexed),
                     ),
@@ -384,25 +420,31 @@ def _stream_samples(
     index: sqlite3.Connection,
 ) -> int:
     count = 0
-    previous_key: tuple[str, str, int] | None = None
+    previous_key: tuple[str, str, str, int] | None = None
     path = staging / SAMPLE_CHECKS_FILENAME
     with _private_binary_writer(path) as sample_file:
         for raw_record in records:
             record = _as_sample(raw_record, manifest.generation_id)
-            key = (record.source, record.document_id, record.chunk_index)
+            key = (
+                record.source,
+                record.document_id,
+                record.version_id,
+                record.chunk_index,
+            )
             if previous_key is not None and key <= previous_key:
                 raise GenerationFormatError(
-                    "sample checks must be strictly sorted by source, document_id, and chunk_index"
+                    "sample checks must be strictly sorted by source, document_id, "
+                    "version_id, and chunk_index"
                 )
             previous_key = key
             observed = index.execute(
                 "SELECT expected_chunks, indexed FROM documents "
-                "WHERE source = ? AND document_id = ?",
-                (record.source, record.document_id),
+                "WHERE source = ? AND document_id = ? AND version_id = ?",
+                (record.source, record.document_id, record.version_id),
             ).fetchone()
             if observed is None:
                 raise GenerationFormatError(
-                    f"sample references unknown document: {key[:2]}"
+                    f"sample references unknown document version: {key[:3]}"
                 )
             expected_chunks, indexed = observed
             if not indexed or record.chunk_index >= expected_chunks:
@@ -446,6 +488,9 @@ def _checksum_inventory(staging: Path, manifest_bytes: bytes) -> ChecksumInvento
         QUARANTINE_FILENAME: _sha256_file(staging / QUARANTINE_FILENAME),
         MANIFEST_FILENAME: hashlib.sha256(manifest_bytes).hexdigest(),
     }
+    collection_digest = staging / COLLECTION_DIGEST_FILENAME
+    if collection_digest.exists():
+        files[COLLECTION_DIGEST_FILENAME] = _sha256_file(collection_digest)
     return ChecksumInventory.from_dict(
         {
             "schema_version": GENERATION_SCHEMA_VERSION,
@@ -476,6 +521,9 @@ def publish_generation(
     documents: Iterable[DocumentRecord | Mapping[str, object]],
     sample_checks: Iterable[SampleCheck | Mapping[str, object]],
     source_state: Mapping[str, object],
+    *,
+    collection_digest: CollectionDigest | Mapping[str, object] | None = None,
+    preparation_provenance: Mapping[str, object] | None = None,
 ) -> Path:
     """Build and atomically publish one immutable generation.
 
@@ -494,6 +542,27 @@ def publish_generation(
     if source_state_sha256(source_state) != parsed_manifest.source.state_sha256:
         raise GenerationFormatError(
             "source_state does not match manifest.source.state_sha256"
+        )
+    if preparation_provenance is not None and not isinstance(
+        preparation_provenance, Mapping
+    ):
+        raise GenerationFormatError("preparation_provenance must be a JSON object")
+    if collection_digest is None:
+        raise GenerationFormatError(
+            "immutable generation publication requires a sealed collection digest"
+        )
+    parsed_collection_digest = (
+        collection_digest
+        if isinstance(collection_digest, CollectionDigest)
+        else CollectionDigest.from_dict(collection_digest)
+    )
+    if (
+        parsed_collection_digest.point_count != parsed_manifest.chunk_count
+        or parsed_collection_digest.physical_collection
+        != f"georgian_legal__gen_{parsed_manifest.generation_id}"
+    ):
+        raise GenerationFormatError(
+            "collection digest does not match generation identity/count"
         )
 
     root = Path(output_root)
@@ -542,11 +611,19 @@ def publish_generation(
             validation_index = None
             validation_path.unlink()
 
-            _write_json(staging / PROVENANCE_FILENAME, _provenance(parsed_manifest))
+            _write_json(
+                staging / PROVENANCE_FILENAME,
+                _provenance(parsed_manifest, preparation_provenance),
+            )
             _write_json(
                 staging / SOURCE_STATE_FILENAME,
                 _source_state_artifact(parsed_manifest, source_state),
             )
+            if parsed_collection_digest is not None:
+                _write_json(
+                    staging / COLLECTION_DIGEST_FILENAME,
+                    parsed_collection_digest.to_dict(),
+                )
             manifest_bytes = _canonical_json_bytes(
                 parsed_manifest.to_dict(), pretty=True
             )

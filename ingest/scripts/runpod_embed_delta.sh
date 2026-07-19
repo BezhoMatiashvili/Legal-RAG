@@ -31,10 +31,11 @@ mkdir -p "$OUT"
 rm -f "$OUT"/{DONE,checksum_gpu.json,input_manifest_gpu.json,embed_report.json,run_manifest.json}
 exec > >(tee -a "$OUT/embed.log") 2>&1
 
+EXPECTED_GPU="${EXPECTED_GPU:-NVIDIA GeForce RTX 4090}"
 GPU_NAMES="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || true)"
 GPU_COUNT="$(printf '%s\n' "$GPU_NAMES" | sed '/^[[:space:]]*$/d' | wc -l)"
-if [ "$GPU_COUNT" -ne 1 ] || [ "$GPU_NAMES" != "NVIDIA GeForce RTX 4090" ]; then
-  echo "GPU attestation failed: count=$GPU_COUNT names=$GPU_NAMES" >&2
+if [ "$GPU_COUNT" -ne 1 ] || [ "$GPU_NAMES" != "$EXPECTED_GPU" ]; then
+  echo "GPU attestation failed: expected=$EXPECTED_GPU count=$GPU_COUNT names=$GPU_NAMES" >&2
   exit 1
 fi
 echo "[$(date -u +%FT%TZ)] delta start source=$SOURCE run=$RUN gpu=$GPU_NAMES"
@@ -59,10 +60,12 @@ if [ ! -x "$PY" ]; then python -m venv "$WORK/venv"; fi
   "tokenizers==0.22.2" "accelerate==1.14.0" "datasets==5.0.0" \
   "sentencepiece==0.2.1" "safetensors==0.8.0" "qdrant-client>=1.12" \
   "python-dotenv>=1.0" "tqdm>=4.66" "rich>=13"
-"$PY" -c "import torch; assert torch.cuda.is_available(), 'no CUDA'; \
+"$PY" -c "import os, torch; assert torch.cuda.is_available(), 'no CUDA'; \
 assert torch.cuda.device_count() == 1; \
-assert torch.cuda.get_device_name(0) == 'NVIDIA GeForce RTX 4090'; \
-print('CUDA attested:', torch.__version__, torch.version.cuda, torch.cuda.get_device_name(0))"
+expected = os.environ.get('EXPECTED_GPU', 'NVIDIA GeForce RTX 4090'); \
+actual = torch.cuda.get_device_name(0); \
+assert actual == expected, f'CUDA device {actual!r} != expected {expected!r}'; \
+print('CUDA attested:', torch.__version__, torch.version.cuda, actual)"
 
 cd "$WORK/ingest"
 unset GENERATION_ID GENERATION_DIR
@@ -103,7 +106,7 @@ payload = {
     "dense": vec,
     "cosine": cosine,
     "gate": 0.999,
-    "gpu": "NVIDIA GeForce RTX 4090",
+    "gpu": os.environ.get("EXPECTED_GPU", "NVIDIA GeForce RTX 4090"),
 }
 tmp = out.with_suffix(".tmp")
 tmp.write_text(json.dumps(payload), encoding="utf-8")

@@ -15,7 +15,6 @@ import os
 import signal
 import threading
 from collections.abc import Iterator
-from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -26,13 +25,29 @@ from .chunking import build_embed_text, chunk_document
 from .config import Config
 from .dedup import content_hash
 from .hygiene import assess, clean_text
-from .sources import SOURCES, normalize, schema_drift
+from .sources import (
+    SOURCES,
+    STATEFUL_PROMOTED_FIELDS,
+    derived_version_id,
+    finalize_canonical_text,
+    normalize,
+    remap_page_boundaries,
+    schema_drift,
+)
 
 logger = logging.getLogger("ingest.pipeline")
 
-# Product corpus. ``supremecourt`` has a normalizer for separate experiments but is excluded
-# from the production index by design, so generic ``all`` writer commands must not include it.
-CORPUS_SOURCES = ("matsne", "ecd", "constcourt", "napr", "tas", "tbappeal")
+# Every authoritative source is first-class in full, snapshot and delta builds.  Incomplete
+# TAS/Tbilisi Appeal records are still rejected by ``_prepare_doc_for_index`` below.
+CORPUS_SOURCES = (
+    "matsne",
+    "ecd",
+    "constcourt",
+    "napr",
+    "supremecourt",
+    "tas",
+    "tbappeal",
+)
 
 
 class DocumentQuarantined(ValueError):
@@ -61,7 +76,27 @@ def _prepare_doc_for_index(doc):
             doc.document_id,
             f"incomplete_content:{doc.content_kind}:{doc.extraction_status}",
         )
-    return replace(doc, body_markdown=clean_text(doc.body_markdown))
+    if not doc.admissible:
+        raise DocumentQuarantined(
+            doc.source,
+            doc.document_id,
+            f"inadmissible_source:{doc.source_authority}:{doc.page_coordinate_reason}",
+        )
+    canonical_text = clean_text(doc.body_markdown)
+    boundaries = remap_page_boundaries(doc, canonical_text, clean_text)
+    return finalize_canonical_text(
+        doc,
+        canonical_text,
+        page_boundaries=boundaries,
+    )
+
+
+def _generation_version_id(cfg: Config, doc) -> str | None:
+    """Use exactly the canonical version identity written by ``build_payload``."""
+
+    if not cfg.generation_id:
+        return None
+    return doc.version_id or derived_version_id(doc)
 
 
 def _header_v2_kwargs(cfg: Config, doc) -> dict:
@@ -120,10 +155,29 @@ _STATE_FIELDS = (
     "extraction_status",
     "source_binary_url",
     "article_summary",
+    "source_fingerprint",
+    "normalizer_revision",
+    "version_id",
+    "version_id_kind",
+    "supersedes",
+    "effective_from",
+    "effective_to",
+    "repeal_date",
+    "consolidation_status",
+    "version_lineage_status",
+    "version_lineage_complete",
+    "consolidated_dates",
+    "official_url",
+    "official_binary_url",
+    "official_html_url",
+    "official_pdf_url",
+    "source_authority",
+    "freshness_sla_met",
+    "admissible",
+    "page_boundaries",
+    "page_coordinate_reason",
 )
-_PROMOTED_FIELDS = tuple(sorted({
-    field for spec in SOURCES.values() for field in spec.promote_fields
-}))
+_PROMOTED_FIELDS = tuple(sorted(STATEFUL_PROMOTED_FIELDS))
 
 
 def _canonical_date(value) -> str | None:
@@ -136,16 +190,29 @@ def _document_state_hash(cfg: Config, doc=None, payload: dict | None = None) -> 
         raise ValueError("pass exactly one of doc or payload")
     if doc is not None:
         fields = {name: getattr(doc, name) for name in _STATE_FIELDS}
+        fields["page_boundaries"] = [
+            boundary.to_dict() for boundary in doc.page_boundaries
+        ]
         fields["date"] = _canonical_date(doc.date)
         fields["in_force_date"] = _canonical_date(doc.in_force_date)
         fields["expiry_date"] = _canonical_date(doc.expiry_date)
-        promoted = dict(sorted((doc.promoted or {}).items()))
+        fields["effective_from"] = _canonical_date(doc.effective_from)
+        fields["effective_to"] = _canonical_date(doc.effective_to)
+        fields["repeal_date"] = _canonical_date(doc.repeal_date)
+        promoted = {
+            name: doc.promoted[name]
+            for name in _PROMOTED_FIELDS
+            if name in (doc.promoted or {}) and doc.promoted[name] not in (None, "")
+        }
         body_hash = content_hash(doc.body_markdown or "")
     else:
         fields = {name: payload.get(name) for name in _STATE_FIELDS}
         fields["date"] = _canonical_date(payload.get("date"))
         fields["in_force_date"] = _canonical_date(payload.get("in_force_date"))
         fields["expiry_date"] = _canonical_date(payload.get("expiry_date"))
+        fields["effective_from"] = _canonical_date(payload.get("effective_from"))
+        fields["effective_to"] = _canonical_date(payload.get("effective_to"))
+        fields["repeal_date"] = _canonical_date(payload.get("repeal_date"))
         promoted = {
             name: payload.get(name) for name in _PROMOTED_FIELDS
             if payload.get(name) not in (None, "")
@@ -176,7 +243,13 @@ def _document_state_hash(cfg: Config, doc=None, payload: dict | None = None) -> 
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
-def _indexed_document_state(client, cfg: Config, source: str, document_id: str) -> str | None:
+def _indexed_document_state(
+    client,
+    cfg: Config,
+    source: str,
+    document_id: str,
+    version_id: str | None = None,
+) -> str | None:
     """State hash of the indexed chunk zero, with a legacy-payload fallback.
 
     A single O(1) point lookup by deterministic id — lets watch skip re-embedding a doc the
@@ -184,7 +257,12 @@ def _indexed_document_state(client, cfg: Config, source: str, document_id: str) 
     try:
         recs = client.retrieve(
             collection_name=cfg.collection_name,
-            ids=[store.point_id(source, document_id, 0)],
+            ids=[store.point_id(
+                source,
+                document_id,
+                0,
+                version_id=version_id if cfg.generation_id else None,
+            )],
             with_payload=[*_STATE_FIELDS, *_PROMOTED_FIELDS, "content_hash", "document_state_hash"],
         )
     except Exception:  # noqa: BLE001 - a lookup failure must never block ingestion
@@ -320,12 +398,20 @@ def ingest_source(
 
     use_panel = progress is not None and progress.enabled
 
-    resume_after = _load_checkpoint(cfg, source).get("last_document_id") if resume else None
+    checkpoint = _load_checkpoint(cfg, source) if resume else {}
+    resume_after = checkpoint.get("last_document_id")
+    resume_after_version = checkpoint.get("last_version_id")
+    if cfg.generation_id and resume_after is not None and not resume_after_version:
+        raise RuntimeError(
+            "generation resume checkpoint lacks last_version_id; delete the legacy "
+            "checkpoint and restart this immutable generation"
+        )
     skipping = resume_after is not None
 
     pending: list = []
-    pending_deletes: list[tuple[str, str, int]] = []
+    pending_deletes: list[tuple[str, str, str | None, int]] = []
     last_buffered_doc: str | None = None
+    last_buffered_version: str | None = None
     docs = chunks_total = skipped = processed = 0
 
     def report():
@@ -333,7 +419,7 @@ def ingest_source(
             progress.update(source, docs=docs, chunks=chunks_total, skipped=skipped)
 
     def flush():
-        nonlocal last_buffered_doc
+        nonlocal last_buffered_doc, last_buffered_version
         if not pending:
             return
         if use_panel:
@@ -343,18 +429,25 @@ def ingest_source(
         # Only after every replacement point is acknowledged may an older tail be removed.
         # A delete failure leaves the checkpoint behind, so the idempotent upsert+delete pair
         # is retried rather than recording a partial document as complete.
-        for delete_source, delete_document_id, from_index in pending_deletes:
+        for delete_source, delete_document_id, delete_version_id, from_index in pending_deletes:
             store.delete_doc_chunks_from(
                 client,
                 cfg.collection_name,
                 delete_source,
                 delete_document_id,
                 from_index,
+                version_id=delete_version_id,
             )
         if last_buffered_doc is not None:
+            checkpoint_payload = {
+                "last_document_id": last_buffered_doc,
+                "docs": docs,
+                "chunks": chunks_total,
+            }
+            if cfg.generation_id:
+                checkpoint_payload["last_version_id"] = last_buffered_version
             _save_checkpoint(
-                cfg, source,
-                {"last_document_id": last_buffered_doc, "docs": docs, "chunks": chunks_total},
+                cfg, source, checkpoint_payload,
             )
         pending.clear()
         pending_deletes.clear()
@@ -378,8 +471,14 @@ def ingest_source(
             continue
 
         if skipping:
-            # Fast-forward past already-ingested docs, then resume on the next one.
-            if doc.document_id == resume_after:
+            # Fast-forward past the exact immutable document version, then resume on the
+            # next row. Legacy collections retain the historical document-only checkpoint.
+            identity_matches = doc.document_id == resume_after
+            if cfg.generation_id:
+                identity_matches = identity_matches and (
+                    _generation_version_id(cfg, doc) == resume_after_version
+                )
+            if identity_matches:
                 skipping = False
             continue
 
@@ -391,6 +490,8 @@ def ingest_source(
                 overlap=cfg.chunk_overlap,
                 min_tokens=cfg.chunk_min_tokens,
                 count_tokens=count_tokens,
+                page_boundaries=doc.page_boundaries,
+                page_coordinate_reason=doc.page_coordinate_reason,
             )
             if not chunks:
                 continue
@@ -419,7 +520,12 @@ def ingest_source(
             vector = {"dense": emb.dense}
             if emb.sparse.indices:
                 vector["sparse"] = store.sparse_vector(emb.sparse)
-            pid = store.point_id(doc.source, doc.document_id, chunk.chunk_index)
+            pid = store.point_id(
+                doc.source,
+                doc.document_id,
+                chunk.chunk_index,
+                version_id=_generation_version_id(cfg, doc),
+            )
             pending.append(store.point_struct(
                 pid,
                 vector,
@@ -435,9 +541,15 @@ def ingest_source(
         # Incremental: remove chunks left over from a previously longer version. Skipped
         # on a freshly (re)created/empty collection where there is nothing to delete.
         if not skip_stale_delete:
-            pending_deletes.append((doc.source, doc.document_id, len(chunks)))
+            pending_deletes.append((
+                doc.source,
+                doc.document_id,
+                _generation_version_id(cfg, doc),
+                len(chunks),
+            ))
 
         last_buffered_doc = doc.document_id
+        last_buffered_version = _generation_version_id(cfg, doc)
         docs += 1
         chunks_total += len(chunks)
         processed += 1
@@ -450,8 +562,14 @@ def ingest_source(
     flush()
 
     if skipping:
+        checkpoint_identity = (
+            f"{resume_after}@{resume_after_version}"
+            if resume_after_version
+            else repr(resume_after)
+        )
         raise RuntimeError(
-            f"--resume checkpoint id {resume_after!r} for source {source!r} was never found "
+            f"--resume checkpoint identity {checkpoint_identity} for source {source!r} "
+            "was never found "
             f"in {path}. Refusing to silently ingest nothing; delete the checkpoint to start over."
         )
     if skipped:
@@ -565,6 +683,8 @@ def _build_doc_points(cfg: Config, embedder, count_tokens, doc) -> tuple[list, i
         overlap=cfg.chunk_overlap,
         min_tokens=cfg.chunk_min_tokens,
         count_tokens=count_tokens,
+        page_boundaries=doc.page_boundaries,
+        page_coordinate_reason=doc.page_coordinate_reason,
     )
     if not chunks:
         return [], 0
@@ -581,7 +701,12 @@ def _build_doc_points(cfg: Config, embedder, count_tokens, doc) -> tuple[list, i
         vector = {"dense": emb.dense}
         if emb.sparse.indices:
             vector["sparse"] = store.sparse_vector(emb.sparse)
-        pid = store.point_id(doc.source, doc.document_id, chunk.chunk_index)
+        pid = store.point_id(
+            doc.source,
+            doc.document_id,
+            chunk.chunk_index,
+            version_id=_generation_version_id(cfg, doc),
+        )
         points.append(store.point_struct(
             pid,
             vector,
@@ -630,7 +755,7 @@ def watch_drain_source(
     run_offsets = state["run_offsets"]
     docs = chunks_total = skipped = 0
     pending: list = []
-    pending_deletes: list[tuple[str, str, int]] = []
+    pending_deletes: list[tuple[str, str, str | None, int]] = []
     last_off: int | None = None
     # Lowest byte offset of a doc whose embed failed transiently this pass; the run offset
     # must never advance past it (else a later successful doc's offset strands the failed one).
@@ -643,13 +768,14 @@ def watch_drain_source(
             return
         # wait=True so the offset below only advances over durably-written points.
         store.upsert_points(client, cfg.collection_name, pending, wait=True)
-        for delete_source, delete_document_id, from_index in pending_deletes:
+        for delete_source, delete_document_id, delete_version_id, from_index in pending_deletes:
             store.delete_doc_chunks_from(
                 client,
                 cfg.collection_name,
                 delete_source,
                 delete_document_id,
                 from_index,
+                version_id=delete_version_id,
             )
         if last_off is not None and current_run_id is not None:
             # Cap at retry_floor: never persist an offset past a doc awaiting an embed retry.
@@ -710,7 +836,8 @@ def watch_drain_source(
             indexed_prev_state = None
             if skip_unchanged:
                 indexed_prev_state = _indexed_document_state(
-                    client, cfg, source, doc.document_id
+                    client, cfg, source, doc.document_id,
+                    _generation_version_id(cfg, doc),
                 )
                 if (indexed_prev_state is not None
                         and indexed_prev_state == _document_state_hash(cfg, doc=doc)):
@@ -755,7 +882,12 @@ def watch_drain_source(
             pending.extend(points)
             # Incremental: drop chunks left over from a previously longer version.
             if not skip_stale_delete:
-                pending_deletes.append((doc.source, doc.document_id, n_chunks))
+                pending_deletes.append((
+                    doc.source,
+                    doc.document_id,
+                    _generation_version_id(cfg, doc),
+                    n_chunks,
+                ))
             if indexed_prev_state is not None:
                 state["updated"] = state.get("updated", 0) + 1   # re-embedded a changed doc
             elif skip_unchanged:

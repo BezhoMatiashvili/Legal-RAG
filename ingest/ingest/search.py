@@ -11,6 +11,7 @@ from qdrant_client import models
 
 from .citations import citation_lookup, extract_citation, pin_points
 from .config import Config
+from .court_extract import normalize_judge_key
 
 _MKHEDRULI_RE = re.compile(r"[ა-ჿ]")
 
@@ -36,15 +37,21 @@ def build_filter(
     language: str | None = None,
     document_type: str | None = None,
     court: str | None = None,
+    judges: str | None = None,
+    disposition: str | None = None,
+    appeal_type: str | None = None,
     document_id: str | None = None,
     document_number: str | None = None,
     registration_code: str | None = None,
+    article_id: str | None = None,
+    clause_id: str | None = None,
     parties: str | None = None,
     contains: str | None = None,
     status: str | None = None,
     is_consolidated: bool | None = None,
     date_from: str | None = None,
     date_to: str | None = None,
+    as_of: str | None = None,
 ) -> models.Filter | None:
     """Build an AND filter over the indexed payload fields.
 
@@ -63,6 +70,30 @@ def build_filter(
         )
     if court:
         must.append(models.FieldCondition(key="court", match=models.MatchValue(value=court)))
+    if judges:
+        judge_key = normalize_judge_key(judges)
+        if not judge_key:
+            raise ValueError(
+                "judges must be a Georgian surname or first-name/initial plus surname"
+            )
+        must.append(
+            models.FieldCondition(
+                key="judges",
+                match=models.MatchValue(value=judge_key),
+            )
+        )
+    if disposition:
+        must.append(
+            models.FieldCondition(
+                key="disposition", match=models.MatchValue(value=disposition)
+            )
+        )
+    if appeal_type:
+        must.append(
+            models.FieldCondition(
+                key="appeal_type", match=models.MatchValue(value=appeal_type)
+            )
+        )
     if document_id:
         must.append(
             models.FieldCondition(key="document_id", match=models.MatchValue(value=document_id))
@@ -77,6 +108,18 @@ def build_filter(
         must.append(
             models.FieldCondition(
                 key="registration_code", match=models.MatchValue(value=registration_code)
+            )
+        )
+    if article_id:
+        must.append(
+            models.FieldCondition(
+                key="article_id", match=models.MatchValue(value=article_id)
+            )
+        )
+    if clause_id:
+        must.append(
+            models.FieldCondition(
+                key="clause_id", match=models.MatchValue(value=clause_id)
             )
         )
     if parties:
@@ -98,6 +141,30 @@ def build_filter(
                 range=models.DatetimeRange(gte=_date_bound(date_from), lte=_date_bound(date_to)),
             )
         )
+    if as_of:
+        instant = _date_bound(as_of)
+        # Canonical version intervals are [effective_from, effective_to).  An omitted
+        # effective_to means the version remains open-ended.  Publication date (``date``)
+        # is deliberately not consulted here.
+        must.append(
+            models.FieldCondition(
+                key="effective_from",
+                range=models.DatetimeRange(lte=instant),
+            )
+        )
+        must.append(
+            models.Filter(
+                should=[
+                    models.FieldCondition(
+                        key="effective_to",
+                        range=models.DatetimeRange(gt=instant),
+                    ),
+                    models.IsEmptyCondition(
+                        is_empty=models.PayloadField(key="effective_to")
+                    ),
+                ]
+            )
+        )
     return models.Filter(must=must) if must else None
 
 
@@ -115,6 +182,7 @@ def hybrid_search(
     max_per_doc: int | None = None,
     mmr_lambda: float | None = None,
     timings_ms: dict[str, float] | None = None,
+    trace: dict | None = None,
     **filters,
 ):
     """Two-stage retrieval: hybrid (dense+sparse, RRF-fused) recall → optional rerank.
@@ -195,12 +263,40 @@ def hybrid_search(
     if timings_ms is not None:
         timings_ms["search"] = timings_ms.get("search", 0.0) + (time.perf_counter() - t0) * 1000
     points = result.points
+    if trace is not None:
+        trace.clear()
+        trace.update(
+            {
+                "route": "dense_only" if not use_sparse else "hybrid",
+                "query_language": detect_language(query),
+                "filters": dict(filters),
+                "candidate_ranking": [
+                    {
+                        "point_id": str(getattr(point, "id", "")),
+                        "score": format(float(point.score), ".17g"),
+                        "source": (point.payload or {}).get("source"),
+                        "document_id": (point.payload or {}).get("document_id"),
+                        "version_id": (point.payload or {}).get("version_id"),
+                        "chunk_index": (point.payload or {}).get("chunk_index"),
+                    }
+                    for point in points
+                ],
+                "pinned_ranking": [
+                    {
+                        "point_id": str(getattr(point, "id", "")),
+                        "score": format(float(point.score), ".17g"),
+                    }
+                    for point in pinned
+                ],
+            }
+        )
     if reranker is not None and points:
         # Rerank the whole pool when diversifying so MMR/cap choose the final top_k.
         t0 = time.perf_counter()
         points = rerank_points(
             reranker, query, points,
             top_k=len(points) if diversity_on else top_k, min_score=rerank_min_score,
+            enrich_context=getattr(cfg, "rerank_context_enriched", False),
         )
         if timings_ms is not None:
             timings_ms["rerank"] = (
@@ -212,7 +308,16 @@ def hybrid_search(
     elif reranker is None:
         points = points[:top_k]
     # Pin AFTER rerank/diversity so nothing can demote an exact citation hit.
-    return pin_points(pinned, points, top_k) if pinned else points
+    final = pin_points(pinned, points, top_k) if pinned else points
+    if trace is not None:
+        trace["final_ranking"] = [
+            {
+                "point_id": str(getattr(point, "id", "")),
+                "score": format(float(point.score), ".17g"),
+            }
+            for point in final
+        ]
+    return final
 
 
 def _point_dense(pt):
@@ -302,13 +407,43 @@ def diversify(points, *, top_k: int, max_per_doc: int | None = None,
     return selected
 
 
-def rerank_points(reranker, query: str, points, *, top_k: int, min_score: float | None = None):
+def _rerank_text(payload: dict, *, enrich: bool) -> str:
+    """Cross-encoder input for one candidate.
+
+    Raw chunk body by default (current behavior). When ``enrich`` (I8,
+    ``RERANK_CONTEXT_ENRICHED``), prepends a terse title/type-status/number/heading header
+    built from the same payload fields recall already benefits from (``build_payload``),
+    so the cross-encoder can disambiguate near-duplicate documents instead of reading body
+    text alone.
+    """
+    text = payload.get("text") or ""
+    if not enrich:
+        return text
+    parts = []
+    if payload.get("title"):
+        parts.append(payload["title"])
+    kind = " ".join(p for p in (payload.get("document_type"), payload.get("status")) if p)
+    if kind:
+        parts.append(kind)
+    num = "/".join(
+        p for p in (payload.get("document_number"), payload.get("registration_code")) if p
+    )
+    if num:
+        parts.append(f"№{num}")
+    if payload.get("heading"):
+        parts.append(payload["heading"])
+    header = " | ".join(parts)
+    return f"{header}\n{text}" if header else text
+
+
+def rerank_points(reranker, query: str, points, *, top_k: int, min_score: float | None = None,
+                   enrich_context: bool = False):
     """Re-score fused candidates with a cross-encoder, gate, and return the best ``top_k``.
 
     Each point's ``.score`` is overwritten with its rerank score so downstream
     formatting reports the calibrated relevance, not the RRF rank score.
     """
-    texts = [(pt.payload or {}).get("text") or "" for pt in points]
+    texts = [_rerank_text(pt.payload or {}, enrich=enrich_context) for pt in points]
     scores = reranker.score(query, texts)
     for pt, score in zip(points, scores):
         pt.score = float(score)

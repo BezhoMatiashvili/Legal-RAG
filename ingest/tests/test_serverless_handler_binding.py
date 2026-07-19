@@ -35,6 +35,8 @@ _HANDLER_ENV = (
     "EMBED_HEADER_V2",
     "PRODUCTION_MODE",
     "VERIFIED_WORKER_BINDING",
+    "RETRIEVER_LICENSE_ATTESTATION_PATH",
+    "RERANKER_LICENSE_ATTESTATION_PATH",
     "HF_HOME",
 )
 
@@ -106,6 +108,31 @@ def _load_handler(monkeypatch, tmp_path, manifest: dict | None):
             monkeypatch.delenv(key, raising=False)
 
     state = {"manifest": manifest}
+    if manifest is not None:
+        identity = manifest["point_identity"]
+        for label, role, model_key, revision_key in (
+            ("retriever", "embedder", "embedding_model", "embedding_revision"),
+            ("reranker", "reranker", "reranker_model", "reranker_revision"),
+        ):
+            model_id = identity[model_key]
+            revision = identity[revision_key]
+            path = tmp_path / f"{label}-license.json"
+            path.write_text(json.dumps({
+                "model_id": model_id,
+                "revision": revision,
+                "version": f"{model_id}@{revision}",
+                "role": role,
+                "license_id": "Apache-2.0",
+                "commercial_use_allowed": True,
+                "weights_private_deployment_allowed": True,
+                "training_data_use_allowed": True,
+                "reviewed_by": "legal-reviewer",
+                "reviewed_at": "2026-07-15",
+                "authoritative_source_url": "https://example.test/license",
+            }), encoding="utf-8")
+            monkeypatch.setenv(
+                f"{label.upper()}_LICENSE_ATTESTATION_PATH", str(path)
+            )
     fake_boot = types.ModuleType("qdrant_boot")
     fake_boot.QDRANT_URL = "http://127.0.0.1:6333"
     fake_boot.VOLUME_ROOT = tmp_path
@@ -151,15 +178,18 @@ def _load_handler(monkeypatch, tmp_path, manifest: dict | None):
         calls["health"] = int(calls["health"]) + 1
         return json.dumps({"ok": True})
 
-    def install(cfg, probe):
+    def install(cfg, probe, **kwargs):
         calls["cfg"] = cfg
         calls["probe"] = probe
+        calls["attestations"] = kwargs
 
     fake_srv._install_verified_worker_runtime = install
     fake_srv._result_cache = {}
     fake_srv._get_embedder = operation
     fake_srv._get_reranker = operation
     fake_srv.legal_search = operation
+    fake_srv.legal_ask = operation
+    fake_srv.legal_get_context = operation
     fake_srv.legal_get_document = operation
     fake_srv.legal_lookup = operation
     fake_srv.legal_browse = operation
@@ -167,6 +197,8 @@ def _load_handler(monkeypatch, tmp_path, manifest: dict | None):
     fake_srv.legal_collection_info = operation
     fake_srv.legal_health = health
     fake_srv.SearchInput = Input
+    fake_srv.LegalAskInput = Input
+    fake_srv.LegalGetContextInput = Input
     fake_srv.GetDocumentInput = Input
     fake_srv.LookupInput = Input
     fake_srv.BrowseInput = Input
@@ -200,6 +232,10 @@ def test_cold_boot_binds_exact_runtime_before_mcp_install(monkeypatch, tmp_path)
     assert cfg.rerank_remote_url is None
     assert generation_point_identity(cfg).as_payload() == manifest["point_identity"]
     assert calls["probe"]()["ok"] is True
+    assert set(calls["attestations"]) == {
+        "retriever_attestation",
+        "reranker_attestation",
+    }
 
 
 def test_prepublication_health_is_available_but_never_calls_mcp(monkeypatch, tmp_path):

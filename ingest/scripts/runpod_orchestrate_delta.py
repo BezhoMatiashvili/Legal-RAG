@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run one validated, source-aware delta embed on one Secure Cloud RTX 4090.
+"""Run one validated, source-aware delta embed on one Secure Cloud GPU pod.
 
 The workflow is deliberately fail-closed: explicit raw items are normalized/chunked on
 the host first, a run-scoped collection is derived from ``source`` + ``run_id``, the pod
@@ -7,6 +7,13 @@ must pass the CPU/GPU checksum gate *before* embedding, and the downloaded snaps
 accepted only when its SHA-256, document identities, chunks, UUIDv5 point ids, and exact
 point count match the host manifest.  The paid pod is terminated and confirmed absent
 before the local restore starts.
+
+GPU selection (2026-07-14): tries ``GPU_PRIMARY`` (RTX 4090) first, then each
+``GPU_FALLBACKS`` candidate in order if the primary has no capacity — user-authorized
+override of the prior single-GPU-only policy after repeated zero-cost "no capacity"
+failures. The G2 CPU/GPU cosine-similarity gate (``O.COS_GATE``) validates numerical
+correctness regardless of which candidate is used; budget/reserve math still gates on
+``GPU_PRIMARY``'s price as a conservative ceiling.
 
 Supreme Court example (from ``ingest/``)::
 
@@ -59,7 +66,18 @@ BILLING_CLEANUP_MARGIN_S = 35 * 60
 UNCERTAIN_DEPLOY_RECONCILE_ATTEMPTS = 12
 CONFIRMED_ABSENCE_CHECKS = 3
 RECONCILE_INTERVAL_S = 5
-GPU = "NVIDIA GeForce RTX 4090"
+# Primary GPU, tried first; fallbacks tried in order only after the primary is exhausted
+# (2026-07-14, user-authorized override of the prior single-GPU-only policy after 6
+# consecutive zero-cost "no capacity" failures on RTX 4090 Secure Cloud spanning ~3h real
+# time — same candidate list already used and tested in runpod_orchestrate.py). Budget/
+# reserve math still gates on GPU_PRIMARY's price as a conservative ceiling: fallbacks are
+# typically cheaper, and attest_provider_pod already enforces actual cost <= gate.price
+# regardless of which candidate is used, so this never underestimates spend risk.
+GPU_PRIMARY = "NVIDIA GeForce RTX 4090"
+GPU_FALLBACKS = ["NVIDIA RTX A5000", "NVIDIA GeForce RTX 3090",
+                 "NVIDIA RTX 4000 Ada Generation", "NVIDIA L4"]
+ALL_CANDIDATE_GPUS = (GPU_PRIMARY, *GPU_FALLBACKS)
+GPU = GPU_PRIMARY  # backward-compat alias (existing tests reference orch.GPU directly)
 COLLECTION_PREFIX = "georgian_legal_delta"
 POD_PREFIX = "georgian-legal-delta"
 RUNPOD_SPEND_LOCK = O.INGEST / ".state" / "runpod-spend.lock"
@@ -67,6 +85,7 @@ _ACTIVE_FINAL_STATES = {"TERMINATED", "EXITED"}
 
 _created_pod_ids: set[str] = set()
 _created_pod_name: str | None = None
+_provisioned_gpu: str | None = None  # which candidate actually got a pod, set by step_provision_4090
 
 
 class ReserveBudgetError(RuntimeError):
@@ -337,8 +356,9 @@ def runpod_spend_gate(chunks: int) -> SpendGate:
             f"RunPod already has active pod(s); refusing a second pod: {summary}"
         )
     price, stock = O.gpu_price(
-        GPU
-    )  # secureCloud=true inside the browser-UA GraphQL helper
+        GPU_PRIMARY
+    )  # secureCloud=true inside the browser-UA GraphQL helper; conservative price ceiling
+    # for ALL candidates (fallbacks are typically cheaper) — see GPU_PRIMARY comment above.
     if not isinstance(price, (int, float)) or float(price) <= 0:
         raise RuntimeError("no live Secure Cloud RTX 4090 price/capacity")
     if str(stock or "").strip().lower() not in {"low", "medium", "high"}:
@@ -362,7 +382,7 @@ def runpod_spend_gate(chunks: int) -> SpendGate:
         max_compute_cost=balance - RESERVE_USD - cleanup_margin_cost,
     )
     O.log(
-        f"RunPod gate PASS: balance=${balance:.2f}, active_pods=0, {GPU} Secure "
+        f"RunPod gate PASS: balance=${balance:.2f}, active_pods=0, {GPU_PRIMARY} Secure "
         f"stock={stock}, price=${float(price):.2f}/hr, conservative={hours:.2f}h/"
         f"${estimated:.2f}, cleanup_margin={BILLING_CLEANUP_MARGIN_S / 60:.0f}min/"
         f"${cleanup_margin_cost:.2f}, reserve=${RESERVE_USD:.2f}"
@@ -377,15 +397,16 @@ def enforce_reserve_budget(
     max_compute_cost: float,
     phase: str,
 ) -> float:
-    """Fail once elapsed compute at the gated price would consume the $2 reserve."""
-    cost = max(0.0, time.monotonic() - provisioned_at) / 3600 * price
+    """Fail once wall-clock compute at the gated price would consume the reserve."""
+    now = time.time()
+    cost = max(0.0, now - provisioned_at) / 3600 * price
     if cost >= max_compute_cost:
         raise ReserveBudgetError(
             f"RunPod compute reached ${cost:.2f} during {phase}; "
             f"preserving ${RESERVE_USD:.2f} reserve"
         )
     O.log(
-        f"RunPod budget checkpoint {phase}: ${cost:.3f} spent-equivalent, "
+        f"RunPod wall-clock budget checkpoint {phase}: ${cost:.3f} spent-equivalent, "
         f"${max_compute_cost - cost:.3f} before reserve"
     )
     return cost
@@ -518,65 +539,94 @@ def attest_provider_pod(ctx: DeltaRun, pod_id: str, gate: SpendGate) -> float:
 
 
 def step_provision_4090(pubkey: str, ctx: DeltaRun, price: float) -> str:
-    """Provision exactly one Secure Cloud RTX 4090, never a fallback GPU."""
-    global _created_pod_name
+    """Provision exactly one Secure Cloud GPU pod: try GPU_PRIMARY, then each
+    GPU_FALLBACKS candidate in order (2026-07-14, user-authorized override of the prior
+    single-GPU-only policy — see the GPU_PRIMARY constant comment for why). A candidate is
+    skipped if its live price exceeds the gated ceiling `price`, so this never provisions
+    above what was budgeted. Records which candidate actually got a pod in the
+    module-level `_provisioned_gpu` global so attestation/manifest checks verify against
+    the real GPU used, not an assumption."""
+    global _created_pod_name, _provisioned_gpu
     _created_pod_name = ctx.pod_name
     mutation = (
         "mutation($input:PodFindAndDeployOnDemandInput!){ "
         "podFindAndDeployOnDemand(input:$input){ id imageName machineId } }"
     )
-    variables = {
-        "input": {
-            "cloudType": "SECURE",
-            "gpuCount": 1,
-            "gpuTypeId": GPU,
-            "minMemoryInGb": 20,
-            "minVcpuCount": 4,
-            "name": ctx.pod_name,
-            "imageName": O.IMAGE,
-            "dockerArgs": "",
-            "ports": "22/tcp",
-            "volumeInGb": 80,
-            "containerDiskInGb": 60,
-            "volumeMountPath": "/workspace",
-            "supportPublicIp": True,
-            "startSsh": True,
-            "env": [{"key": "PUBLIC_KEY", "value": pubkey}],
+    for gpu_id in ALL_CANDIDATE_GPUS:
+        if gpu_id != GPU_PRIMARY:
+            live_price, live_stock = O.gpu_price(gpu_id)
+            if live_price is None or float(live_price) > price:
+                O.log(f"{gpu_id}: no price within gated ceiling ${price:.2f}/hr — skipping")
+                continue
+            O.log(f"{gpu_id}: ${live_price}/hr stock={live_stock}")
+        variables = {
+            "input": {
+                "cloudType": "SECURE",
+                "gpuCount": 1,
+                "gpuTypeId": gpu_id,
+                "minMemoryInGb": 20,
+                "minVcpuCount": 4,
+                "name": ctx.pod_name,
+                "imageName": O.IMAGE,
+                "dockerArgs": "",
+                "ports": "22/tcp",
+                "volumeInGb": 80,
+                "containerDiskInGb": 60,
+                "volumeMountPath": "/workspace",
+                "supportPublicIp": True,
+                "startSsh": True,
+                "env": [{"key": "PUBLIC_KEY", "value": pubkey}],
+            }
         }
-    }
-    for attempt in range(1, 4):
-        try:
-            data = O.gql(mutation, variables)
-        except (
-            Exception
-        ):  # a lost response may still have created the uniquely named pod
-            for _ in range(3):
-                matches = _named_active_pods(ctx.pod_name)
-                for match in matches:
-                    if match.get("id"):
-                        _created_pod_ids.add(match["id"])
-                if matches:
-                    break
-                time.sleep(5)
-            if len(matches) == 1:
-                pod_id = str(matches[0]["id"])
+        for attempt in range(1, 4):
+            try:
+                data = O.gql(mutation, variables)
+            except RuntimeError as exc:
+                # A clean GraphQL error response (e.g. RunPod's "does not have the
+                # resources to deploy" capacity message) — the request definitely reached
+                # RunPod and got a definitive no; no pod was created, no reconciliation
+                # needed, safe to retry/fall back like a null "no capacity" response.
+                O.log(f"Secure 1x {gpu_id} deploy attempt {attempt}/3 error: {exc}")
+                time.sleep(20)
+                continue
+            except (
+                Exception
+            ):  # a lost response may still have created the uniquely named pod
+                matches = []
+                for _ in range(3):
+                    matches = _named_active_pods(ctx.pod_name)
+                    for match in matches:
+                        if match.get("id"):
+                            _created_pod_ids.add(match["id"])
+                    if matches:
+                        break
+                    time.sleep(5)
+                if len(matches) == 1:
+                    pod_id = str(matches[0]["id"])
+                    (O.WORKDIR / "pod.id").write_text(pod_id, encoding="utf-8")
+                    _provisioned_gpu = gpu_id
+                    O.log(f"adopted pod {pod_id} on {gpu_id} after lost deploy response")
+                    return pod_id
+                raise
+            pod = data.get("podFindAndDeployOnDemand")
+            if pod and pod.get("id"):
+                pod_id = str(pod["id"])
+                _created_pod_ids.add(pod_id)
                 (O.WORKDIR / "pod.id").write_text(pod_id, encoding="utf-8")
-                O.log(f"adopted pod {pod_id} after lost deploy response")
+                _provisioned_gpu = gpu_id
+                O.log(f"provisioned Secure 1x {gpu_id} pod {pod_id} (${price:.2f}/hr)")
                 return pod_id
-            raise
-        pod = data.get("podFindAndDeployOnDemand")
-        if pod and pod.get("id"):
-            pod_id = str(pod["id"])
-            _created_pod_ids.add(pod_id)
-            (O.WORKDIR / "pod.id").write_text(pod_id, encoding="utf-8")
-            O.log(f"provisioned Secure 1x {GPU} pod {pod_id} (${price:.2f}/hr)")
-            return pod_id
-        O.log(f"Secure 1x {GPU} deploy attempt {attempt}/3 returned no capacity")
-        time.sleep(20)
-    raise RuntimeError(f"could not provision Secure 1x {GPU}; no fallback is permitted")
+            O.log(f"Secure 1x {gpu_id} deploy attempt {attempt}/3 returned no capacity")
+            time.sleep(20)
+        O.log(f"{gpu_id}: exhausted 3 attempts, trying next candidate")
+    raise RuntimeError(f"could not provision any GPU (tried {list(ALL_CANDIDATE_GPUS)})")
 
 
 def attest_single_4090(ip: str, port: int) -> None:
+    """Verify the pod's hardware matches the candidate step_provision_4090 actually used
+    (`_provisioned_gpu`, set as a side effect) — falls back to GPU_PRIMARY if that global
+    is somehow unset, preserving the original fail-closed default."""
+    expected = _provisioned_gpu or GPU_PRIMARY
     names = [
         line.strip()
         for line in O.ssh_capture(
@@ -584,11 +634,11 @@ def attest_single_4090(ip: str, port: int) -> None:
         ).splitlines()
         if line.strip()
     ]
-    if names != [GPU]:
+    if names != [expected]:
         raise RuntimeError(
-            f"GPU attestation failed; expected exactly [{GPU!r}], got {names!r}"
+            f"GPU attestation failed; expected exactly [{expected!r}], got {names!r}"
         )
-    O.log(f"GPU attestation PASS: exactly one {GPU}")
+    O.log(f"GPU attestation PASS: exactly one {expected}")
 
 
 def _pod_gone(pod_id: str) -> bool:
@@ -796,6 +846,7 @@ def step_launch_delta(ip: str, port: int, passphrase: str, ctx: DeltaRun) -> Non
             f"{QDRANT_WRITE_APPROVAL_ENV}=1",
             f"{QDRANT_RECREATE_APPROVAL_ENV}=1",
             f"{RUNPOD_EPHEMERAL_QDRANT_ENV}=1",
+            f"EXPECTED_GPU={shlex.quote(_provisioned_gpu or GPU_PRIMARY)}",
             "WORK=/workspace",
         ]
     )
@@ -831,15 +882,17 @@ def step_poll_delta(
     provisioned_at: float,
     max_compute_cost: float,
 ) -> None:
-    deadline = time.monotonic() + POLL_DEADLINE_S
+    deadline = time.time() + POLL_DEADLINE_S
     dead_checks = 0
-    while time.monotonic() < deadline:
+    while True:
         enforce_reserve_budget(
             price=price,
             provisioned_at=provisioned_at,
             max_compute_cost=max_compute_cost,
             phase="embed polling",
         )
+        if time.time() >= deadline:
+            raise TimeoutError("delta embed exceeded deadline")
         if O.ssh_ok(ip, port, "test -f /workspace/out/DONE"):
             enforce_reserve_budget(
                 price=price,
@@ -873,7 +926,6 @@ def step_poll_delta(
             )
             raise RuntimeError("delta embed ended without DONE:\n" + full)
         time.sleep(POLL_S)
-    raise TimeoutError("delta embed exceeded deadline")
 
 
 def _sha256(path: Path) -> str:
@@ -922,13 +974,24 @@ def validate_run_manifest(
         "points_count": expected["chunks"],
         "skipped": 0,
         "snapshot": snapshot.name,
-        "gpu": GPU,
     }
     errors = [
         f"{field}: expected {value!r}, got {run_manifest.get(field)!r}"
         for field, value in checks.items()
         if run_manifest.get(field) != value
     ]
+    # "gpu" is checked separately: when this process itself provisioned the pod
+    # (_provisioned_gpu set), require an exact match to what was live-attested via SSH;
+    # otherwise (e.g. --skip-pod validating a prior run's artifacts) accept any of the
+    # known candidate GPUs rather than assuming a single fixed one.
+    reported_gpu = run_manifest.get("gpu")
+    if _provisioned_gpu is not None:
+        if reported_gpu != _provisioned_gpu:
+            errors.append(f"gpu: expected {_provisioned_gpu!r}, got {reported_gpu!r}")
+    elif reported_gpu not in ALL_CANDIDATE_GPUS:
+        errors.append(
+            f"gpu: {reported_gpu!r} is not one of the allowed GPU types {list(ALL_CANDIDATE_GPUS)!r}"
+        )
     expected_ids = expected.get("document_ids")
     if (
         not isinstance(expected_ids, list)
@@ -1048,6 +1111,8 @@ def validate_restored_records(records: list, ctx: DeltaRun, expected: dict) -> N
             raise RuntimeError(f"unexpected restored delta document {key!r}")
         if not isinstance(chunk_index, int) or isinstance(chunk_index, bool):
             raise RuntimeError(f"invalid chunk_index for {key}: {chunk_index!r}")
+        # Deliberately legacy: ``preflight_pod_delta_write`` pins this run-scoped staging
+        # collection to generation_id=None. Immutable v3 publishes never use this workflow.
         if str(record.id) != point_id(source, document_id, chunk_index):
             raise RuntimeError(
                 f"UUIDv5 point id mismatch for {key} chunk {chunk_index}"
@@ -1212,7 +1277,7 @@ def run_paid_workflow(
     )
     preflight_pod_delta_write(ctx)
     O._price = gate.price
-    provision_attempted_at = time.monotonic()
+    provision_attempted_at = time.time()
     O._provisioned_at = provision_attempted_at
     watchdog = paid_budget_watchdog(
         price=gate.price,
@@ -1281,7 +1346,7 @@ def run_paid_workflow(
             O._ip,
             O._port,
             price=gate.price,
-            provisioned_at=O._provisioned_at,
+            provisioned_at=provision_attempted_at,
             max_compute_cost=gate.max_compute_cost,
         )
         enforce_reserve_budget(
@@ -1312,12 +1377,12 @@ def run_paid_workflow(
                 except Exception:  # noqa: BLE001 - termination is the real cleanup
                     pass
             _cleanup_delta(strict=True)
-            if O._provisioned_at:
-                hours = (time.monotonic() - O._provisioned_at) / 3600
-                O.log(
-                    f"COST: up={hours * 60:.1f}min price=${gate.price:.2f}/hr "
-                    f"est=${hours * gate.price:.3f}"
-                )
+            hours = max(0.0, time.time() - provision_attempted_at) / 3600
+            O.log(
+                "COST: wall-clock/conservative "
+                f"elapsed={hours * 60:.1f}min price=${gate.price:.2f}/hr "
+                f"est=${hours * gate.price:.3f}"
+            )
 
 
 def run_locked_paid_workflow(

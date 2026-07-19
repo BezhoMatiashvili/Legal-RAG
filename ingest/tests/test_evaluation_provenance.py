@@ -14,7 +14,10 @@ from ingest.config import load_config
 def _index_info(**overrides):
     values = {
         "collection_alias": "georgian_legal",
+        "serving_alias": "georgian_legal",
         "physical_collection": "georgian_legal__gen_20260713",
+        "queried_collection": "georgian_legal",
+        "access_kind": "serving_alias",
         "generation_id": "20260713",
         "n_points": 17,
         "corpus_hash": "1" * 64,
@@ -28,6 +31,7 @@ def _index_info(**overrides):
         "vector_space_id": "3" * 64,
         "chunk_config_id": "4" * 64,
         "header_config_id": "5" * 64,
+        "retrieval_fingerprint_revision": 2,
         "retrieval_fingerprint": "6" * 64,
         "dependency_identity": "7" * 64,
         "image_identity": "sha256:" + "8" * 64,
@@ -44,6 +48,11 @@ class _Aliases:
 
     def get_aliases(self):
         return SimpleNamespace(aliases=self.entries)
+
+
+class _NoAliasLookup:
+    def get_aliases(self):  # pragma: no cover - a call is the assertion failure
+        raise AssertionError("direct physical evaluation must not inspect aliases")
 
 
 def test_alias_resolution_requires_exact_generation_target():
@@ -72,6 +81,31 @@ def test_alias_resolution_requires_exact_generation_target():
         _resolve_physical_collection(wrong, "georgian_legal", "20260713")
 
 
+def test_direct_physical_resolution_never_reads_alias_inventory():
+    physical = "georgian_legal__gen_20260713"
+    assert _resolve_physical_collection(_NoAliasLookup(), physical, "20260713") == physical
+
+
+@pytest.mark.parametrize("entries", ([], [
+    SimpleNamespace(
+        alias_name="georgian_legal",
+        collection_name="georgian_legal__gen_20260713",
+    ),
+    SimpleNamespace(
+        alias_name="georgian_legal",
+        collection_name="georgian_legal__gen_20260713",
+    ),
+]))
+def test_alias_resolution_rejects_missing_or_duplicate_mapping(entries):
+    with pytest.raises(RuntimeError, match="must resolve exactly"):
+        _resolve_physical_collection(_Aliases(entries), "georgian_legal", "20260713")
+
+
+def test_collection_target_rejects_any_non_serving_alias_name():
+    with pytest.raises(RuntimeError, match="evaluation target must be"):
+        _resolve_physical_collection(_NoAliasLookup(), "scratch", "20260713")
+
+
 def test_provenance_builder_binds_frozen_sets_and_clean_patch_identity():
     result = build_evaluation_provenance(
         _index_info(), {"golden_v2": "9" * 64}, "production"
@@ -79,6 +113,9 @@ def test_provenance_builder_binds_frozen_sets_and_clean_patch_identity():
 
     payload = result.to_dict()
     assert payload["physical_collection"] == "georgian_legal__gen_20260713"
+    assert payload["serving_alias"] == "georgian_legal"
+    assert payload["queried_collection"] == "georgian_legal"
+    assert payload["access_kind"] == "serving_alias"
     assert payload["frozen_set_hashes"] == {"golden_v2": "9" * 64}
     assert payload["dirty_patch_hash"] == (
         "e3b0c44298fc1c149afbf4c8996fb924"
@@ -102,6 +139,34 @@ def test_qdrant_eval_rejects_missing_generation_before_model_load(monkeypatch):
     cfg = replace(load_config(), generation_dir=None)
 
     with pytest.raises(RuntimeError, match="requires GENERATION_DIR"):
+        qdrant_deps(cfg)
+
+
+def test_candidate_qdrant_eval_requires_explicit_verification_pair_before_client(
+    monkeypatch, tmp_path
+):
+    import ingest.generation as generation
+    import ingest.qdrant_store as qdrant_store
+
+    generation_id = "v3_512_candidate_20260715_01"
+    generation_dir = tmp_path / generation_id
+    generation_dir.mkdir()
+    cfg = replace(
+        load_config(), generation_id=generation_id, generation_dir=generation_dir
+    )
+    monkeypatch.setattr(
+        generation,
+        "load_generation",
+        lambda _path: SimpleNamespace(
+            manifest=SimpleNamespace(generation_id=generation_id)
+        ),
+    )
+
+    def explode(_cfg):
+        raise AssertionError("Qdrant client must not be constructed")
+
+    monkeypatch.setattr(qdrant_store, "make_client", explode)
+    with pytest.raises(RuntimeError, match="two explicit run-specific"):
         qdrant_deps(cfg)
 
 
@@ -137,6 +202,7 @@ def test_qdrant_eval_provenance_uses_verified_manifest_model_identity(
         ),
         vector_space=SimpleNamespace(id="3" * 64),
         chunking=SimpleNamespace(fingerprint="4" * 64, document_header=True),
+        retrieval_fingerprint_revision=2,
         retrieval_fingerprint="5" * 64,
         dependency=SimpleNamespace(
             lock_sha256="6" * 64,
